@@ -3,6 +3,7 @@
 
 import json
 import os
+import re
 import select
 import sys
 import termios
@@ -22,16 +23,39 @@ LOG_PATH = Path.home() / ".claude" / "command-log.jsonl"
 MAX_ENTRIES = 50
 POLL_INTERVAL = 0.3
 
+DANGEROUS_PATTERNS = re.compile(
+    r"\b("
+    r"rm\b|rmdir\b|unlink\b"           # remove
+    r"|mv\b|cp\b"                       # move/overwrite
+    r"|dd\b|mkfs\b|shred\b"            # destructive
+    r"|chmod\b|chown\b|chgrp\b"        # permissions
+    r"|sudo\b|su\b|doas\b"             # privilege escalation
+    r"|kill\b|killall\b|pkill\b"       # process kill
+    r"|git\s+push\b|git\s+reset\b"     # git destructive
+    r"|git\s+checkout\s+--"            # git discard
+    r"|git\s+clean\b|git\s+branch\s+-[dD]" # git cleanup
+    r"|truncate\b|tee\b"              # write/overwrite
+    r"|>\s*/"                          # redirect to absolute path
+    r"|curl\b.*\|\s*(?:bash|sh)\b"     # pipe to shell
+    r"|wget\b|curl\b.*-o\b"           # download/write
+    r"|pip\s+install\b|npm\s+install\b" # package install
+    r"|docker\s+rm\b|docker\s+rmi\b"   # container removal
+    r"|systemctl\b|service\b"          # service control
+    r")",
+    re.IGNORECASE,
+)
+
+
+def is_dangerous(cmd: str) -> bool:
+    return bool(DANGEROUS_PATTERNS.search(cmd))
+
 
 def short_path(cwd: str) -> str:
-    """Shorten path: replace home with ~ and keep last 2 components if long."""
-    home = str(Path.home())
-    if cwd.startswith(home):
-        cwd = "~" + cwd[len(home):]
-    parts = cwd.split("/")
-    if len(parts) > 4:
-        return "/".join(parts[:2]) + "/.../" + "/".join(parts[-2:])
-    return cwd
+    """Show .../last_dir, truncated to 10 chars."""
+    name = os.path.basename(cwd) or cwd
+    if len(name) > 10:
+        return ".../" + name[:10]
+    return ".../" + name
 
 
 def short_session(sid: str) -> str:
@@ -72,17 +96,22 @@ def build_table(entries: list[dict], max_rows: int) -> Table:
     )
     table.add_column("Time", style="cyan", width=8, no_wrap=True)
     table.add_column("Session", style="magenta", width=8, no_wrap=True)
-    table.add_column("Directory", style="green", max_width=30, no_wrap=True)
+    table.add_column("Directory", style="green", width=14, no_wrap=True)
     table.add_column("Command", style="white", ratio=1)
 
     # Newest first, limited to what fits the terminal
     visible = entries[-max_rows:] if len(entries) > max_rows else entries
     for entry in reversed(visible):
+        cmd = entry.get("command", "")
+        cmd_text = Text()
+        if is_dangerous(cmd):
+            cmd_text.append("* ", style="bold red")
+        cmd_text.append(truncate_cmd(cmd, 118 if is_dangerous(cmd) else 120))
         table.add_row(
             format_time(entry.get("timestamp", "")),
             short_session(entry.get("session_id", "")),
             short_path(entry.get("cwd", "")),
-            truncate_cmd(entry.get("command", ""), 120),
+            cmd_text,
         )
 
     return table
@@ -99,9 +128,22 @@ def build_panel(entries: list[dict], line_count: int, term_height: int) -> Panel
     else:
         content = build_table(entries, max_rows)
 
+    # Count sessions active in the last 5 minutes
+    now = datetime.now().astimezone()
+    active_sessions = set()
+    for entry in entries:
+        try:
+            ts = datetime.fromisoformat(entry.get("timestamp", ""))
+            if (now - ts).total_seconds() < 300:
+                active_sessions.add(entry.get("session_id", ""))
+        except (ValueError, TypeError):
+            pass
+    active_count = len(active_sessions)
+
     status = Text()
     status.append(" \u25cf", style="bright_green")
-    status.append(f"  {line_count} commands logged", style="dim")
+    status.append(f"  {active_count} active", style="bold yellow" if active_count > 0 else "dim")
+    status.append(f"  \u00b7  {line_count} commands logged", style="dim")
     status.append("  \u00b7  q to quit  \u00b7  c to clear", style="dim italic")
 
     from rich.console import Group
