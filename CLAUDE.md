@@ -54,7 +54,7 @@ python3 feed.py
 |-----|--------|
 | `j`/`k` or `↓`/`↑` | Move cursor down/up |
 | `g`/`G` | Jump to top/bottom |
-| `Enter` | Open selected session's commands (filtered JSONL) in `$VISUAL` or `xdg-open` |
+| `Enter` | Open selected session's commands (filtered JSONL) in `$VISUAL` or the platform default launcher |
 | `f` | Open file manager on folder of files referenced in selected command |
 | `1`–`5` | Toggle columns: 1=Time, 2=Session, 3=Directory, 4=Files, 5=Command |
 | `c` | Clear display |
