@@ -101,6 +101,13 @@ def short_session(sid: str) -> str:
     return sid[:8] if sid else "--------"
 
 
+def _platform_opener() -> str:
+    """Return the platform-default file launcher (`open` on macOS, `xdg-open` elsewhere)."""
+    if sys.platform == "darwin":
+        return "open"
+    return "xdg-open"
+
+
 def normalize_cmd(cmd: str) -> str:
     """Collapse whitespace in command string."""
     return " ".join(cmd.split())
@@ -178,7 +185,7 @@ def build_table(
 
 
 def open_session_jsonl(session_id: str) -> None:
-    """Filter log by session_id, write to /tmp, open with $VISUAL or xdg-open."""
+    """Filter log by session_id, write to a temp file, open with $VISUAL or the platform default launcher."""
     if not session_id or not LOG_PATH.exists():
         return
     safe_id = re.sub(r"[^a-zA-Z0-9-]", "", session_id[:8]) or "unknown"
@@ -188,7 +195,7 @@ def open_session_jsonl(session_id: str) -> None:
             entry = parse_line(line.strip())
             if entry and entry.get("session_id", "") == session_id:
                 f_out.write(line)
-    opener = os.environ.get("VISUAL") or "xdg-open"
+    opener = os.environ.get("VISUAL") or _platform_opener()
     subprocess.Popen(
         [opener, out_path],
         stdout=subprocess.DEVNULL,
@@ -218,7 +225,7 @@ def open_file_folder(entry: dict) -> None:
 
     if target:
         subprocess.Popen(
-            ["xdg-open", target],
+            [_platform_opener(), target],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
