@@ -3,6 +3,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import feed
+from unittest.mock import patch
 
 
 class TestIsDangerous:
@@ -141,9 +142,6 @@ class TestParseLine:
 
     def test_empty_string(self):
         assert feed.parse_line("") is None
-
-
-from unittest.mock import patch
 
 
 class TestPlatformOpener:

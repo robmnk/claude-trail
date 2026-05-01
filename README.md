@@ -11,6 +11,7 @@ Real-time TUI dashboard that shows every Bash command Claude Code executes acros
 - **Dangerous command highlighting** — flags risky operations (`rm`, `sudo`, `git reset`, etc.) with red markers
 - **Active session indicator** — shows how many sessions have been active in the last 5 minutes
 - **Minimal footprint** — single Python file, one dependency (`rich`)
+- **Cross-platform** — works on Linux and macOS (uses `xdg-open` or `open` automatically)
 
 ## How It Works
 
@@ -89,7 +90,7 @@ Each line in `~/.claude/command-log.jsonl`:
 
 ### Platform support
 
-Linux only. Uses POSIX `termios` and `tty` modules; not tested on macOS or Windows. The hook also uses GNU `date %3N` for millisecond timestamps — macOS users should install GNU coreutils (`brew install coreutils`, then use `gdate`) or remove the `%3N` from the format string.
+Linux and macOS. Uses POSIX `termios` and `tty`. The hook emits second-precision ISO-8601 timestamps that work on both BSD and GNU `date`. Windows is not supported (no termios). On macOS, file actions go through `open`; on Linux, `xdg-open`. Both honour `$VISUAL` for opening session JSONL files.
 
 ### Log rotation
 
