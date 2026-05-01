@@ -79,3 +79,4 @@ python3 feed.py
 - File paths extracted via regex matching absolute (`/...`), home (`~/...`), and relative (`./...`) paths
 - Session JSONL written under `tempfile.gettempdir()` (default `/tmp`) as `bash-feed-session-{sanitized-id}.jsonl` on Enter
 - Column visibility persists during session, status bar shows toggle state as `1 2 3 4 5`
+- Platform-specific file launcher: `xdg-open` on Linux, `open` on macOS, selected via `feed._platform_opener()`. Honours `$VISUAL` first if set.
