@@ -79,7 +79,7 @@ Each line in `~/.claude/command-log.jsonl`:
 
 ```json
 {
-  "timestamp": "2025-01-01T12:00:00.000Z",
+  "timestamp": "2025-01-01T12:00:00Z",
   "command": "ls -la",
   "cwd": "/home/user/project",
   "session_id": "abc12345-..."
