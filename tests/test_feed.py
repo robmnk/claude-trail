@@ -141,3 +141,20 @@ class TestParseLine:
 
     def test_empty_string(self):
         assert feed.parse_line("") is None
+
+
+from unittest.mock import patch
+
+
+class TestPlatformOpener:
+    def test_darwin_returns_open(self):
+        with patch.object(feed.sys, "platform", "darwin"):
+            assert feed._platform_opener() == "open"
+
+    def test_linux_returns_xdg_open(self):
+        with patch.object(feed.sys, "platform", "linux"):
+            assert feed._platform_opener() == "xdg-open"
+
+    def test_other_platforms_default_to_xdg_open(self):
+        with patch.object(feed.sys, "platform", "freebsd14"):
+            assert feed._platform_opener() == "xdg-open"
