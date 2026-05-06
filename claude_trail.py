@@ -11,7 +11,7 @@ import tempfile
 import termios
 import time
 import tty
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from rich.console import Console, Group
@@ -354,7 +354,34 @@ def read_last_entries(path: Path, n: int) -> tuple[list[dict], int]:
     return entries, size
 
 
+def hook_main(stream=None) -> int:
+    """PostToolUse hook: read a tool event from stdin and append a Bash log entry.
+
+    Wired up via `claude-trail hook` in ~/.claude/settings.json.
+    """
+    try:
+        data = json.load(stream if stream is not None else sys.stdin)
+    except (json.JSONDecodeError, ValueError, OSError):
+        return 0
+    if not isinstance(data, dict) or data.get("tool_name") != "Bash":
+        return 0
+    tool_input = data.get("tool_input") or {}
+    entry = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "command": tool_input.get("command", ""),
+        "cwd": data.get("cwd", ""),
+        "session_id": data.get("session_id", ""),
+    }
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+    return 0
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "hook":
+        sys.exit(hook_main())
+
     console = Console()
     cursor = 0
     scroll_offset = 0

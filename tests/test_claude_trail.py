@@ -167,3 +167,65 @@ class TestPlatformOpener:
     def test_other_platforms_default_to_xdg_open(self):
         with patch.object(feed.sys, "platform", "freebsd14"):
             assert feed._platform_opener() == "xdg-open"
+
+
+class TestHookMain:
+    def _run_hook(self, tmp_path, payload):
+        import io, json
+        log_file = tmp_path / "command-log.jsonl"
+        with patch.object(feed, "LOG_PATH", log_file):
+            stream = io.StringIO(json.dumps(payload))
+            rc = feed.hook_main(stream=stream)
+        return rc, log_file
+
+    def test_bash_event_writes_entry(self, tmp_path):
+        import json
+        rc, log = self._run_hook(tmp_path, {
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls -la"},
+            "cwd": "/work",
+            "session_id": "abcdef12",
+        })
+        assert rc == 0
+        line = log.read_text(encoding="utf-8").strip()
+        entry = json.loads(line)
+        assert entry["command"] == "ls -la"
+        assert entry["cwd"] == "/work"
+        assert entry["session_id"] == "abcdef12"
+        assert entry["timestamp"].endswith("Z") and "T" in entry["timestamp"]
+
+    def test_non_bash_event_writes_nothing(self, tmp_path):
+        rc, log = self._run_hook(tmp_path, {
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/tmp/foo"},
+        })
+        assert rc == 0
+        assert not log.exists() or log.read_text() == ""
+
+    def test_malformed_json_does_not_crash(self, tmp_path):
+        import io
+        log = tmp_path / "command-log.jsonl"
+        with patch.object(feed, "LOG_PATH", log):
+            rc = feed.hook_main(stream=io.StringIO("not json at all"))
+        assert rc == 0
+        assert not log.exists()
+
+    def test_missing_optional_fields_default_to_empty(self, tmp_path):
+        import json
+        rc, log = self._run_hook(tmp_path, {"tool_name": "Bash"})
+        assert rc == 0
+        entry = json.loads(log.read_text(encoding="utf-8").strip())
+        assert entry["command"] == ""
+        assert entry["cwd"] == ""
+        assert entry["session_id"] == ""
+
+    def test_creates_parent_directory(self, tmp_path):
+        import io, json
+        log = tmp_path / "nested" / "subdir" / "command-log.jsonl"
+        with patch.object(feed, "LOG_PATH", log):
+            rc = feed.hook_main(stream=io.StringIO(json.dumps({
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo hi"},
+            })))
+        assert rc == 0
+        assert log.exists()

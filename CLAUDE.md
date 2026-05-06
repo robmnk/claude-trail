@@ -6,17 +6,18 @@ Real-time TUI dashboard showing all Bash commands executed by Claude Code sessio
 
 ```
 Claude Code session
-  └─ PostToolUse hook (hook.sh)
+  └─ PostToolUse hook (`claude-trail hook` subcommand)
        └─ Appends JSON to ~/.claude/command-log.jsonl
-            └─ claude_trail.py tails the file and renders with Rich
+            └─ `claude-trail` (TUI) tails the file and renders with Rich
 ```
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `claude_trail.py` | Rich-based TUI — tails `command-log.jsonl`, renders 5-column table with cursor navigation, column toggles, and action keys |
-| `hook.sh` | PostToolUse hook — captures Bash tool calls (command, cwd, session_id, timestamp) |
+| `claude_trail.py` | Module: TUI (`main`) and PostToolUse hook (`hook_main`). Tails `command-log.jsonl`, renders 5-column table with cursor navigation, column toggles, and action keys |
+| `hook.sh` | Legacy bash version of the hook (deprecated, kept for users who still reference it). New installs should use `claude-trail hook`. |
+| `pyproject.toml` | Package metadata and `claude-trail` entry point |
 | `requirements.txt` | Python deps (`rich>=13.0`) |
 
 ## Key Paths
@@ -26,7 +27,7 @@ Claude Code session
 
 ## Hook Setup
 
-The hook must be registered in `~/.claude/settings.json`:
+Register in `~/.claude/settings.json` using the built-in subcommand:
 
 ```json
 {
@@ -34,7 +35,9 @@ The hook must be registered in `~/.claude/settings.json`:
     "PostToolUse": [
       {
         "matcher": "Bash",
-        "command": "/home/naka/Projects/personal/claude-trail/hook.sh"
+        "hooks": [
+          { "type": "command", "command": "claude-trail hook" }
+        ]
       }
     ]
   }
@@ -44,8 +47,8 @@ The hook must be registered in `~/.claude/settings.json`:
 ## Running
 
 ```bash
-cd ~/Projects/personal/claude-trail
-python3 claude_trail.py
+claude-trail              # if installed via pipx / uv tool install
+python3 claude_trail.py   # if running from a clone
 ```
 
 ## Controls
