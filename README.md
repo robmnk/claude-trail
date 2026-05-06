@@ -15,8 +15,8 @@ Observability tool for Claude Code: a real-time TUI dashboard that shows every B
 
 ## How It Works
 
-1. A Claude Code `PostToolUse` hook (`hook.sh`) captures every Bash command and appends it as JSON to `~/.claude/command-log.jsonl`
-2. `claude_trail.py` tails the log file and renders a live-updating table using [Rich](https://github.com/Textualize/rich)
+1. A Claude Code `PostToolUse` hook (`claude-trail hook`) captures every Bash command and appends it as JSON to `~/.claude/command-log.jsonl`
+2. `claude-trail` tails the log file and renders a live-updating table using [Rich](https://github.com/Textualize/rich)
 
 ## Setup
 
@@ -37,7 +37,7 @@ pip install -r requirements.txt
 
 ### 2. Register the hook
 
-Add to `~/.claude/settings.json`:
+Add this to the `hooks` section of `~/.claude/settings.json` (merge with any existing `PostToolUse` entries):
 
 ```json
 {
@@ -45,12 +45,19 @@ Add to `~/.claude/settings.json`:
     "PostToolUse": [
       {
         "matcher": "Bash",
-        "command": "/path/to/claude-trail/hook.sh"
+        "hooks": [
+          { "type": "command", "command": "claude-trail hook" }
+        ]
       }
     ]
   }
 }
 ```
+
+The hook is built into the `claude-trail` binary, so no path is needed as long as `claude-trail` is on your `PATH` (which `pipx` and `uv tool install` set up automatically).
+
+> Running from a clone instead of installing? Use the absolute path:
+> `"command": "python3 /absolute/path/to/claude_trail.py hook"`
 
 ### 3. Run
 
