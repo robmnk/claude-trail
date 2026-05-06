@@ -128,10 +128,14 @@ def format_time(ts: str) -> str:
         return "??:??:??"
 
 
-def get_display_entries(entries: list[dict], max_rows: int) -> list[dict]:
-    """Return entries in display order (newest first), limited to max_rows."""
-    visible = entries[-max_rows:] if len(entries) > max_rows else entries
-    return list(reversed(visible))
+def get_display_entries(
+    entries: list[dict], max_rows: int, offset: int = 0
+) -> list[dict]:
+    """Return up to max_rows entries in newest-first order, skipping the first `offset`."""
+    if not entries:
+        return []
+    reversed_view = list(reversed(entries))
+    return reversed_view[offset : offset + max_rows]
 
 
 def build_table(
@@ -139,6 +143,7 @@ def build_table(
     max_rows: int,
     visible_cols: dict[int, bool],
     cursor: int,
+    offset: int = 0,
 ) -> Table:
     table = Table(
         box=box.SIMPLE_HEAVY,
@@ -154,11 +159,12 @@ def build_table(
         name, style, kwargs = COLUMNS[col_id]
         table.add_column(name, style=style, **kwargs)
 
-    display = get_display_entries(entries, max_rows)
+    display = get_display_entries(entries, max_rows, offset)
+    highlight_idx = cursor - offset
 
     for idx, entry in enumerate(display):
         cmd = entry.get("command", "")
-        row_style = "on grey23" if idx == cursor else None
+        row_style = "on grey23" if idx == highlight_idx else None
 
         cells = []
         for col_id in sorted(visible_cols):
@@ -234,10 +240,10 @@ def open_file_folder(entry: dict) -> None:
 
 def build_panel(
     entries: list[dict],
-    shown_count: int,
     term_height: int,
     visible_cols: dict[int, bool],
     cursor: int,
+    offset: int = 0,
 ) -> Panel:
     max_rows = max(term_height - 10, 3)
 
@@ -246,7 +252,7 @@ def build_panel(
         content.append("Make sure the hook is configured in ~/.claude/settings.json\n", style="dim")
         content.append(f"Watching: {LOG_PATH}", style="dim")
     else:
-        content = build_table(entries, max_rows, visible_cols, cursor)
+        content = build_table(entries, max_rows, visible_cols, cursor, offset)
 
     # Count sessions active in the last 5 minutes
     now = datetime.now().astimezone()
@@ -268,7 +274,10 @@ def build_panel(
     status = Text()
     status.append(" \u25cf", style="bright_green")
     status.append(f"  {active_count} active", style="bold yellow" if active_count > 0 else "dim")
-    status.append(f"  \u00b7  {shown_count} shown", style="dim")
+    if entries:
+        status.append(f"  \u00b7  {cursor + 1}/{len(entries)}", style="dim")
+    else:
+        status.append("  \u00b7  0/0", style="dim")
 
     status2 = Text.from_markup(
         f"  [dim italic]cols:[/dim italic] {col_toggles}"
@@ -279,7 +288,7 @@ def build_panel(
 
     return Panel(
         body,
-        title="[bold cyan] bash-feed [/bold cyan]",
+        title="[bold cyan] claude bash feed [/bold cyan]",
         subtitle=f"[dim]{LOG_PATH}[/dim]",
         box=box.ROUNDED,
         padding=(1, 2),
@@ -348,10 +357,10 @@ def read_last_entries(path: Path, n: int) -> tuple[list[dict], int]:
 def main():
     console = Console()
     cursor = 0
+    scroll_offset = 0
     visible_cols = {1: True, 2: True, 3: True, 4: True, 5: True}
 
     entries, last_pos = read_last_entries(LOG_PATH, MAX_ENTRIES)
-    shown_count = len(entries)
 
     interactive = sys.stdin.isatty()
     if interactive:
@@ -362,19 +371,30 @@ def main():
     def calc_max_rows():
         return max(console.height - 10, 3)
 
-    def max_cursor_idx():
-        return min(len(entries), calc_max_rows()) - 1
+    def clamp_view():
+        """Keep cursor in [0, len(entries)-1] and scroll_offset so cursor is visible."""
+        nonlocal cursor, scroll_offset
+        if not entries:
+            cursor = 0
+            scroll_offset = 0
+            return
+        cursor = max(0, min(cursor, len(entries) - 1))
+        max_rows = calc_max_rows()
+        if cursor < scroll_offset:
+            scroll_offset = cursor
+        elif cursor >= scroll_offset + max_rows:
+            scroll_offset = cursor - max_rows + 1
+        max_offset = max(0, len(entries) - max_rows)
+        scroll_offset = max(0, min(scroll_offset, max_offset))
 
     def selected_entry() -> dict | None:
-        if not entries:
+        if not entries or cursor < 0 or cursor >= len(entries):
             return None
-        display = get_display_entries(entries, calc_max_rows())
-        idx = min(cursor, len(display) - 1)
-        return display[idx] if 0 <= idx < len(display) else None
+        return list(reversed(entries))[cursor]
 
     try:
         with Live(
-            build_panel(entries, shown_count, console.height, visible_cols, cursor),
+            build_panel(entries, console.height, visible_cols, cursor, scroll_offset),
             console=console,
             refresh_per_second=4,
         ) as live:
@@ -388,16 +408,20 @@ def main():
                                 break
                             elif ch == "c":
                                 entries.clear()
-                                shown_count = 0
                                 cursor = 0
+                                scroll_offset = 0
                             elif ch in ("k", "up"):
                                 cursor = max(0, cursor - 1)
+                                clamp_view()
                             elif ch in ("j", "down"):
-                                cursor = min(max(max_cursor_idx(), 0), cursor + 1)
+                                cursor = min(max(0, len(entries) - 1), cursor + 1)
+                                clamp_view()
                             elif ch == "g":
                                 cursor = 0
+                                scroll_offset = 0
                             elif ch == "G":
-                                cursor = max(max_cursor_idx(), 0)
+                                cursor = max(0, len(entries) - 1)
+                                clamp_view()
                             elif ch in ("1", "2", "3", "4", "5"):
                                 col = int(ch)
                                 if not visible_cols[col] or sum(visible_cols.values()) > 1:
@@ -414,22 +438,27 @@ def main():
                         time.sleep(POLL_INTERVAL)
 
                     new_lines, last_pos = tail_file(LOG_PATH, last_pos)
+                    new_count = 0
                     for line in new_lines:
                         entry = parse_line(line.strip())
                         if entry:
                             entries.append(entry)
-                            shown_count += 1
+                            new_count += 1
+
+                    # If user scrolled away from the top, keep them anchored to the
+                    # entry they were viewing as new entries shift the reversed view down.
+                    if new_count > 0 and cursor > 0:
+                        cursor += new_count
+                        scroll_offset += new_count
 
                     if len(entries) > MAX_ENTRIES:
                         entries = entries[-MAX_ENTRIES:]
 
-                    mc = max_cursor_idx()
-                    if mc < 0:
-                        cursor = 0
-                    elif cursor > mc:
-                        cursor = mc
+                    clamp_view()
 
-                    live.update(build_panel(entries, shown_count, console.height, visible_cols, cursor))
+                    live.update(
+                        build_panel(entries, console.height, visible_cols, cursor, scroll_offset)
+                    )
             except KeyboardInterrupt:
                 pass
     finally:

@@ -131,6 +131,17 @@ class TestGetDisplayEntries:
         result = feed.get_display_entries(entries, 3)
         assert result == [{"id": 9}, {"id": 8}, {"id": 7}]
 
+    def test_offset_skips_newest(self):
+        entries = [{"id": i} for i in range(10)]
+        # offset=3 skips the 3 newest, max_rows=3 → next 3
+        result = feed.get_display_entries(entries, 3, offset=3)
+        assert result == [{"id": 6}, {"id": 5}, {"id": 4}]
+
+    def test_offset_past_end_returns_empty(self):
+        entries = [{"id": i} for i in range(5)]
+        result = feed.get_display_entries(entries, 3, offset=10)
+        assert result == []
+
 
 class TestParseLine:
     def test_valid_json(self):
