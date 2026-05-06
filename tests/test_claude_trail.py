@@ -60,8 +60,17 @@ class TestFormatTime:
         assert feed.format_time("2025-01-01T12:34:56") == "12:34:56"
 
     def test_iso_with_z_suffix(self):
+        # Either fromisoformat doesn't support Z (Python <3.11, returns "??:??:??"),
+        # or it parses as UTC and converts to local time (HH:MM:SS).
         result = feed.format_time("2025-01-01T12:00:00.000Z")
-        assert result == "??:??:??" or result == "12:00:00"
+        assert result == "??:??:??" or (len(result) == 8 and result.count(":") == 2)
+
+    def test_iso_with_offset_renders_in_local_tz(self):
+        # Same UTC instant but expressed with a +00:00 offset; fromisoformat
+        # always supports this. Result must match what 12:00 UTC looks like locally.
+        from datetime import datetime as _dt, timezone as _tz
+        expected = _dt(2025, 1, 1, 12, 0, 0, tzinfo=_tz.utc).astimezone().strftime("%H:%M:%S")
+        assert feed.format_time("2025-01-01T12:00:00+00:00") == expected
 
     def test_invalid_string(self):
         assert feed.format_time("not a date") == "??:??:??"
