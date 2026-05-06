@@ -1,4 +1,4 @@
-# claude bash feed
+# claude-trail
 
 Observability tool for Claude Code: a real-time TUI dashboard that shows every Bash command Claude Code executes across all sessions.
 
@@ -6,7 +6,7 @@ Observability tool for Claude Code: a real-time TUI dashboard that shows every B
 
 ## Features
 
-- **Live command feed** — watches all Claude Code Bash tool calls in real-time
+- **Live command trail** — watches all Claude Code Bash tool calls in real-time
 - **Multi-session aware** — tracks commands across concurrent sessions with color-coded IDs
 - **Dangerous command highlighting** — flags risky operations (`rm`, `sudo`, `git reset`, etc.) with red markers
 - **Active session indicator** — shows how many sessions have been active in the last 5 minutes
@@ -16,7 +16,7 @@ Observability tool for Claude Code: a real-time TUI dashboard that shows every B
 ## How It Works
 
 1. A Claude Code `PostToolUse` hook (`hook.sh`) captures every Bash command and appends it as JSON to `~/.claude/command-log.jsonl`
-2. `feed.py` tails the log file and renders a live-updating table using [Rich](https://github.com/Textualize/rich)
+2. `claude_trail.py` tails the log file and renders a live-updating table using [Rich](https://github.com/Textualize/rich)
 
 ## Setup
 
@@ -26,10 +26,10 @@ Pick one:
 
 ```bash
 # pipx (recommended, broadly available)
-pipx install git+https://github.com/YOUR_USER/bash-feed
+pipx install git+https://github.com/YOUR_USER/claude-trail
 
 # uv
-uv tool install git+https://github.com/YOUR_USER/bash-feed
+uv tool install git+https://github.com/YOUR_USER/claude-trail
 
 # from a local clone, no install
 pip install -r requirements.txt
@@ -45,7 +45,7 @@ Add to `~/.claude/settings.json`:
     "PostToolUse": [
       {
         "matcher": "Bash",
-        "command": "/path/to/bash-feed/hook.sh"
+        "command": "/path/to/claude-trail/hook.sh"
       }
     ]
   }
@@ -55,8 +55,8 @@ Add to `~/.claude/settings.json`:
 ### 3. Run
 
 ```bash
-bash-feed          # if installed via pipx / uv
-python3 feed.py    # if running from a clone
+claude-trail              # if installed via pipx / uv
+python3 claude_trail.py   # if running from a clone
 ```
 
 ## Controls
@@ -104,7 +104,7 @@ Linux and macOS. Uses POSIX `termios` and `tty`. The hook emits second-precision
 
 ### Log rotation
 
-The log file `~/.claude/command-log.jsonl` grows indefinitely. To bound it with `logrotate`, drop a config like this in `/etc/logrotate.d/bash-feed`:
+The log file `~/.claude/command-log.jsonl` grows indefinitely. To bound it with `logrotate`, drop a config like this in `/etc/logrotate.d/claude-trail`:
 
 ```
 /home/YOUR_USER/.claude/command-log.jsonl {

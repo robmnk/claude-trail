@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bash-feed: realtime TUI showing all Bash commands Claude Code executes."""
+"""claude-trail: realtime TUI showing all Bash commands Claude Code executes."""
 
 import json
 import os
@@ -195,7 +195,7 @@ def open_session_jsonl(session_id: str) -> None:
     if not session_id or not LOG_PATH.exists():
         return
     safe_id = re.sub(r"[^a-zA-Z0-9-]", "", session_id[:8]) or "unknown"
-    out_path = os.path.join(tempfile.gettempdir(), f"bash-feed-session-{safe_id}.jsonl")
+    out_path = os.path.join(tempfile.gettempdir(), f"claude-trail-session-{safe_id}.jsonl")
     with open(LOG_PATH, "r", encoding="utf-8") as f_in, open(out_path, "w", encoding="utf-8") as f_out:
         for line in f_in:
             entry = parse_line(line.strip())
@@ -288,7 +288,7 @@ def build_panel(
 
     return Panel(
         body,
-        title="[bold cyan] claude bash feed [/bold cyan]",
+        title="[bold cyan] claude-trail [/bold cyan]",
         subtitle=f"[dim]{LOG_PATH}[/dim]",
         box=box.ROUNDED,
         padding=(1, 2),
