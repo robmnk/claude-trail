@@ -3,16 +3,16 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "bash-feed"
+name = "claude-trail"
 version = "0.1.0"
-description = "Observability TUI for Claude Code: a real-time feed of every Bash command Claude Code executes."
+description = "Observability TUI for Claude Code: a real-time trail of every Bash command Claude Code executes."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 dependencies = ["rich>=13.0"]
 
 [project.scripts]
-bash-feed = "feed:main"
+claude-trail = "claude_trail:main"
 
 [tool.hatch.build.targets.wheel]
-include = ["feed.py"]
+include = ["claude_trail.py"]

@@ -1,4 +1,4 @@
-# bash-feed
+# claude-trail
 
 Real-time TUI dashboard showing all Bash commands executed by Claude Code sessions.
 
@@ -8,14 +8,14 @@ Real-time TUI dashboard showing all Bash commands executed by Claude Code sessio
 Claude Code session
   └─ PostToolUse hook (hook.sh)
        └─ Appends JSON to ~/.claude/command-log.jsonl
-            └─ feed.py tails the file and renders with Rich
+            └─ claude_trail.py tails the file and renders with Rich
 ```
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `feed.py` | Rich-based TUI — tails `command-log.jsonl`, renders 5-column table with cursor navigation, column toggles, and action keys |
+| `claude_trail.py` | Rich-based TUI — tails `command-log.jsonl`, renders 5-column table with cursor navigation, column toggles, and action keys |
 | `hook.sh` | PostToolUse hook — captures Bash tool calls (command, cwd, session_id, timestamp) |
 | `requirements.txt` | Python deps (`rich>=13.0`) |
 
@@ -34,7 +34,7 @@ The hook must be registered in `~/.claude/settings.json`:
     "PostToolUse": [
       {
         "matcher": "Bash",
-        "command": "/home/naka/Projects/personal/bash-feed/hook.sh"
+        "command": "/home/naka/Projects/personal/claude-trail/hook.sh"
       }
     ]
   }
@@ -44,8 +44,8 @@ The hook must be registered in `~/.claude/settings.json`:
 ## Running
 
 ```bash
-cd ~/Projects/personal/bash-feed
-python3 feed.py
+cd ~/Projects/personal/claude-trail
+python3 claude_trail.py
 ```
 
 ## Controls
@@ -77,6 +77,6 @@ python3 feed.py
 - Display shows newest-first, max 50 entries, with active session count
 - Poll interval: 300ms
 - File paths extracted via regex matching absolute (`/...`), home (`~/...`), and relative (`./...`) paths
-- Session JSONL written under `tempfile.gettempdir()` (default `/tmp`) as `bash-feed-session-{sanitized-id}.jsonl` on Enter
+- Session JSONL written under `tempfile.gettempdir()` (default `/tmp`) as `claude-trail-session-{sanitized-id}.jsonl` on Enter
 - Column visibility persists during session, status bar shows toggle state as `1 2 3 4 5`
-- Platform-specific file launcher: `xdg-open` on Linux, `open` on macOS, selected via `feed._platform_opener()`. Honours `$VISUAL` first if set.
+- Platform-specific file launcher: `xdg-open` on Linux, `open` on macOS, selected via `claude_trail._platform_opener()`. Honours `$VISUAL` first if set.
