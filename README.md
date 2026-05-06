@@ -96,18 +96,20 @@ Each line in `~/.claude/command-log.jsonl`:
 
 ```json
 {
-  "timestamp": "2025-01-01T12:00:00Z",
+  "timestamp": "2025-01-01T12:00:00-03:00",
   "command": "ls -la",
   "cwd": "/home/user/project",
   "session_id": "abc12345-..."
 }
 ```
 
+Timestamps are in the user's local timezone (ISO 8601 with offset).
+
 ## Notes
 
 ### Platform support
 
-Linux and macOS. Uses POSIX `termios` and `tty`. The hook emits second-precision ISO-8601 timestamps that work on both BSD and GNU `date`. Windows is not supported (no termios). On macOS, file actions go through `open`; on Linux, `xdg-open`. Both honour `$VISUAL` for opening session JSONL files.
+Linux and macOS. Uses POSIX `termios` and `tty`. The hook emits second-precision ISO 8601 timestamps in the user's local timezone (with offset). Windows is not supported (no termios). On macOS, file actions go through `open`; on Linux, `xdg-open`. Both honour `$VISUAL` for opening session JSONL files.
 
 ### Log rotation
 
