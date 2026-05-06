@@ -20,9 +20,18 @@ Observability tool for Claude Code: a real-time TUI dashboard that shows every B
 
 ## Setup
 
-### 1. Install dependencies
+### 1. Install
+
+Pick one:
 
 ```bash
+# pipx (recommended, broadly available)
+pipx install git+https://github.com/YOUR_USER/bash-feed
+
+# uv
+uv tool install git+https://github.com/YOUR_USER/bash-feed
+
+# from a local clone, no install
 pip install -r requirements.txt
 ```
 
@@ -46,7 +55,8 @@ Add to `~/.claude/settings.json`:
 ### 3. Run
 
 ```bash
-python3 feed.py
+bash-feed          # if installed via pipx / uv
+python3 feed.py    # if running from a clone
 ```
 
 ## Controls

@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bash-feed"
+version = "0.1.0"
+description = "Observability TUI for Claude Code: a real-time feed of every Bash command Claude Code executes."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = ["rich>=13.0"]
+
+[project.scripts]
+bash-feed = "feed:main"
+
+[tool.hatch.build.targets.wheel]
+include = ["feed.py"]
