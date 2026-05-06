@@ -11,7 +11,7 @@ import tempfile
 import termios
 import time
 import tty
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 from rich.console import Console, Group
@@ -367,7 +367,7 @@ def hook_main(stream=None) -> int:
         return 0
     tool_input = data.get("tool_input") or {}
     entry = {
-        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
         "command": tool_input.get("command", ""),
         "cwd": data.get("cwd", ""),
         "session_id": data.get("session_id", ""),

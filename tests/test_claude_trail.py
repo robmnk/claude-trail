@@ -192,7 +192,9 @@ class TestHookMain:
         assert entry["command"] == "ls -la"
         assert entry["cwd"] == "/work"
         assert entry["session_id"] == "abcdef12"
-        assert entry["timestamp"].endswith("Z") and "T" in entry["timestamp"]
+        from datetime import datetime as _dt
+        parsed = _dt.fromisoformat(entry["timestamp"])
+        assert parsed.tzinfo is not None  # tz-aware (local offset)
 
     def test_non_bash_event_writes_nothing(self, tmp_path):
         rc, log = self._run_hook(tmp_path, {
