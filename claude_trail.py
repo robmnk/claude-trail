@@ -123,6 +123,8 @@ def parse_line(line: str) -> dict | None:
 def format_time(ts: str) -> str:
     try:
         dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone()  # render in the user's local timezone
         return dt.strftime("%H:%M:%S")
     except (ValueError, TypeError):
         return "??:??:??"
