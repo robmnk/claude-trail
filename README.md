@@ -1,6 +1,6 @@
-# bash-feed
+# claude bash feed
 
-Real-time TUI dashboard that shows every Bash command Claude Code executes across all sessions.
+Observability tool for Claude Code: a real-time TUI dashboard that shows every Bash command Claude Code executes across all sessions.
 
 ![TUI showing command feed with timestamps, sessions, and dangerous command highlighting]
 
