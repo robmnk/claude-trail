@@ -111,6 +111,33 @@ class TestSessionLabel:
         assert feed.session_label("abcdef1234567890", {"other": "x"}) == "abcdef12"
 
 
+class TestSessionColor:
+    def test_empty_returns_dim(self):
+        assert feed.session_color("") == "dim"
+
+    def test_returns_value_from_palette(self):
+        assert feed.session_color("abcd1234") in feed.SESSION_PALETTE
+
+    def test_deterministic_same_input_same_output(self):
+        a = feed.session_color("715dd70e-d772-46ad-b4cb-e9ccacd7340a")
+        b = feed.session_color("715dd70e-d772-46ad-b4cb-e9ccacd7340a")
+        assert a == b
+
+    def test_different_sessions_can_get_different_colors(self):
+        # Collisions are allowed by the modulo mapping, but across many distinct
+        # IDs we should see at least two distinct colors — otherwise the palette
+        # or the hash is broken.
+        ids = [f"session-{i:04d}" for i in range(50)]
+        colors = {feed.session_color(sid) for sid in ids}
+        assert len(colors) >= 2
+
+    def test_palette_avoids_red(self):
+        # Red is reserved for the dangerous-command marker; mixing it into the
+        # Session column would be confusing.
+        assert "red" not in feed.SESSION_PALETTE
+        assert "bright_red" not in feed.SESSION_PALETTE
+
+
 class TestLoadSessionNames:
     """Covers reading ~/.claude/sessions/*.json with mocked SESSIONS_DIR.
 

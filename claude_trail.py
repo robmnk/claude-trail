@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """claude-trail: realtime TUI showing all Bash commands Claude Code executes."""
 
+import hashlib
 import json
 import os
 import re
@@ -66,6 +67,21 @@ COLUMNS = {
     4: ("Files", "yellow", {"width": 20, "no_wrap": True, "overflow": "ellipsis"}),
     5: ("Command", "white", {"ratio": 1, "no_wrap": True, "overflow": "ellipsis"}),
 }
+
+# Palette for the Session cell tint. Red shades are reserved for the dangerous-
+# command marker, so they are intentionally absent here.
+SESSION_PALETTE = (
+    "magenta",
+    "cyan",
+    "green",
+    "yellow",
+    "blue",
+    "bright_magenta",
+    "bright_cyan",
+    "bright_green",
+    "bright_yellow",
+    "bright_blue",
+)
 
 
 def is_dangerous(cmd: str) -> bool:
@@ -146,6 +162,16 @@ def session_label(sid: str, name_map: dict[str, str] | None = None) -> str:
     return sid[:8] if sid else "--------"
 
 
+def session_color(sid: str) -> str:
+    """Stable per-session color from SESSION_PALETTE, so rows from the same
+    session share a tint across runs. Uses md5 (not Python's salted hash) for
+    cross-process determinism."""
+    if not sid:
+        return "dim"
+    h = int(hashlib.md5(sid.encode("utf-8")).hexdigest(), 16)
+    return SESSION_PALETTE[h % len(SESSION_PALETTE)]
+
+
 def _platform_opener() -> str:
     """Return the platform-default file launcher (`open` on macOS, `xdg-open` elsewhere)."""
     if sys.platform == "darwin":
@@ -221,7 +247,8 @@ def build_table(
             if col_id == 1:
                 cells.append(format_time(entry.get("timestamp", "")))
             elif col_id == 2:
-                cells.append(session_label(entry.get("session_id", ""), name_map))
+                sid = entry.get("session_id", "")
+                cells.append(Text(session_label(sid, name_map), style=session_color(sid)))
             elif col_id == 3:
                 cells.append(short_path(entry.get("cwd", "")))
             elif col_id == 4:
