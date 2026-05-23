@@ -22,8 +22,10 @@ from rich.text import Text
 from rich import box
 
 LOG_PATH = Path.home() / ".claude" / "command-log.jsonl"
+SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 MAX_ENTRIES = 50
 POLL_INTERVAL = 0.3
+SESSION_NAME_CACHE_TTL = 2.0  # seconds
 
 DANGEROUS_PATTERNS = re.compile(
     r"\b("
@@ -59,7 +61,7 @@ FILE_PATH_RE = re.compile(
 
 COLUMNS = {
     1: ("Time", "cyan", {"width": 8, "no_wrap": True}),
-    2: ("Session", "magenta", {"width": 8, "no_wrap": True}),
+    2: ("Session", "magenta", {"width": 20, "no_wrap": True, "overflow": "ellipsis"}),
     3: ("Directory", "green", {"width": 14, "no_wrap": True}),
     4: ("Files", "yellow", {"width": 20, "no_wrap": True, "overflow": "ellipsis"}),
     5: ("Command", "white", {"ratio": 1, "no_wrap": True, "overflow": "ellipsis"}),
@@ -96,8 +98,51 @@ def short_path(cwd: str) -> str:
     return ".../" + name
 
 
-def short_session(sid: str) -> str:
-    """First 8 chars of session ID."""
+_session_name_cache: dict[str, str] = {}
+_session_name_cache_ts: float = 0.0
+
+
+def load_session_names() -> dict[str, str]:
+    """Map session_id -> name from ~/.claude/sessions/*.json.
+
+    Claude Code writes one JSON file per running session there (named after pid),
+    each carrying a `sessionId` and an optional `name`. The file is removed when
+    the session exits, so we accumulate known names across calls — once a name has
+    been observed it stays available even after the session is gone. Cached for
+    SESSION_NAME_CACHE_TTL seconds to avoid hitting the filesystem on every render.
+    """
+    global _session_name_cache_ts
+    now = time.monotonic()
+    if now - _session_name_cache_ts < SESSION_NAME_CACHE_TTL:
+        return _session_name_cache
+    try:
+        files = list(SESSIONS_DIR.iterdir())
+    except (OSError, FileNotFoundError):
+        files = []
+    for entry in files:
+        if entry.suffix != ".json":
+            continue
+        try:
+            with open(entry, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        sid = data.get("sessionId")
+        name = data.get("name")
+        if sid and name:
+            _session_name_cache[sid] = name
+    _session_name_cache_ts = now
+    return _session_name_cache
+
+
+def session_label(sid: str, name_map: dict[str, str] | None = None) -> str:
+    """Session name if known, else first 8 chars of its ID."""
+    if name_map:
+        name = name_map.get(sid)
+        if name:
+            return name
     return sid[:8] if sid else "--------"
 
 
@@ -146,6 +191,7 @@ def build_table(
     visible_cols: dict[int, bool],
     cursor: int,
     offset: int = 0,
+    name_map: dict[str, str] | None = None,
 ) -> Table:
     table = Table(
         box=box.SIMPLE_HEAVY,
@@ -175,7 +221,7 @@ def build_table(
             if col_id == 1:
                 cells.append(format_time(entry.get("timestamp", "")))
             elif col_id == 2:
-                cells.append(short_session(entry.get("session_id", "")))
+                cells.append(session_label(entry.get("session_id", ""), name_map))
             elif col_id == 3:
                 cells.append(short_path(entry.get("cwd", "")))
             elif col_id == 4:
@@ -246,6 +292,7 @@ def build_panel(
     visible_cols: dict[int, bool],
     cursor: int,
     offset: int = 0,
+    name_map: dict[str, str] | None = None,
 ) -> Panel:
     max_rows = max(term_height - 10, 3)
 
@@ -254,7 +301,7 @@ def build_panel(
         content.append("Make sure the hook is configured in ~/.claude/settings.json\n", style="dim")
         content.append(f"Watching: {LOG_PATH}", style="dim")
     else:
-        content = build_table(entries, max_rows, visible_cols, cursor, offset)
+        content = build_table(entries, max_rows, visible_cols, cursor, offset, name_map)
 
     # Count sessions active in the last 5 minutes
     now = datetime.now().astimezone()
@@ -390,6 +437,7 @@ def main():
     visible_cols = {1: True, 2: True, 3: True, 4: True, 5: True}
 
     entries, last_pos = read_last_entries(LOG_PATH, MAX_ENTRIES)
+    name_map = load_session_names()
 
     interactive = sys.stdin.isatty()
     if interactive:
@@ -423,7 +471,7 @@ def main():
 
     try:
         with Live(
-            build_panel(entries, console.height, visible_cols, cursor, scroll_offset),
+            build_panel(entries, console.height, visible_cols, cursor, scroll_offset, name_map),
             console=console,
             refresh_per_second=4,
         ) as live:
@@ -485,8 +533,10 @@ def main():
 
                     clamp_view()
 
+                    name_map = load_session_names()
+
                     live.update(
-                        build_panel(entries, console.height, visible_cols, cursor, scroll_offset)
+                        build_panel(entries, console.height, visible_cols, cursor, scroll_offset, name_map)
                     )
             except KeyboardInterrupt:
                 pass
