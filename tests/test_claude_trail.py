@@ -111,31 +111,167 @@ class TestSessionLabel:
         assert feed.session_label("abcdef1234567890", {"other": "x"}) == "abcdef12"
 
 
-class TestSessionColor:
-    def test_empty_returns_dim(self):
-        assert feed.session_color("") == "dim"
+class TestRichColor:
+    def test_none_stays_none(self):
+        assert feed.rich_color(None) is None
 
-    def test_returns_value_from_palette(self):
-        assert feed.session_color("abcd1234") in feed.SESSION_PALETTE
+    def test_empty_string_is_none(self):
+        assert feed.rich_color("") is None
 
-    def test_deterministic_same_input_same_output(self):
-        a = feed.session_color("715dd70e-d772-46ad-b4cb-e9ccacd7340a")
-        b = feed.session_color("715dd70e-d772-46ad-b4cb-e9ccacd7340a")
-        assert a == b
+    def test_passthrough_for_rich_native_names(self):
+        assert feed.rich_color("red") == "red"
+        assert feed.rich_color("yellow") == "yellow"
+        assert feed.rich_color("magenta") == "magenta"
 
-    def test_different_sessions_can_get_different_colors(self):
-        # Collisions are allowed by the modulo mapping, but across many distinct
-        # IDs we should see at least two distinct colors — otherwise the palette
-        # or the hash is broken.
-        ids = [f"session-{i:04d}" for i in range(50)]
-        colors = {feed.session_color(sid) for sid in ids}
-        assert len(colors) >= 2
+    def test_orange_mapped_to_orange1(self):
+        assert feed.rich_color("orange") == "orange1"
 
-    def test_palette_avoids_red(self):
-        # Red is reserved for the dangerous-command marker; mixing it into the
-        # Session column would be confusing.
-        assert "red" not in feed.SESSION_PALETTE
-        assert "bright_red" not in feed.SESSION_PALETTE
+    def test_gray_and_grey_mapped(self):
+        assert feed.rich_color("gray") == "grey50"
+        assert feed.rich_color("grey") == "grey50"
+
+    def test_pink_mapped(self):
+        assert feed.rich_color("pink") == "pink1"
+
+    def test_aliased_names_parse_in_rich(self):
+        from rich.style import Style
+        for claude_name in feed.CLAUDE_COLOR_ALIASES:
+            Style.parse(feed.rich_color(claude_name))  # raises if invalid
+
+
+class TestScanChunkForColor:
+    def _evt(self, color):
+        import json
+        return json.dumps({
+            "type": "system",
+            "subtype": "local_command",
+            "content": (
+                f"<command-name>/color</command-name>\n"
+                f"            <command-message>color</command-message>\n"
+                f"            <command-args>{color}</command-args>"
+            ),
+        })
+
+    def test_returns_none_when_no_color_event(self):
+        assert feed._scan_chunk_for_color('{"type":"system","content":"hi"}\n') is None
+
+    def test_extracts_color_from_single_event(self):
+        assert feed._scan_chunk_for_color(self._evt("yellow")) == "yellow"
+
+    def test_returns_last_color_when_multiple(self):
+        chunk = self._evt("red") + "\n" + self._evt("yellow")
+        assert feed._scan_chunk_for_color(chunk) == "yellow"
+
+    def test_ignores_non_local_command_events(self):
+        bogus = '{"type":"assistant","content":"<command-name>/color</command-name>...<command-args>red</command-args>"}'
+        assert feed._scan_chunk_for_color(bogus) is None
+
+    def test_tolerates_malformed_json_lines(self):
+        chunk = "not-json-at-all\n" + self._evt("orange")
+        assert feed._scan_chunk_for_color(chunk) == "orange"
+
+
+class TestLoadSessionColors:
+    """Covers transcript discovery, incremental tailing, and TTL caching.
+
+    Each test mutates module-level cache state and resets it explicitly.
+    """
+
+    def _reset(self):
+        feed._session_color_cache.clear()
+        feed._session_color_cache_ts = 0.0
+        feed._transcript_path_cache.clear()
+        feed._transcript_positions.clear()
+
+    def _color_event(self, sid, color):
+        import json
+        return json.dumps({
+            "type": "system",
+            "subtype": "local_command",
+            "sessionId": sid,
+            "content": (
+                f"<command-name>/color</command-name>\n"
+                f"            <command-args>{color}</command-args>"
+            ),
+        }) + "\n"
+
+    def _write_transcript(self, projects_root, sid, lines):
+        project = projects_root / "-home-naka-Projects-x"
+        project.mkdir(parents=True, exist_ok=True)
+        path = project / f"{sid}.jsonl"
+        path.write_text("".join(lines), encoding="utf-8")
+        return path
+
+    def test_reads_color_from_transcript(self, tmp_path):
+        self._reset()
+        sid = "aaa-111"
+        self._write_transcript(tmp_path, sid, [self._color_event(sid, "yellow")])
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed, "SESSION_COLOR_CACHE_TTL", 0.0):
+            colors = feed.load_session_colors([sid])
+        assert colors == {sid: "yellow"}
+
+    def test_picks_latest_color_when_multiple_set(self, tmp_path):
+        self._reset()
+        sid = "bbb-222"
+        self._write_transcript(tmp_path, sid, [
+            self._color_event(sid, "red"),
+            self._color_event(sid, "blue"),
+        ])
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed, "SESSION_COLOR_CACHE_TTL", 0.0):
+            colors = feed.load_session_colors([sid])
+        assert colors == {sid: "blue"}
+
+    def test_session_without_color_command_returns_empty(self, tmp_path):
+        self._reset()
+        sid = "ccc-333"
+        self._write_transcript(tmp_path, sid, [
+            '{"type":"user","content":"hello"}\n',
+        ])
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed, "SESSION_COLOR_CACHE_TTL", 0.0):
+            colors = feed.load_session_colors([sid])
+        assert colors == {}
+
+    def test_missing_transcript_is_skipped(self, tmp_path):
+        self._reset()
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed, "SESSION_COLOR_CACHE_TTL", 0.0):
+            colors = feed.load_session_colors(["never-existed"])
+        assert colors == {}
+
+    def test_missing_projects_dir_is_tolerated(self, tmp_path):
+        self._reset()
+        with patch.object(feed, "PROJECTS_DIR", tmp_path / "absent"), \
+             patch.object(feed, "SESSION_COLOR_CACHE_TTL", 0.0):
+            colors = feed.load_session_colors(["any"])
+        assert colors == {}
+
+    def test_picks_up_color_appended_to_transcript(self, tmp_path):
+        """Mid-session /color must be observed on the next non-cached refresh."""
+        self._reset()
+        sid = "ddd-444"
+        path = self._write_transcript(tmp_path, sid, [self._color_event(sid, "red")])
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed, "SESSION_COLOR_CACHE_TTL", 0.0):
+            assert feed.load_session_colors([sid]) == {sid: "red"}
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(self._color_event(sid, "magenta"))
+            assert feed.load_session_colors([sid]) == {sid: "magenta"}
+
+    def test_cache_retains_color_after_transcript_removed(self, tmp_path):
+        """If Claude Code rotates or removes a transcript, the last-known color
+        should still be available."""
+        self._reset()
+        sid = "eee-555"
+        path = self._write_transcript(tmp_path, sid, [self._color_event(sid, "cyan")])
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed, "SESSION_COLOR_CACHE_TTL", 0.0):
+            assert feed.load_session_colors([sid]) == {sid: "cyan"}
+            path.unlink()
+            feed._transcript_path_cache.pop(sid, None)  # invalidate stale path
+            assert feed.load_session_colors([sid]) == {sid: "cyan"}
 
 
 class TestLoadSessionNames:

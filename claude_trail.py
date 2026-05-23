@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """claude-trail: realtime TUI showing all Bash commands Claude Code executes."""
 
-import hashlib
 import json
 import os
 import re
@@ -24,9 +23,11 @@ from rich import box
 
 LOG_PATH = Path.home() / ".claude" / "command-log.jsonl"
 SESSIONS_DIR = Path.home() / ".claude" / "sessions"
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
 MAX_ENTRIES = 50
 POLL_INTERVAL = 0.3
 SESSION_NAME_CACHE_TTL = 2.0  # seconds
+SESSION_COLOR_CACHE_TTL = 5.0  # seconds
 
 DANGEROUS_PATTERNS = re.compile(
     r"\b("
@@ -68,20 +69,30 @@ COLUMNS = {
     5: ("Command", "white", {"ratio": 1, "no_wrap": True, "overflow": "ellipsis"}),
 }
 
-# Palette for the Session cell tint. Red shades are reserved for the dangerous-
-# command marker, so they are intentionally absent here.
-SESSION_PALETTE = (
-    "magenta",
-    "cyan",
-    "green",
-    "yellow",
-    "blue",
-    "bright_magenta",
-    "bright_cyan",
-    "bright_green",
-    "bright_yellow",
-    "bright_blue",
+# Matches the `/color <value>` slash command as it appears in transcript
+# system/local_command events: a single line containing
+#   <command-name>/color</command-name> ... <command-args>VALUE</command-args>
+COLOR_CMD_RE = re.compile(
+    r"<command-name>/color</command-name>.*?<command-args>([^<]+)</command-args>",
+    re.DOTALL,
 )
+
+# Claude Code's /color accepts plain names like "orange"/"pink"/"gray" that
+# Rich's color parser rejects (it expects X11-style suffixes such as "orange1").
+# Translate so the cell tint matches what the user sees in Claude's session tag.
+CLAUDE_COLOR_ALIASES = {
+    "orange": "orange1",
+    "pink": "pink1",
+    "gray": "grey50",
+    "grey": "grey50",
+}
+
+
+def rich_color(claude_color: str | None) -> str | None:
+    """Map a /color value to a name Rich understands, or return it unchanged."""
+    if not claude_color:
+        return None
+    return CLAUDE_COLOR_ALIASES.get(claude_color, claude_color)
 
 
 def is_dangerous(cmd: str) -> bool:
@@ -162,14 +173,90 @@ def session_label(sid: str, name_map: dict[str, str] | None = None) -> str:
     return sid[:8] if sid else "--------"
 
 
-def session_color(sid: str) -> str:
-    """Stable per-session color from SESSION_PALETTE, so rows from the same
-    session share a tint across runs. Uses md5 (not Python's salted hash) for
-    cross-process determinism."""
-    if not sid:
-        return "dim"
-    h = int(hashlib.md5(sid.encode("utf-8")).hexdigest(), 16)
-    return SESSION_PALETTE[h % len(SESSION_PALETTE)]
+_session_color_cache: dict[str, str] = {}
+_session_color_cache_ts: float = 0.0
+_transcript_path_cache: dict[str, Path] = {}
+_transcript_positions: dict[str, int] = {}
+
+
+def _find_transcript(sid: str) -> Path | None:
+    """Locate `~/.claude/projects/*/<sid>.jsonl`. Caches resolved paths."""
+    cached = _transcript_path_cache.get(sid)
+    if cached is not None and cached.exists():
+        return cached
+    try:
+        for project in PROJECTS_DIR.iterdir():
+            if not project.is_dir():
+                continue
+            candidate = project / f"{sid}.jsonl"
+            if candidate.exists():
+                _transcript_path_cache[sid] = candidate
+                return candidate
+    except (OSError, FileNotFoundError):
+        pass
+    return None
+
+
+def _scan_chunk_for_color(chunk: str) -> str | None:
+    """Scan a transcript chunk for /color system events; return the last value found."""
+    color: str | None = None
+    for line in chunk.splitlines():
+        if "/color" not in line:
+            continue
+        try:
+            evt = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(evt, dict):
+            continue
+        if evt.get("type") != "system" or evt.get("subtype") != "local_command":
+            continue
+        match = COLOR_CMD_RE.search(evt.get("content", ""))
+        if match:
+            color = match.group(1).strip()
+    return color
+
+
+def load_session_colors(session_ids) -> dict[str, str]:
+    """Map session_id -> the color the user picked with Claude Code's `/color`
+    slash command, parsed from each session's transcript under
+    ~/.claude/projects/. Transcripts are tailed incrementally (we remember each
+    file's last-scanned byte offset) so the cost stays cheap as transcripts grow.
+    Refreshed at most every SESSION_COLOR_CACHE_TTL seconds; the cache
+    accumulates so a color stays known after the session ends.
+    """
+    global _session_color_cache_ts
+    now = time.monotonic()
+    if now - _session_color_cache_ts < SESSION_COLOR_CACHE_TTL:
+        return _session_color_cache
+    for sid in session_ids:
+        if not sid:
+            continue
+        path = _find_transcript(sid)
+        if path is None:
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        last_pos = _transcript_positions.get(sid, 0)
+        if size < last_pos:
+            # file got truncated/rewritten — re-scan from the start
+            last_pos = 0
+        if size == last_pos:
+            continue
+        try:
+            with open(path, "rb") as f:
+                f.seek(last_pos)
+                chunk = f.read(size - last_pos)
+        except OSError:
+            continue
+        _transcript_positions[sid] = size
+        color = _scan_chunk_for_color(chunk.decode("utf-8", errors="replace"))
+        if color:
+            _session_color_cache[sid] = color
+    _session_color_cache_ts = now
+    return _session_color_cache
 
 
 def _platform_opener() -> str:
@@ -218,6 +305,7 @@ def build_table(
     cursor: int,
     offset: int = 0,
     name_map: dict[str, str] | None = None,
+    color_map: dict[str, str] | None = None,
 ) -> Table:
     table = Table(
         box=box.SIMPLE_HEAVY,
@@ -248,7 +336,9 @@ def build_table(
                 cells.append(format_time(entry.get("timestamp", "")))
             elif col_id == 2:
                 sid = entry.get("session_id", "")
-                cells.append(Text(session_label(sid, name_map), style=session_color(sid)))
+                label = session_label(sid, name_map)
+                color = rich_color(color_map.get(sid)) if color_map else None
+                cells.append(Text(label, style=color) if color else label)
             elif col_id == 3:
                 cells.append(short_path(entry.get("cwd", "")))
             elif col_id == 4:
@@ -320,6 +410,7 @@ def build_panel(
     cursor: int,
     offset: int = 0,
     name_map: dict[str, str] | None = None,
+    color_map: dict[str, str] | None = None,
 ) -> Panel:
     max_rows = max(term_height - 10, 3)
 
@@ -328,7 +419,7 @@ def build_panel(
         content.append("Make sure the hook is configured in ~/.claude/settings.json\n", style="dim")
         content.append(f"Watching: {LOG_PATH}", style="dim")
     else:
-        content = build_table(entries, max_rows, visible_cols, cursor, offset, name_map)
+        content = build_table(entries, max_rows, visible_cols, cursor, offset, name_map, color_map)
 
     # Count sessions active in the last 5 minutes
     now = datetime.now().astimezone()
@@ -465,6 +556,7 @@ def main():
 
     entries, last_pos = read_last_entries(LOG_PATH, MAX_ENTRIES)
     name_map = load_session_names()
+    color_map = load_session_colors({e.get("session_id", "") for e in entries})
 
     interactive = sys.stdin.isatty()
     if interactive:
@@ -498,7 +590,7 @@ def main():
 
     try:
         with Live(
-            build_panel(entries, console.height, visible_cols, cursor, scroll_offset, name_map),
+            build_panel(entries, console.height, visible_cols, cursor, scroll_offset, name_map, color_map),
             console=console,
             refresh_per_second=4,
         ) as live:
@@ -561,9 +653,10 @@ def main():
                     clamp_view()
 
                     name_map = load_session_names()
+                    color_map = load_session_colors({e.get("session_id", "") for e in entries})
 
                     live.update(
-                        build_panel(entries, console.height, visible_cols, cursor, scroll_offset, name_map)
+                        build_panel(entries, console.height, visible_cols, cursor, scroll_offset, name_map, color_map)
                     )
             except KeyboardInterrupt:
                 pass
