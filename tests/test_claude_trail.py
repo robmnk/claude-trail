@@ -94,15 +94,113 @@ class TestShortPath:
         assert feed.short_path("") == ".../"
 
 
-class TestShortSession:
-    def test_empty(self):
-        assert feed.short_session("") == "--------"
+class TestSessionLabel:
+    def test_empty_id(self):
+        assert feed.session_label("") == "--------"
 
-    def test_eight_chars(self):
-        assert feed.short_session("abcd1234") == "abcd1234"
+    def test_no_name_map_uses_id_prefix(self):
+        assert feed.session_label("abcdef1234567890") == "abcdef12"
 
-    def test_longer_than_eight(self):
-        assert feed.short_session("abcdef1234567890") == "abcdef12"
+    def test_empty_name_map_falls_back(self):
+        assert feed.session_label("abcd1234", {}) == "abcd1234"
+
+    def test_id_present_in_map_returns_name(self):
+        assert feed.session_label("abcd1234", {"abcd1234": "my-session"}) == "my-session"
+
+    def test_id_absent_from_map_falls_back_to_prefix(self):
+        assert feed.session_label("abcdef1234567890", {"other": "x"}) == "abcdef12"
+
+
+class TestLoadSessionNames:
+    """Covers reading ~/.claude/sessions/*.json with mocked SESSIONS_DIR.
+
+    These tests mutate module-level cache state (`_session_name_cache`,
+    `_session_name_cache_ts`); each method resets it explicitly so order
+    does not matter.
+    """
+
+    def _reset_cache(self):
+        feed._session_name_cache.clear()
+        feed._session_name_cache_ts = 0.0
+
+    def test_reads_name_from_json(self, tmp_path):
+        import json
+        self._reset_cache()
+        (tmp_path / "1234.json").write_text(
+            json.dumps({"sessionId": "abc-123", "name": "my-session"})
+        )
+        with patch.object(feed, "SESSIONS_DIR", tmp_path), \
+             patch.object(feed, "SESSION_NAME_CACHE_TTL", 0.0):
+            names = feed.load_session_names()
+        assert names == {"abc-123": "my-session"}
+
+    def test_skips_sessions_without_name(self, tmp_path):
+        import json
+        self._reset_cache()
+        (tmp_path / "1.json").write_text(json.dumps({"sessionId": "a"}))
+        (tmp_path / "2.json").write_text(
+            json.dumps({"sessionId": "b", "name": "labeled"})
+        )
+        with patch.object(feed, "SESSIONS_DIR", tmp_path), \
+             patch.object(feed, "SESSION_NAME_CACHE_TTL", 0.0):
+            names = feed.load_session_names()
+        assert names == {"b": "labeled"}
+
+    def test_skips_entry_without_session_id(self, tmp_path):
+        import json
+        self._reset_cache()
+        (tmp_path / "orphan.json").write_text(json.dumps({"name": "no-id"}))
+        with patch.object(feed, "SESSIONS_DIR", tmp_path), \
+             patch.object(feed, "SESSION_NAME_CACHE_TTL", 0.0):
+            names = feed.load_session_names()
+        assert names == {}
+
+    def test_skips_malformed_json(self, tmp_path):
+        import json
+        self._reset_cache()
+        (tmp_path / "broken.json").write_text("not json at all")
+        (tmp_path / "good.json").write_text(
+            json.dumps({"sessionId": "x", "name": "ok"})
+        )
+        with patch.object(feed, "SESSIONS_DIR", tmp_path), \
+             patch.object(feed, "SESSION_NAME_CACHE_TTL", 0.0):
+            names = feed.load_session_names()
+        assert names == {"x": "ok"}
+
+    def test_skips_non_json_files(self, tmp_path):
+        import json
+        self._reset_cache()
+        (tmp_path / "README").write_text("ignore me")
+        (tmp_path / "lock.txt").write_text("ignore me too")
+        (tmp_path / "ok.json").write_text(
+            json.dumps({"sessionId": "y", "name": "kept"})
+        )
+        with patch.object(feed, "SESSIONS_DIR", tmp_path), \
+             patch.object(feed, "SESSION_NAME_CACHE_TTL", 0.0):
+            names = feed.load_session_names()
+        assert names == {"y": "kept"}
+
+    def test_missing_directory_returns_empty(self, tmp_path):
+        self._reset_cache()
+        missing = tmp_path / "does-not-exist"
+        with patch.object(feed, "SESSIONS_DIR", missing), \
+             patch.object(feed, "SESSION_NAME_CACHE_TTL", 0.0):
+            names = feed.load_session_names()
+        assert names == {}
+
+    def test_cache_persists_name_after_file_removed(self, tmp_path):
+        """A name observed once must remain available after Claude Code removes
+        the pid.json on session exit, so the TUI can still label historical rows.
+        """
+        import json
+        self._reset_cache()
+        pid_file = tmp_path / "999.json"
+        pid_file.write_text(json.dumps({"sessionId": "s1", "name": "first"}))
+        with patch.object(feed, "SESSIONS_DIR", tmp_path), \
+             patch.object(feed, "SESSION_NAME_CACHE_TTL", 0.0):
+            assert feed.load_session_names() == {"s1": "first"}
+            pid_file.unlink()
+            assert feed.load_session_names() == {"s1": "first"}
 
 
 class TestExtractFiles:
