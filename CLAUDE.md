@@ -58,7 +58,9 @@ python3 claude_trail.py   # if running from a clone
 |-----|--------|
 | `j`/`k` or `↓`/`↑` | Move cursor down/up |
 | `g`/`G` | Jump to top/bottom |
-| `Enter` | Open selected session's commands (filtered JSONL) in `$VISUAL` or the platform default launcher |
+| `Enter` | Open the full-command detail view for the selected command |
+| `Esc` | Close the detail view (also `q` or `Enter` while it is open) |
+| `o` | Open selected session's commands (filtered JSONL) in `$VISUAL` or the platform default launcher |
 | `f` | Open file manager on folder of files referenced in selected command |
 | `1`–`5` | Toggle columns: 1=Time, 2=Session, 3=Directory, 4=Files, 5=Command |
 | `c` | Clear display |
@@ -81,7 +83,8 @@ python3 claude_trail.py   # if running from a clone
 - Display shows newest-first, max 50 entries, with active session count
 - Poll interval: 300ms
 - File paths extracted via regex matching absolute (`/...`), home (`~/...`), and relative (`./...`) paths
-- Session JSONL written under `tempfile.gettempdir()` (default `/tmp`) as `claude-trail-session-{sanitized-id}.jsonl` on Enter
+- `Enter` opens an in-TUI detail view (`build_detail_panel()`) showing the selected command in full: untruncated, newlines preserved, with the danger `*` marker and a metadata header (time, session, directory, files). `Esc`/`q`/`Enter` close it. The view is modal: while open, navigation/column/clear keys are ignored (only `Ctrl-C` still quits).
+- Session JSONL written under `tempfile.gettempdir()` (default `/tmp`) as `claude-trail-session-{sanitized-id}.jsonl` on `o`
 - Session names are read from `~/.claude/sessions/<pid>.json` (`name` field). Cached for 2s in `load_session_names()`; the cache accumulates so a session's name remains resolvable after Claude Code removes its pid.json on exit.
 - Session color comes from the latest `/color <value>` event in `~/.claude/projects/*/<session-id>.jsonl` (`system/local_command` events). `load_session_colors()` tails each transcript incrementally and refreshes at most every 5s. Names like `orange`/`pink`/`gray` are translated to Rich-compatible equivalents (`orange1`, `pink1`, `grey50`) via `CLAUDE_COLOR_ALIASES`.
 - Column visibility persists during session, status bar shows toggle state as `1 2 3 4 5`
