@@ -5,6 +5,7 @@ import json
 import os
 import re
 import select
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,7 @@ import termios
 import time
 import tty
 from datetime import datetime
+from importlib.metadata import PackageNotFoundError, version as pkg_version
 from pathlib import Path
 
 from rich.console import Console, Group
@@ -20,6 +22,11 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from rich import box
+
+try:
+    __version__ = pkg_version("claude-trail")
+except PackageNotFoundError:  # running from a clone without an install
+    __version__ = ""
 
 LOG_PATH = Path.home() / ".claude" / "command-log.jsonl"
 SESSIONS_DIR = Path.home() / ".claude" / "sessions"
@@ -355,10 +362,11 @@ def build_table(
     return table
 
 
-def open_session_jsonl(session_id: str) -> None:
-    """Filter log by session_id, write to a temp file, open with $VISUAL or the platform default launcher."""
+def filter_session_log(session_id: str) -> str | None:
+    """Filter the command log down to one session, write it to a temp file, and
+    return that path (or None if there is nothing to show)."""
     if not session_id or not LOG_PATH.exists():
-        return
+        return None
     safe_id = re.sub(r"[^a-zA-Z0-9-]", "", session_id[:8]) or "unknown"
     out_path = os.path.join(tempfile.gettempdir(), f"claude-trail-session-{safe_id}.jsonl")
     with open(LOG_PATH, "r", encoding="utf-8") as f_in, open(out_path, "w", encoding="utf-8") as f_out:
@@ -366,13 +374,7 @@ def open_session_jsonl(session_id: str) -> None:
             entry = parse_line(line.strip())
             if entry and entry.get("session_id", "") == session_id:
                 f_out.write(line)
-    opener = os.environ.get("VISUAL") or _platform_opener()
-    subprocess.Popen(
-        [opener, out_path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    return out_path
 
 
 def open_file_folder(entry: dict) -> None:
@@ -401,6 +403,16 @@ def open_file_folder(entry: dict) -> None:
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+
+
+def _panel_title(extra: str = "") -> str:
+    """Title bar markup: ` claude-trail vX.Y.Z [extra] `."""
+    parts = ["[bold cyan] claude-trail [/bold cyan]"]
+    if __version__:
+        parts.append(f"[dim]v{__version__}[/dim]")
+    if extra:
+        parts.append(f"[dim] {extra}[/dim]")
+    return "".join(parts) + " "
 
 
 def build_detail_panel(
@@ -445,7 +457,7 @@ def build_detail_panel(
 
     return Panel(
         body,
-        title="[bold cyan] claude-trail · command [/bold cyan]",
+        title=_panel_title("· command"),
         subtitle=f"[dim]{LOG_PATH}[/dim]",
         box=box.ROUNDED,
         padding=(1, 2),
@@ -505,7 +517,7 @@ def build_panel(
 
     return Panel(
         body,
-        title="[bold cyan] claude-trail [/bold cyan]",
+        title=_panel_title(),
         subtitle=f"[dim]{LOG_PATH}[/dim]",
         box=box.ROUNDED,
         padding=(1, 2),
@@ -520,7 +532,9 @@ def read_key() -> str:
         ready, _, _ = select.select([sys.stdin], [], [], 0.05)
         if ready:
             ch2 = sys.stdin.read(1)
-            if ch2 == "[":
+            # CSI ("[") is the normal cursor-key form; SS3 ("O") is what a
+            # terminal in application-cursor-keys mode sends for the arrows.
+            if ch2 in ("[", "O"):
                 ch3 = sys.stdin.read(1)
                 if ch3 == "A":
                     return "up"
@@ -652,6 +666,36 @@ def main():
             console=console,
             refresh_per_second=4,
         ) as live:
+
+            def open_session_log(entry: dict) -> None:
+                out_path = filter_session_log(entry.get("session_id", ""))
+                if not out_path:
+                    return
+                editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+                if editor and interactive:
+                    # Terminal editor (nvim, vim, ...): suspend the live display
+                    # and hand the tty over, then restore. Launching it detached
+                    # would fight the TUI for the terminal and corrupt the screen.
+                    live.stop()
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                    try:
+                        subprocess.call(shlex.split(editor) + [out_path])
+                    except (OSError, ValueError):
+                        pass
+                    tty.setcbreak(fd)
+                    live.start(refresh=True)
+                else:
+                    # No editor configured: hand off to the GUI file launcher.
+                    try:
+                        subprocess.Popen(
+                            [_platform_opener(), out_path],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            start_new_session=True,
+                        )
+                    except OSError:
+                        pass
+
             try:
                 while True:
                     if interactive:
@@ -692,7 +736,7 @@ def main():
                             elif ch == "o":
                                 entry = selected_entry()
                                 if entry:
-                                    open_session_jsonl(entry.get("session_id", ""))
+                                    open_session_log(entry)
                             elif ch == "f":
                                 entry = selected_entry()
                                 if entry:
