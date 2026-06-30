@@ -525,23 +525,39 @@ def build_panel(
     )
 
 
-def read_key() -> str:
-    """Read a keypress, handling escape sequences for arrow keys."""
-    ch = sys.stdin.read(1)
-    if ch == "\x1b":
-        ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+def read_key(fd: int) -> str:
+    """Read one keypress from `fd`, decoding arrow-key escape sequences.
+
+    Reads via os.read (unbuffered) instead of sys.stdin on purpose: the poll
+    loop calls select() on this same fd, and Python's buffered text stdin would
+    read ahead into its own buffer where select() can't see it — dropping the
+    trailing bytes of arrow sequences and stalling queued keys (the cause of
+    laggy navigation). os.read keeps reads and select() consistent.
+    """
+    try:
+        data = os.read(fd, 1)
+    except OSError:
+        return ""
+    if not data:
+        return ""
+    if data == b"\x1b":
+        # Arrow keys arrive as a multi-byte escape sequence. Grab whatever is
+        # already buffered on the fd; a lone ESC has nothing waiting.
+        ready, _, _ = select.select([fd], [], [], 0.02)
         if ready:
-            ch2 = sys.stdin.read(1)
-            # CSI ("[") is the normal cursor-key form; SS3 ("O") is what a
-            # terminal in application-cursor-keys mode sends for the arrows.
-            if ch2 in ("[", "O"):
-                ch3 = sys.stdin.read(1)
-                if ch3 == "A":
-                    return "up"
-                elif ch3 == "B":
-                    return "down"
-        return ch
-    return ch
+            try:
+                tail = os.read(fd, 8)
+            except OSError:
+                tail = b""
+            seq = tail.decode("utf-8", errors="replace")
+            # CSI ("[A"/"[B") is the normal cursor-key form; SS3 ("OA"/"OB") is
+            # what a terminal in application-cursor-keys mode sends.
+            if seq in ("[A", "OA"):
+                return "up"
+            if seq in ("[B", "OB"):
+                return "down"
+        return "\x1b"
+    return data.decode("utf-8", errors="replace")
 
 
 def tail_file(path: Path, last_pos: int) -> tuple[list[str], int]:
@@ -696,51 +712,69 @@ def main():
                     except OSError:
                         pass
 
+            def apply_key(ch: str) -> bool:
+                """Apply one key. Returns True if the app should quit."""
+                nonlocal cursor, scroll_offset, detail_entry
+                if detail_entry is not None:
+                    # Modal full-command view: esc / q / enter return to the
+                    # table; Ctrl-C still quits.
+                    if ch == "\x03":
+                        return True
+                    if ch in ("\x1b", "q", "\r", "\n"):
+                        detail_entry = None
+                    return False
+                if ch in ("q", "\x03"):
+                    return True
+                if ch == "c":
+                    entries.clear()
+                    cursor = 0
+                    scroll_offset = 0
+                elif ch in ("k", "up"):
+                    cursor = max(0, cursor - 1)
+                    clamp_view()
+                elif ch in ("j", "down"):
+                    cursor = min(max(0, len(entries) - 1), cursor + 1)
+                    clamp_view()
+                elif ch == "g":
+                    cursor = 0
+                    scroll_offset = 0
+                elif ch == "G":
+                    cursor = max(0, len(entries) - 1)
+                    clamp_view()
+                elif ch in ("1", "2", "3", "4", "5"):
+                    col = int(ch)
+                    if not visible_cols[col] or sum(visible_cols.values()) > 1:
+                        visible_cols[col] = not visible_cols[col]
+                elif ch in ("\r", "\n"):
+                    detail_entry = selected_entry()
+                elif ch == "o":
+                    entry = selected_entry()
+                    if entry:
+                        open_session_log(entry)
+                elif ch == "f":
+                    entry = selected_entry()
+                    if entry:
+                        open_file_folder(entry)
+                return False
+
             try:
                 while True:
+                    quit_now = False
                     if interactive:
-                        ready, _, _ = select.select([sys.stdin], [], [], POLL_INTERVAL)
-                        if ready:
-                            ch = read_key()
-                            if detail_entry is not None:
-                                # Modal full-command view: esc / q / enter return
-                                # to the table; Ctrl-C still quits.
-                                if ch == "\x03":
-                                    break
-                                elif ch in ("\x1b", "q", "\r", "\n"):
-                                    detail_entry = None
-                            elif ch in ("q", "\x03"):
+                        ready, _, _ = select.select([fd], [], [], POLL_INTERVAL)
+                        # Drain every buffered keystroke before rendering, so
+                        # holding or fast-typing a key doesn't render once per
+                        # key (which feels laggy).
+                        while ready:
+                            ch = read_key(fd)
+                            if not ch:  # EOF / read error — stop draining
                                 break
-                            elif ch == "c":
-                                entries.clear()
-                                cursor = 0
-                                scroll_offset = 0
-                            elif ch in ("k", "up"):
-                                cursor = max(0, cursor - 1)
-                                clamp_view()
-                            elif ch in ("j", "down"):
-                                cursor = min(max(0, len(entries) - 1), cursor + 1)
-                                clamp_view()
-                            elif ch == "g":
-                                cursor = 0
-                                scroll_offset = 0
-                            elif ch == "G":
-                                cursor = max(0, len(entries) - 1)
-                                clamp_view()
-                            elif ch in ("1", "2", "3", "4", "5"):
-                                col = int(ch)
-                                if not visible_cols[col] or sum(visible_cols.values()) > 1:
-                                    visible_cols[col] = not visible_cols[col]
-                            elif ch in ("\r", "\n"):
-                                detail_entry = selected_entry()
-                            elif ch == "o":
-                                entry = selected_entry()
-                                if entry:
-                                    open_session_log(entry)
-                            elif ch == "f":
-                                entry = selected_entry()
-                                if entry:
-                                    open_file_folder(entry)
+                            if apply_key(ch):
+                                quit_now = True
+                                break
+                            ready, _, _ = select.select([fd], [], [], 0)
+                        if quit_now:
+                            break
                     else:
                         time.sleep(POLL_INTERVAL)
 
