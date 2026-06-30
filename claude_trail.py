@@ -403,6 +403,56 @@ def open_file_folder(entry: dict) -> None:
         )
 
 
+def build_detail_panel(
+    entry: dict,
+    term_height: int,
+    name_map: dict[str, str] | None = None,
+    color_map: dict[str, str] | None = None,
+) -> Panel:
+    """Full-screen view of a single command: metadata header plus the complete,
+    untruncated command text (newlines preserved)."""
+    sid = entry.get("session_id", "")
+    cmd = entry.get("command", "")
+
+    meta = Table.grid(padding=(0, 2))
+    meta.add_column(style="dim", justify="right", no_wrap=True)
+    meta.add_column(ratio=1)
+    meta.add_row("Time", format_time(entry.get("timestamp", "")))
+    label = session_label(sid, name_map)
+    color = rich_color(color_map.get(sid)) if color_map else None
+    meta.add_row("Session", Text(label, style=color) if color else label)
+    meta.add_row("Directory", entry.get("cwd", "") or "(none)")
+    files = extract_files(cmd)
+    if files:
+        meta.add_row("Files", files)
+
+    cmd_text = Text()
+    if is_dangerous(cmd):
+        cmd_text.append("* ", style="bold red")
+    cmd_text.append(cmd or "(empty)")
+
+    cmd_panel = Panel(
+        cmd_text,
+        title="[dim]command[/dim]",
+        title_align="left",
+        border_style="grey50",
+        box=box.ROUNDED,
+        padding=(1, 2),
+    )
+
+    hint = Text.from_markup("[dim italic]esc / q / ↵ : back[/dim italic]")
+    body = Group(meta, Text(""), cmd_panel, Text(""), hint)
+
+    return Panel(
+        body,
+        title="[bold cyan] claude-trail · command [/bold cyan]",
+        subtitle=f"[dim]{LOG_PATH}[/dim]",
+        box=box.ROUNDED,
+        padding=(1, 2),
+        height=term_height,
+    )
+
+
 def build_panel(
     entries: list[dict],
     term_height: int,
@@ -448,7 +498,7 @@ def build_panel(
 
     status2 = Text.from_markup(
         f"  [dim italic]cols:[/dim italic] {col_toggles}"
-        "  [dim italic]\u00b7  j/k:nav  \u21b5:session  f:folder  q:quit  c:clear[/dim italic]"
+        "  [dim italic]\u00b7  j/k:nav  \u21b5:view  o:session  f:folder  q:quit  c:clear[/dim italic]"
     )
 
     body = Group(content, Text(""), status, status2)
@@ -553,6 +603,7 @@ def main():
     cursor = 0
     scroll_offset = 0
     visible_cols = {1: True, 2: True, 3: True, 4: True, 5: True}
+    detail_entry: dict | None = None  # when set, render the full-command view
 
     entries, last_pos = read_last_entries(LOG_PATH, MAX_ENTRIES)
     name_map = load_session_names()
@@ -588,9 +639,16 @@ def main():
             return None
         return list(reversed(entries))[cursor]
 
+    def render_panel() -> Panel:
+        if detail_entry is not None:
+            return build_detail_panel(detail_entry, console.height, name_map, color_map)
+        return build_panel(
+            entries, console.height, visible_cols, cursor, scroll_offset, name_map, color_map
+        )
+
     try:
         with Live(
-            build_panel(entries, console.height, visible_cols, cursor, scroll_offset, name_map, color_map),
+            render_panel(),
             console=console,
             refresh_per_second=4,
         ) as live:
@@ -600,7 +658,14 @@ def main():
                         ready, _, _ = select.select([sys.stdin], [], [], POLL_INTERVAL)
                         if ready:
                             ch = read_key()
-                            if ch in ("q", "\x03"):
+                            if detail_entry is not None:
+                                # Modal full-command view: esc / q / enter return
+                                # to the table; Ctrl-C still quits.
+                                if ch == "\x03":
+                                    break
+                                elif ch in ("\x1b", "q", "\r", "\n"):
+                                    detail_entry = None
+                            elif ch in ("q", "\x03"):
                                 break
                             elif ch == "c":
                                 entries.clear()
@@ -623,6 +688,8 @@ def main():
                                 if not visible_cols[col] or sum(visible_cols.values()) > 1:
                                     visible_cols[col] = not visible_cols[col]
                             elif ch in ("\r", "\n"):
+                                detail_entry = selected_entry()
+                            elif ch == "o":
                                 entry = selected_entry()
                                 if entry:
                                     open_session_jsonl(entry.get("session_id", ""))
@@ -655,9 +722,7 @@ def main():
                     name_map = load_session_names()
                     color_map = load_session_colors({e.get("session_id", "") for e in entries})
 
-                    live.update(
-                        build_panel(entries, console.height, visible_cols, cursor, scroll_offset, name_map, color_map)
-                    )
+                    live.update(render_panel())
             except KeyboardInterrupt:
                 pass
     finally:
