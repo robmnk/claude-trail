@@ -760,6 +760,7 @@ def main():
             try:
                 while True:
                     quit_now = False
+                    acted = False
                     if interactive:
                         ready, _, _ = select.select([fd], [], [], POLL_INTERVAL)
                         # Drain every buffered keystroke before rendering, so
@@ -769,6 +770,7 @@ def main():
                             ch = read_key(fd)
                             if not ch:  # EOF / read error — stop draining
                                 break
+                            acted = True
                             if apply_key(ch):
                                 quit_now = True
                                 break
@@ -800,7 +802,10 @@ def main():
                     name_map = load_session_names()
                     color_map = load_session_colors({e.get("session_id", "") for e in entries})
 
-                    live.update(render_panel())
+                    # Redraw immediately on input or new log lines so cursor
+                    # moves feel instant; let the auto-refresh thread handle the
+                    # idle clock/active-count ticks.
+                    live.update(render_panel(), refresh=acted or new_count > 0)
             except KeyboardInterrupt:
                 pass
     finally:
