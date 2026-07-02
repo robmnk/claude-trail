@@ -2,16 +2,14 @@
 
 Observability tool for Claude Code: a real-time TUI dashboard that shows every Bash command Claude Code executes across all sessions.
 
-![TUI showing command feed with timestamps, sessions, and dangerous command highlighting]
-
 ## Features
 
-- **Live command trail** — watches all Claude Code Bash tool calls in real-time
-- **Multi-session aware** — tracks commands across concurrent sessions with color-coded IDs
-- **Dangerous command highlighting** — flags risky operations (`rm`, `sudo`, `git reset`, etc.) with red markers
-- **Active session indicator** — shows how many sessions have been active in the last 5 minutes
-- **Minimal footprint** — single Python file, one dependency (`rich`)
-- **Cross-platform** — works on Linux and macOS (uses `xdg-open` or `open` automatically)
+- **Live command trail** - watches all Claude Code Bash tool calls in real-time
+- **Multi-session aware** - tracks commands across concurrent sessions with color-coded IDs
+- **Dangerous command highlighting** - flags risky operations (`rm`, `sudo`, `git reset`, etc.) with red markers
+- **Active session indicator** - shows how many sessions have been active in the last 5 minutes
+- **Minimal footprint** - single Python file, one dependency (`rich`)
+- **Cross-platform** - works on Linux and macOS (uses `xdg-open` or `open` automatically)
 
 ## How It Works
 
@@ -26,10 +24,10 @@ Pick one:
 
 ```bash
 # pipx (recommended, broadly available)
-pipx install git+https://github.com/YOUR_USER/claude-trail
+pipx install git+https://github.com/robmnk/claude-trail
 
 # uv
-uv tool install git+https://github.com/YOUR_USER/claude-trail
+uv tool install git+https://github.com/robmnk/claude-trail
 
 # from a local clone, no install
 pip install -r requirements.txt
@@ -72,9 +70,11 @@ python3 claude_trail.py   # if running from a clone
 |-----|--------|
 | `j` / `k` or `↓` / `↑` | Move cursor down / up |
 | `g` / `G` | Jump to top / bottom |
-| `Enter` | Open selected session's commands (filtered JSONL) in `$VISUAL` or the platform default launcher (`xdg-open` on Linux, `open` on macOS) |
-| `f` | Open file manager on the folder of files referenced in the selected command |
-| `1`–`5` | Toggle columns (1=Time, 2=Session, 3=Directory, 4=Files, 5=Command) |
+| `Enter` | Open the full-command detail view for the selected command |
+| `Esc` | Close the detail view (also `q` or `Enter` while it is open) |
+| `o` | Open the selected session's commands (filtered JSONL) in `$VISUAL` / `$EDITOR`, else the platform launcher (`xdg-open` on Linux, `open` on macOS) |
+| `f` | Open the file manager on the folder of files referenced in the selected command |
+| `1`-`5` | Toggle columns (1=Time, 2=Session, 3=Directory, 4=Files, 5=Command) |
 | `c` | Clear display |
 | `q` | Quit |
 
@@ -126,6 +126,28 @@ The log file `~/.claude/command-log.jsonl` grows indefinitely. To bound it with 
 ```
 
 Or run a periodic truncation manually (e.g. via cron) once the file exceeds a size you're comfortable with.
+
+## Development
+
+Work from a clone with the dev dependencies installed:
+
+```bash
+git clone https://github.com/robmnk/claude-trail
+cd claude-trail
+pip install -e '.[dev]'   # editable install plus pytest
+```
+
+Run the tests:
+
+```bash
+pytest
+```
+
+Run the TUI straight from the checkout without installing:
+
+```bash
+python3 claude_trail.py
+```
 
 ## License
 
