@@ -53,18 +53,31 @@ DANGEROUS_PATTERNS = re.compile(
     r"|wget\b|curl\b.*-o\b"           # download/write
     r"|pip\s+install\b|npm\s+install\b" # package install
     r"|docker\s+rm\b|docker\s+rmi\b"   # container removal
-    # only mutating systemctl subcommands; bare `service` collided with
-    # `docker service ls` / `kubectl get service`
-    r"|systemctl\s+(?:start|stop|restart|reload|enable|disable|mask|daemon-reload)\b"
+    # systemctl: flag every subcommand except the read-only ones, so new
+    # mutating verbs (poweroff, isolate, unmask, try-restart, ...) are covered
+    # automatically and flags may precede the verb (`systemctl --user restart`).
+    r"|systemctl\s+(?:--?[\w-]+(?:=\S*)?\s+)*"
+    r"(?!(?:status|show|cat|help|list-[\w-]+|is-[\w-]+|get-default)\b)[a-z][\w-]*"
+    # SysV service control, scoped to `service <name> <verb>` so that
+    # `docker service ls` / `kubectl get service` stay unflagged
+    r"|service\s+\S+\s+(?:start|stop|restart|reload|force-reload)\b"
     r")",
     re.IGNORECASE,
 )
 
 # A write-redirect to an absolute path (e.g. `> /etc/hosts`, `2>/var/log/x`),
-# excluding the ubiquitous `/dev/null` discard and pure fd-duplication like
-# `2>&1` (which has no `/` target). Kept separate from DANGEROUS_PATTERNS
-# because that group's leading \b rejects a space-separated `> /path`.
-DANGEROUS_REDIRECT = re.compile(r">>?\s*/(?!dev/null\b)")
+# excluding targets that never touch the disk: /dev/null and the other stream
+# devices (/dev/zero, /dev/std*, /dev/tty, /dev/fd/N, /proc/self/fd/N). Pure
+# fd-duplication like `2>&1` has no `/` target and never matches. Kept
+# separate from DANGEROUS_PATTERNS because that group's leading \b rejects a
+# space-separated `> /path`.
+DANGEROUS_REDIRECT = re.compile(
+    r">>?\s*/(?!(?:dev/(?:null|zero|stdin|stdout|stderr|tty|fd/)|proc/self/fd/)\b)"
+)
+
+# Quoted spans, stripped before the redirect check: a redirect operator inside
+# quotes is literal text to the shell, not a redirect.
+QUOTED_SPAN_RE = re.compile(r"'[^']*'" + r'|"[^"]*"')
 
 # Extract file paths from command strings
 FILE_PATH_RE = re.compile(
@@ -111,7 +124,11 @@ def rich_color(claude_color: str | None) -> str | None:
 
 
 def is_dangerous(cmd: str) -> bool:
-    return bool(DANGEROUS_PATTERNS.search(cmd) or DANGEROUS_REDIRECT.search(cmd))
+    if DANGEROUS_PATTERNS.search(cmd):
+        return True
+    # Strip quoted spans first so prose like `git commit -m "logs > /var/log"`
+    # is not mistaken for a redirect; an unquoted `> /path` still matches.
+    return bool(DANGEROUS_REDIRECT.search(QUOTED_SPAN_RE.sub(" ", cmd)))
 
 
 def extract_files(cmd: str) -> str:
@@ -560,18 +577,35 @@ def read_key(fd: int) -> str:
     if not data:
         return ""
     if data == b"\x1b":
-        # Consume exactly one escape sequence: the CSI ("[") or SS3 ("O")
-        # introducer plus its final byte. Reading one byte at a time (rather
-        # than os.read(fd, 8)) leaves any following sequence on the fd for the
-        # next call. Holding an arrow key queues several, and a greedy read
-        # would swallow the rest and surface a lone ESC, dropping keystrokes.
+        # Consume exactly one complete escape sequence so none of its bytes
+        # leak into the drain loop as stray keystrokes (a leaked digit would
+        # toggle a column). CSI is ESC '[' + parameter/intermediate bytes
+        # (0x20-0x3F) + one final byte (0x40-0x7E), which covers modified
+        # arrows (ESC [ 1 ; 5 A) and function keys (ESC [ 1 5 ~); SS3 is
+        # ESC 'O' + one final byte. Reading one sequence at a time (rather
+        # than a greedy os.read(fd, 8)) leaves any following sequence on the
+        # fd for the next call, so held arrows don't drop keystrokes.
         intro = _read_pending_byte(fd)
-        if intro in (b"[", b"O"):
-            seq = (intro + _read_pending_byte(fd)).decode("utf-8", errors="replace")
-            if seq in ("[A", "OA"):
-                return "up"
-            if seq in ("[B", "OB"):
-                return "down"
+        if intro == b"[":
+            seq = intro
+            while len(seq) < 16:
+                nxt = _read_pending_byte(fd)
+                if not nxt:
+                    break
+                seq += nxt
+                if 0x40 <= nxt[0] <= 0x7E:  # CSI final byte
+                    break
+        elif intro == b"O":
+            seq = intro + _read_pending_byte(fd)
+        else:
+            return "\x1b"
+        decoded = seq.decode("utf-8", errors="replace")
+        # Final byte A/B is cursor up/down in both CSI and SS3, with or
+        # without modifier parameters ("[A", "[1;5A", "OA").
+        if decoded.endswith("A"):
+            return "up"
+        if decoded.endswith("B"):
+            return "down"
         return "\x1b"
     return data.decode("utf-8", errors="replace")
 
@@ -641,13 +675,13 @@ def hook_main(stream=None) -> int:
     return 0
 
 
-def _sigterm_exit(signum, frame):
-    """SIGTERM handler: raise SystemExit so main()'s finally restores the tty.
+def _signal_exit(signum, frame):
+    """Fatal-signal handler: raise SystemExit so main()'s finally restores the tty.
 
     SystemExit is a BaseException, so the loop's `except KeyboardInterrupt`
     does not swallow it and it propagates to the terminal-restoring finally.
     """
-    raise SystemExit(143)  # 128 + SIGTERM (15)
+    raise SystemExit(128 + signum)
 
 
 def main():
@@ -667,12 +701,16 @@ def main():
     interactive = sys.stdin.isatty()
     if interactive:
         fd = sys.stdin.fileno()
+        # Without these, a SIGTERM (kill/pkill from another pane), SIGHUP
+        # (kill -HUP), or SIGQUIT (Ctrl-\, which setcbreak leaves enabled)
+        # would terminate the process without unwinding, leaving the terminal
+        # in no-echo cbreak mode. Raising SystemExit lets the finally below
+        # restore it. Registered before setcbreak so there is no window where
+        # the tty is already altered but the handlers are not yet in place.
+        for _sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+            signal.signal(_sig, _signal_exit)
         old_settings = termios.tcgetattr(fd)
         tty.setcbreak(fd)
-        # Without this, a SIGTERM (kill/pkill from another pane) would terminate
-        # the process without unwinding, leaving the terminal in no-echo cbreak
-        # mode. Raising SystemExit lets the finally below restore it.
-        signal.signal(signal.SIGTERM, _sigterm_exit)
 
     def calc_max_rows():
         return max(console.height - 10, 3)
