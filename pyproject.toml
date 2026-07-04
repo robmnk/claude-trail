@@ -12,7 +12,7 @@ license = "MIT"
 dependencies = ["rich>=13.0"]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff"]
+dev = ["pytest", "ruff>=0.15,<0.16"]
 
 [project.scripts]
 claude-trail = "claude_trail:main"
