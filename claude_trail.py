@@ -966,6 +966,9 @@ def main():
 
                     new_lines, last_pos = tail_file(LOG_PATH, last_pos)
                     new_count = state.ingest(new_lines)
+                    # Re-read the height so a resize during the poll wait lands in
+                    # this frame's clamp (the old per-clamp code read it live).
+                    max_rows = visible_row_count(console.height)
                     state.clamp(max_rows)
 
                     name_map = load_session_names()
