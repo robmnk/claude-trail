@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """claude-trail: realtime TUI showing all Bash commands Claude Code executes."""
 
+import enum
 import json
 import os
 import re
@@ -13,7 +14,7 @@ import tempfile
 import termios
 import time
 import tty
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 from pathlib import Path
@@ -36,6 +37,8 @@ SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 MAX_ENTRIES = 50
 POLL_INTERVAL = 0.3
+CHROME_ROWS = 10  # title, status, padding
+MIN_VISIBLE_ROWS = 3
 SESSION_NAME_CACHE_TTL = 2.0  # seconds
 SESSION_COLOR_CACHE_TTL = 5.0  # seconds
 
@@ -532,6 +535,11 @@ def build_detail_panel(
     )
 
 
+def visible_row_count(term_height: int) -> int:
+    """Rows available for the table body once the panel chrome is accounted for."""
+    return max(term_height - CHROME_ROWS, MIN_VISIBLE_ROWS)
+
+
 def build_panel(
     entries: list[dict],
     term_height: int,
@@ -541,7 +549,7 @@ def build_panel(
     name_map: dict[str, str] | None = None,
     color_map: dict[str, str] | None = None,
 ) -> Panel:
-    max_rows = max(term_height - 10, 3)
+    max_rows = visible_row_count(term_height)
 
     if not entries:
         content = Text("Waiting for commands...\n\n", style="dim italic")
@@ -717,6 +725,134 @@ def hook_main(stream=None) -> int:
     return 0
 
 
+class Action(enum.Enum):
+    """Outcome of one keypress that main() must act on outside of state mutation."""
+
+    QUIT = enum.auto()
+    OPEN_SESSION = enum.auto()
+    OPEN_FILES = enum.auto()
+    NONE = enum.auto()
+
+
+@dataclass
+class AppState:
+    """All view state for the TUI, independent of terminal I/O.
+
+    INVARIANT: entries are stored oldest-first (append order); `cursor` and
+    `scroll_offset` index the newest-first VIEW, where index 0 = the newest
+    entry. `selected_entry()` is the single place that bridges the two by
+    reversing `entries`.
+    """
+
+    entries: list[dict]
+    cursor: int = 0
+    scroll_offset: int = 0
+    visible_cols: dict[int, bool] = field(
+        default_factory=lambda: {c.key: True for c in COLUMNS}
+    )
+    detail_entry: dict | None = None
+
+    def selected_entry(self) -> dict | None:
+        """The entry the cursor points at in the newest-first view, or None."""
+        if not self.entries or self.cursor < 0 or self.cursor >= len(self.entries):
+            return None
+        return list(reversed(self.entries))[self.cursor]
+
+    def move_up(self) -> None:
+        self.cursor = max(0, self.cursor - 1)
+
+    def move_down(self) -> None:
+        self.cursor = min(max(0, len(self.entries) - 1), self.cursor + 1)
+
+    def goto_top(self) -> None:
+        self.cursor = 0
+        self.scroll_offset = 0
+
+    def goto_bottom(self) -> None:
+        self.cursor = max(0, len(self.entries) - 1)
+
+    def toggle_col(self, col: int) -> None:
+        """Flip a column's visibility, but never hide the last visible column."""
+        if not self.visible_cols[col] or sum(self.visible_cols.values()) > 1:
+            self.visible_cols[col] = not self.visible_cols[col]
+
+    def ingest(self, new_lines: list[str]) -> int:
+        """Parse and append new log lines; re-anchor the cursor if scrolled away.
+
+        Returns the number of entries added. Trims to MAX_ENTRIES. Does NOT
+        clamp: the caller clamps after ingest (preserving the original order).
+        """
+        new_count = 0
+        for line in new_lines:
+            entry = parse_line(line.strip())
+            if entry:
+                self.entries.append(entry)
+                new_count += 1
+        # If the user scrolled away from the top, keep them anchored to the entry
+        # they were viewing as new entries shift the reversed view down.
+        if new_count > 0 and self.cursor > 0:
+            self.cursor += new_count
+            self.scroll_offset += new_count
+        if len(self.entries) > MAX_ENTRIES:
+            self.entries = self.entries[-MAX_ENTRIES:]
+        return new_count
+
+    def clamp(self, max_rows: int) -> None:
+        """Keep cursor in [0, len-1] and scroll_offset so the cursor is visible."""
+        if not self.entries:
+            self.cursor = 0
+            self.scroll_offset = 0
+            return
+        self.cursor = max(0, min(self.cursor, len(self.entries) - 1))
+        if self.cursor < self.scroll_offset:
+            self.scroll_offset = self.cursor
+        elif self.cursor >= self.scroll_offset + max_rows:
+            self.scroll_offset = self.cursor - max_rows + 1
+        max_offset = max(0, len(self.entries) - max_rows)
+        self.scroll_offset = max(0, min(self.scroll_offset, max_offset))
+
+
+def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
+    """Apply one keypress to `state`, returning the Action main() must perform.
+
+    Mutates `state` but spawns no processes and touches no terminal.
+    """
+    if state.detail_entry is not None:
+        # Modal full-command view: esc / q / enter return to the table;
+        # Ctrl-C still quits.
+        if ch == "\x03":
+            return Action.QUIT
+        if ch in ("\x1b", "q", "\r", "\n"):
+            state.detail_entry = None
+        return Action.NONE
+    if ch in ("q", "\x03"):
+        return Action.QUIT
+    if ch == "c":
+        state.entries.clear()
+        state.cursor = 0
+        state.scroll_offset = 0
+    elif ch in ("k", "up"):
+        state.move_up()
+        state.clamp(max_rows)
+    elif ch in ("j", "down"):
+        state.move_down()
+        state.clamp(max_rows)
+    elif ch == "g":
+        state.goto_top()
+    elif ch == "G":
+        state.goto_bottom()
+        state.clamp(max_rows)
+    elif ch.isdigit() and int(ch) in state.visible_cols:
+        state.toggle_col(int(ch))
+    elif ch in ("\r", "\n"):
+        state.detail_entry = state.selected_entry()
+    elif ch == "o":
+        return Action.OPEN_SESSION
+    elif ch == "f":
+        return Action.OPEN_FILES
+    return Action.NONE
+
+
 def _signal_exit(signum, frame):
     """Fatal-signal handler: raise SystemExit so main()'s finally restores the tty.
 
@@ -731,14 +867,11 @@ def main():
         sys.exit(hook_main())
 
     console = Console()
-    cursor = 0
-    scroll_offset = 0
-    visible_cols = {c.key: True for c in COLUMNS}
-    detail_entry: dict | None = None  # when set, render the full-command view
 
     entries, last_pos = read_last_entries(LOG_PATH, MAX_ENTRIES)
+    state = AppState(entries=entries)
     name_map = load_session_names()
-    color_map = load_session_colors({e.get("session_id", "") for e in entries})
+    color_map = load_session_colors({e.get("session_id", "") for e in state.entries})
 
     interactive = sys.stdin.isatty()
     if interactive:
@@ -754,35 +887,12 @@ def main():
         old_settings = termios.tcgetattr(fd)
         tty.setcbreak(fd)
 
-    def calc_max_rows():
-        return max(console.height - 10, 3)
-
-    def clamp_view():
-        """Keep cursor in [0, len(entries)-1] and scroll_offset so cursor is visible."""
-        nonlocal cursor, scroll_offset
-        if not entries:
-            cursor = 0
-            scroll_offset = 0
-            return
-        cursor = max(0, min(cursor, len(entries) - 1))
-        max_rows = calc_max_rows()
-        if cursor < scroll_offset:
-            scroll_offset = cursor
-        elif cursor >= scroll_offset + max_rows:
-            scroll_offset = cursor - max_rows + 1
-        max_offset = max(0, len(entries) - max_rows)
-        scroll_offset = max(0, min(scroll_offset, max_offset))
-
-    def selected_entry() -> dict | None:
-        if not entries or cursor < 0 or cursor >= len(entries):
-            return None
-        return list(reversed(entries))[cursor]
-
     def render_panel() -> Panel:
-        if detail_entry is not None:
-            return build_detail_panel(detail_entry, console.height, name_map, color_map)
+        if state.detail_entry is not None:
+            return build_detail_panel(state.detail_entry, console.height, name_map, color_map)
         return build_panel(
-            entries, console.height, visible_cols, cursor, scroll_offset, name_map, color_map
+            state.entries, console.height, state.visible_cols,
+            state.cursor, state.scroll_offset, name_map, color_map,
         )
 
     try:
@@ -821,53 +931,9 @@ def main():
                     except OSError:
                         pass
 
-            def apply_key(ch: str) -> bool:
-                """Apply one key. Returns True if the app should quit."""
-                nonlocal cursor, scroll_offset, detail_entry
-                if detail_entry is not None:
-                    # Modal full-command view: esc / q / enter return to the
-                    # table; Ctrl-C still quits.
-                    if ch == "\x03":
-                        return True
-                    if ch in ("\x1b", "q", "\r", "\n"):
-                        detail_entry = None
-                    return False
-                if ch in ("q", "\x03"):
-                    return True
-                if ch == "c":
-                    entries.clear()
-                    cursor = 0
-                    scroll_offset = 0
-                elif ch in ("k", "up"):
-                    cursor = max(0, cursor - 1)
-                    clamp_view()
-                elif ch in ("j", "down"):
-                    cursor = min(max(0, len(entries) - 1), cursor + 1)
-                    clamp_view()
-                elif ch == "g":
-                    cursor = 0
-                    scroll_offset = 0
-                elif ch == "G":
-                    cursor = max(0, len(entries) - 1)
-                    clamp_view()
-                elif ch.isdigit() and int(ch) in visible_cols:
-                    col = int(ch)
-                    if not visible_cols[col] or sum(visible_cols.values()) > 1:
-                        visible_cols[col] = not visible_cols[col]
-                elif ch in ("\r", "\n"):
-                    detail_entry = selected_entry()
-                elif ch == "o":
-                    entry = selected_entry()
-                    if entry:
-                        open_session_log(entry)
-                elif ch == "f":
-                    entry = selected_entry()
-                    if entry:
-                        open_file_folder(entry)
-                return False
-
             try:
                 while True:
+                    max_rows = visible_row_count(console.height)
                     quit_now = False
                     acted = False
                     if interactive:
@@ -877,12 +943,21 @@ def main():
                         # key (which feels laggy).
                         while ready:
                             ch = read_key(fd)
-                            if not ch:  # EOF / read error — stop draining
+                            if not ch:  # EOF / read error - stop draining
                                 break
                             acted = True
-                            if apply_key(ch):
+                            action = apply_key(state, ch, max_rows)
+                            if action is Action.QUIT:
                                 quit_now = True
                                 break
+                            if action is Action.OPEN_SESSION:
+                                entry = state.selected_entry()
+                                if entry:
+                                    open_session_log(entry)
+                            elif action is Action.OPEN_FILES:
+                                entry = state.selected_entry()
+                                if entry:
+                                    open_file_folder(entry)
                             ready, _, _ = select.select([fd], [], [], 0)
                         if quit_now:
                             break
@@ -890,26 +965,14 @@ def main():
                         time.sleep(POLL_INTERVAL)
 
                     new_lines, last_pos = tail_file(LOG_PATH, last_pos)
-                    new_count = 0
-                    for line in new_lines:
-                        entry = parse_line(line.strip())
-                        if entry:
-                            entries.append(entry)
-                            new_count += 1
-
-                    # If user scrolled away from the top, keep them anchored to the
-                    # entry they were viewing as new entries shift the reversed view down.
-                    if new_count > 0 and cursor > 0:
-                        cursor += new_count
-                        scroll_offset += new_count
-
-                    if len(entries) > MAX_ENTRIES:
-                        entries = entries[-MAX_ENTRIES:]
-
-                    clamp_view()
+                    new_count = state.ingest(new_lines)
+                    # Re-read the height so a resize during the poll wait lands in
+                    # this frame's clamp (the old per-clamp code read it live).
+                    max_rows = visible_row_count(console.height)
+                    state.clamp(max_rows)
 
                     name_map = load_session_names()
-                    color_map = load_session_colors({e.get("session_id", "") for e in entries})
+                    color_map = load_session_colors({e.get("session_id", "") for e in state.entries})
 
                     # Redraw immediately on input or new log lines so cursor
                     # moves feel instant; let the auto-refresh thread handle the
