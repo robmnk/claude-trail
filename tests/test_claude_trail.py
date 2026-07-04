@@ -67,6 +67,67 @@ class TestIsDangerous:
     def test_systemctl_daemon_reload_flagged(self):
         assert feed.is_dangerous("systemctl daemon-reload") is True
 
+    def test_systemctl_flag_before_verb_flagged(self):
+        assert feed.is_dangerous("systemctl --user restart foo") is True
+
+    def test_systemctl_now_enable_flagged(self):
+        assert feed.is_dangerous("systemctl --now enable bar") is True
+
+    def test_systemctl_poweroff_flagged(self):
+        assert feed.is_dangerous("systemctl poweroff") is True
+
+    def test_systemctl_unmask_flagged(self):
+        assert feed.is_dangerous("systemctl unmask foo") is True
+
+    def test_systemctl_try_restart_flagged(self):
+        assert feed.is_dangerous("systemctl try-restart nginx") is True
+
+    def test_systemctl_isolate_flagged(self):
+        assert feed.is_dangerous("systemctl isolate rescue.target") is True
+
+    def test_systemctl_list_units_not_flagged(self):
+        assert feed.is_dangerous("systemctl list-units") is False
+
+    def test_systemctl_is_active_not_flagged(self):
+        assert feed.is_dangerous("systemctl is-active nginx") is False
+
+    def test_service_restart_flagged(self):
+        assert feed.is_dangerous("service nginx restart") is True
+
+    def test_service_stop_flagged(self):
+        assert feed.is_dangerous("service ssh stop") is True
+
+    def test_service_status_not_flagged(self):
+        assert feed.is_dangerous("service nginx status") is False
+
+    def test_redirect_inside_quotes_not_flagged(self):
+        assert feed.is_dangerous('git commit -m "route logs > /var/log"') is False
+
+    def test_arrow_text_inside_quotes_not_flagged(self):
+        assert feed.is_dangerous('echo "routes: api -> /var/www"') is False
+
+    def test_unquoted_arrow_redirect_still_flagged(self):
+        # unquoted, the shell parses `-> /path` as the word `-` plus a real redirect
+        assert feed.is_dangerous("echo api -> /var/www") is True
+
+    def test_dev_stderr_not_flagged(self):
+        assert feed.is_dangerous("echo msg > /dev/stderr") is False
+
+    def test_dev_tty_not_flagged(self):
+        assert feed.is_dangerous("printf x > /dev/tty") is False
+
+    def test_dev_stdout_not_flagged(self):
+        assert feed.is_dangerous("echo x >/dev/stdout") is False
+
+    def test_proc_self_fd_not_flagged(self):
+        assert feed.is_dangerous("cmd 2>/proc/self/fd/2") is False
+
+    def test_append_to_absolute_path_flagged(self):
+        assert feed.is_dangerous("echo x >> /var/log/app.log") is True
+
+    def test_append_discard_not_flagged(self):
+        assert feed.is_dangerous("cmd 2>>/dev/null") is False
+
 
 class TestNormalizeCmd:
     def test_collapses_runs_of_whitespace(self):
@@ -573,9 +634,33 @@ class TestReadKey:
     def test_mixed_arrow_then_char_not_dropped(self):
         assert self._read_and_close(b"\x1b[Aj", calls=2) == ["up", "j"]
 
+    def test_modified_arrow_consumed_whole(self):
+        # Ctrl-Up (ESC [ 1 ; 5 A) must not leak ';','5','A' as stray keys
+        # ('5' would toggle the Command column); the whole CSI sequence is
+        # consumed and the modifier is ignored.
+        assert self._read_and_close(b"\x1b[1;5Aj", calls=2) == ["up", "j"]
 
-class TestSigtermExit:
+    def test_shift_down_decodes(self):
+        assert self._read_and_close(b"\x1b[1;2B") == ["down"]
+
+    def test_function_key_consumed_whole(self):
+        # F5 (ESC [ 1 5 ~) decodes to a bare ESC with nothing left on the fd
+        assert self._read_and_close(b"\x1b[15~j", calls=2) == ["\x1b", "j"]
+
+    def test_da_response_consumed_whole(self):
+        # a terminal DA response must not leak 'c' (the clear-display key)
+        assert self._read_and_close(b"\x1b[?1;2cj", calls=2) == ["\x1b", "j"]
+
+
+class TestSignalExit:
     def test_raises_system_exit(self):
         import pytest
         with pytest.raises(SystemExit):
-            feed._sigterm_exit(15, None)
+            feed._signal_exit(15, None)
+
+    def test_exit_code_is_128_plus_signum(self):
+        import pytest
+        import signal as _signal
+        with pytest.raises(SystemExit) as exc:
+            feed._signal_exit(int(_signal.SIGHUP), None)
+        assert exc.value.code == 128 + int(_signal.SIGHUP)
