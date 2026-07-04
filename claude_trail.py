@@ -67,8 +67,12 @@ ACTIVE_WINDOW_SECONDS = 300  # a session counts as active if seen within this wi
 class LogEntry(TypedDict):
     """One appended log line: what the hook writes and the TUI reads back.
 
+    The four keys below are always written. A subagent's tool call also carries
+    optional `agent_id`/`agent_type` (see `hook_main`); a main-thread call omits
+    them, so an absent `agent_id` means the main agent ran the command.
+
     Annotation only. `parse_line` returns whatever JSON was on the line (a
-    plain dict at runtime), so these four keys describe the expected shape,
+    plain dict at runtime), so these keys describe the expected shape,
     not an enforced schema.
     """
 
@@ -801,14 +805,29 @@ def read_last_entries(path: Path, n: int) -> tuple[list[LogEntry], int]:
 # ==== Hook ====
 
 
-def _new_entry(timestamp: str, command: str, cwd: str, session_id: str) -> LogEntry:
-    """Build a log entry in the exact key order the hook emits to JSONL."""
-    return {
+def _new_entry(
+    timestamp: str,
+    command: str,
+    cwd: str,
+    session_id: str,
+    agent_id: str | None = None,
+    agent_type: str | None = None,
+) -> LogEntry:
+    """Build a log entry in the exact key order the hook emits to JSONL.
+
+    `agent_id`/`agent_type` are appended (in that order) only for a subagent's
+    tool call; a main-thread call omits them entirely.
+    """
+    entry: dict[str, str] = {
         "timestamp": timestamp,
         "command": command,
         "cwd": cwd,
         "session_id": session_id,
     }
+    if agent_id:
+        entry["agent_id"] = agent_id
+        entry["agent_type"] = agent_type or ""
+    return entry
 
 
 def hook_main(stream=None) -> int:
@@ -823,11 +842,16 @@ def hook_main(stream=None) -> int:
     if not isinstance(data, dict) or data.get("tool_name") != "Bash":
         return 0
     tool_input = data.get("tool_input") or {}
+    # PostToolUse adds agent_id/agent_type only when the hook fires inside a
+    # subagent (Task/Agent/fork/workflow agent); a main-thread call omits them.
+    # agent_id matches the subagent's transcript filename id.
     entry = _new_entry(
         timestamp=datetime.now().astimezone().isoformat(timespec="seconds"),
         command=tool_input.get("command", ""),
         cwd=data.get("cwd", ""),
         session_id=data.get("session_id", ""),
+        agent_id=data.get("agent_id"),
+        agent_type=data.get("agent_type"),
     )
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(LOG_PATH, "a", encoding="utf-8") as f:
