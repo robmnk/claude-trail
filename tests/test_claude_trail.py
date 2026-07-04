@@ -40,6 +40,33 @@ class TestIsDangerous:
     def test_tee_no_longer_flagged(self):
         assert feed.is_dangerous("echo hi | tee output.txt") is False
 
+    def test_stderr_discard_not_flagged(self):
+        assert feed.is_dangerous("cmd 2>/dev/null") is False
+
+    def test_fd_dup_not_flagged(self):
+        assert feed.is_dangerous("python x.py 1>/dev/null 2>&1") is False
+
+    def test_write_to_absolute_path_flagged(self):
+        assert feed.is_dangerous("echo hi > /etc/hosts") is True
+
+    def test_stderr_redirect_to_real_file_flagged(self):
+        assert feed.is_dangerous("run 2>/var/log/out") is True
+
+    def test_systemctl_status_not_flagged(self):
+        assert feed.is_dangerous("systemctl status nginx") is False
+
+    def test_docker_service_ls_not_flagged(self):
+        assert feed.is_dangerous("docker service ls") is False
+
+    def test_kubectl_get_service_not_flagged(self):
+        assert feed.is_dangerous("kubectl get service") is False
+
+    def test_systemctl_restart_flagged(self):
+        assert feed.is_dangerous("systemctl restart nginx") is True
+
+    def test_systemctl_daemon_reload_flagged(self):
+        assert feed.is_dangerous("systemctl daemon-reload") is True
+
 
 class TestNormalizeCmd:
     def test_collapses_runs_of_whitespace(self):
@@ -501,3 +528,54 @@ class TestHookMain:
             })))
         assert rc == 0
         assert log.exists()
+
+
+class TestReadKey:
+    """read_key decodes exactly one escape sequence per call and leaves any
+    following bytes on the fd (so queued arrow keys are not dropped)."""
+
+    def _feed(self, data: bytes) -> int:
+        import os
+        r, w = os.pipe()
+        os.write(w, data)
+        os.close(w)  # EOF after the queued bytes so a lone-ESC select returns at once
+        return r
+
+    def _read_and_close(self, data: bytes, calls: int = 1):
+        import os
+        r = self._feed(data)
+        try:
+            return [feed.read_key(r) for _ in range(calls)]
+        finally:
+            os.close(r)
+
+    def test_plain_char(self):
+        assert self._read_and_close(b"j") == ["j"]
+
+    def test_csi_up(self):
+        assert self._read_and_close(b"\x1b[A") == ["up"]
+
+    def test_csi_down(self):
+        assert self._read_and_close(b"\x1b[B") == ["down"]
+
+    def test_ss3_up(self):
+        assert self._read_and_close(b"\x1bOA") == ["up"]
+
+    def test_ss3_down(self):
+        assert self._read_and_close(b"\x1bOB") == ["down"]
+
+    def test_lone_esc_returns_esc(self):
+        assert self._read_and_close(b"\x1b") == ["\x1b"]
+
+    def test_two_queued_arrows_not_dropped(self):
+        assert self._read_and_close(b"\x1b[B\x1b[B", calls=2) == ["down", "down"]
+
+    def test_mixed_arrow_then_char_not_dropped(self):
+        assert self._read_and_close(b"\x1b[Aj", calls=2) == ["up", "j"]
+
+
+class TestSigtermExit:
+    def test_raises_system_exit(self):
+        import pytest
+        with pytest.raises(SystemExit):
+            feed._sigterm_exit(15, None)
