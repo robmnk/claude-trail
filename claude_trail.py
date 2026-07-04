@@ -794,7 +794,7 @@ def read_last_entries(path: Path, n: int) -> tuple[list[LogEntry], int]:
             data = f.read(read_size) + data
     text = data.decode("utf-8", errors="replace")
     lines = text.splitlines()[-n:]
-    entries = [e for e in (parse_line(l) for l in lines) if e]
+    entries = [e for e in (parse_line(line) for line in lines) if e]
     return entries, size
 
 
