@@ -91,7 +91,7 @@ Adding a column is a single entry in the list.
 
 ## Conventions
 
-- Log format is JSONL with fields: `timestamp`, `command`, `cwd`, `session_id` (modeled as the `LogEntry` TypedDict; annotation only, `parse_line` still returns a plain dict at runtime). `hook_main` builds each line via `_new_entry()` to fix the key order.
+- Log format is JSONL with fields: `timestamp`, `command`, `cwd`, `session_id`, plus optional `agent_id`/`agent_type` on a subagent's commands (PostToolUse adds them only inside a subagent, so an absent `agent_id` means the main agent). Modeled as the `LogEntry` TypedDict; annotation only, `parse_line` still returns a plain dict at runtime. `hook_main` builds each line via `_new_entry()` to fix the key order.
 - Dangerous commands (rm, sudo, git reset, chmod, etc.) are flagged with red `*` prefix
 - Display shows newest-first, max 50 entries, with active session count = distinct `session_id`s seen within `ACTIVE_WINDOW_SECONDS` (300s), computed by `count_active_sessions(entries, now, window=ACTIVE_WINDOW_SECONDS)`
 - Poll interval: 300ms

@@ -659,6 +659,48 @@ class TestHookMain:
         assert rc == 0
         assert log.exists()
 
+    def test_subagent_event_records_agent(self, tmp_path):
+        import json
+        rc, log = self._run_hook(tmp_path, {
+            "tool_name": "Bash",
+            "tool_input": {"command": "pytest -q"},
+            "cwd": "/work",
+            "session_id": "abcdef12",
+            "agent_id": "af6978028df59ded3",
+            "agent_type": "general-purpose",
+        })
+        assert rc == 0
+        entry = json.loads(log.read_text(encoding="utf-8").strip())
+        assert entry["agent_id"] == "af6978028df59ded3"
+        assert entry["agent_type"] == "general-purpose"
+
+    def test_main_agent_event_omits_agent_keys(self, tmp_path):
+        # No agent_id in the payload (main thread) -> no agent_* keys written,
+        # so absent agent_id can mean "the main agent" downstream.
+        import json
+        rc, log = self._run_hook(tmp_path, {
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "session_id": "abcdef12",
+        })
+        assert rc == 0
+        entry = json.loads(log.read_text(encoding="utf-8").strip())
+        assert "agent_id" not in entry
+        assert "agent_type" not in entry
+
+    def test_agent_type_defaults_to_empty_when_missing(self, tmp_path):
+        # agent_id present but agent_type absent -> agent_type stored as "".
+        import json
+        rc, log = self._run_hook(tmp_path, {
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "agent_id": "af69",
+        })
+        assert rc == 0
+        entry = json.loads(log.read_text(encoding="utf-8").strip())
+        assert entry["agent_id"] == "af69"
+        assert entry["agent_type"] == ""
+
 
 class TestReadKey:
     """read_key decodes exactly one escape sequence per call and leaves any
