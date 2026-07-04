@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-"""claude-trail: realtime TUI showing all Bash commands Claude Code executes."""
+"""claude-trail: realtime TUI showing all Bash commands Claude Code executes.
+
+Pipeline:
+    A PostToolUse hook (`claude-trail hook`) appends one JSON line per Bash
+    command to CONFIG_DIR/command-log.jsonl (default ~/.claude). The TUI tails
+    that file, folds the new lines into an AppState (entries plus cursor/scroll/
+    column view state), and Rich renders the state as a newest-first table or a
+    full-command detail panel.
+
+Layout: the file is split into `# ==== <name> ====` banners, in file order:
+    config/paths, danger + path patterns, columns, session /color parsing,
+    danger detection + path extraction, session names, session colors,
+    format/parse helpers, rendering (table), side-effecting actions,
+    rendering (panels), input decoding, file tailing, hook,
+    AppState + apply_key, main.
+"""
 
 import enum
 import json
@@ -18,7 +33,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TypedDict
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -27,20 +42,43 @@ from rich.table import Table
 from rich.text import Text
 from rich import box
 
+# ==== Config / paths ====
+
 try:
     __version__ = pkg_version("claude-trail")
 except PackageNotFoundError:  # running from a clone without an install
     __version__ = ""
 
-LOG_PATH = Path.home() / ".claude" / "command-log.jsonl"
-SESSIONS_DIR = Path.home() / ".claude" / "sessions"
-PROJECTS_DIR = Path.home() / ".claude" / "projects"
+# All state lives under CONFIG_DIR. Honor $CLAUDE_CONFIG_DIR so a relocated
+# Claude Code config still resolves the log, session names, and /color tints.
+CONFIG_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+LOG_PATH = CONFIG_DIR / "command-log.jsonl"
+SESSIONS_DIR = CONFIG_DIR / "sessions"
+PROJECTS_DIR = CONFIG_DIR / "projects"
 MAX_ENTRIES = 1000
 POLL_INTERVAL = 0.3
 CHROME_ROWS = 10  # title, status, padding
 MIN_VISIBLE_ROWS = 3
 SESSION_NAME_CACHE_TTL = 2.0  # seconds
 SESSION_COLOR_CACHE_TTL = 5.0  # seconds
+ACTIVE_WINDOW_SECONDS = 300  # a session counts as active if seen within this window
+
+
+class LogEntry(TypedDict):
+    """One appended log line: what the hook writes and the TUI reads back.
+
+    Annotation only. `parse_line` returns whatever JSON was on the line (a
+    plain dict at runtime), so these four keys describe the expected shape,
+    not an enforced schema.
+    """
+
+    timestamp: str
+    command: str
+    cwd: str
+    session_id: str
+
+
+# ==== Danger + path patterns ====
 
 DANGEROUS_PATTERNS = re.compile(
     r"\b("
@@ -95,6 +133,9 @@ FILE_PATH_RE = re.compile(
 )
 
 
+# ==== Columns ====
+
+
 @dataclass(frozen=True, eq=False)
 class RenderCtx:
     """Per-render state a column cell may need.
@@ -122,7 +163,7 @@ class Column:
     name: str
     style: str
     kwargs: dict
-    render: Callable[[dict, RenderCtx], object]
+    render: Callable[[LogEntry, RenderCtx], object]
 
 
 def _danger_prefixed(cmd: str, body: str) -> Text:
@@ -134,26 +175,26 @@ def _danger_prefixed(cmd: str, body: str) -> Text:
     return text
 
 
-def _render_time(entry: dict, ctx: RenderCtx):
+def _render_time(entry: LogEntry, ctx: RenderCtx):
     return format_time(entry.get("timestamp", ""))
 
 
-def _render_session(entry: dict, ctx: RenderCtx):
+def _render_session(entry: LogEntry, ctx: RenderCtx):
     sid = entry.get("session_id", "")
     label = session_label(sid, ctx.name_map)
     color = rich_color(ctx.color_map.get(sid)) if ctx.color_map else None
     return Text(label, style=color) if color else label
 
 
-def _render_directory(entry: dict, ctx: RenderCtx):
+def _render_directory(entry: LogEntry, ctx: RenderCtx):
     return short_path(entry.get("cwd", ""))
 
 
-def _render_files(entry: dict, ctx: RenderCtx):
+def _render_files(entry: LogEntry, ctx: RenderCtx):
     return extract_files(entry.get("command", ""))
 
 
-def _render_command(entry: dict, ctx: RenderCtx):
+def _render_command(entry: LogEntry, ctx: RenderCtx):
     cmd = entry.get("command", "")
     return _danger_prefixed(cmd, normalize_cmd(cmd))
 
@@ -168,6 +209,8 @@ COLUMNS = [
     Column(5, "Command", "white",
            {"ratio": 1, "no_wrap": True, "overflow": "ellipsis"}, _render_command),
 ]
+
+# ==== Session /color parsing + aliases ====
 
 # Matches the `/color <value>` slash command as it appears in transcript
 # system/local_command events: a single line containing
@@ -195,6 +238,9 @@ def rich_color(claude_color: str | None) -> str | None:
     return CLAUDE_COLOR_ALIASES.get(claude_color, claude_color)
 
 
+# ==== Danger detection + path extraction ====
+
+
 def is_dangerous(cmd: str) -> bool:
     if DANGEROUS_PATTERNS.search(cmd):
         return True
@@ -203,17 +249,16 @@ def is_dangerous(cmd: str) -> bool:
     return bool(DANGEROUS_REDIRECT.search(QUOTED_SPAN_RE.sub(" ", cmd)))
 
 
+def find_paths(cmd: str) -> list[str]:
+    """File paths referenced in `cmd`, in first-seen order, de-duplicated."""
+    return list(dict.fromkeys(FILE_PATH_RE.findall(cmd)))
+
+
 def extract_files(cmd: str) -> str:
-    """Extract file paths referenced in a command."""
-    paths = FILE_PATH_RE.findall(cmd)
-    if not paths:
+    """Basenames of the paths in `cmd`, comma-joined (max 3, then `+N` overflow)."""
+    unique = find_paths(cmd)
+    if not unique:
         return ""
-    seen = set()
-    unique = []
-    for p in paths:
-        if p not in seen:
-            seen.add(p)
-            unique.append(p)
     short = [os.path.basename(p.rstrip("/")) or p for p in unique[:3]]
     result = ", ".join(short)
     if len(unique) > 3:
@@ -229,6 +274,8 @@ def short_path(cwd: str) -> str:
     return ".../" + name
 
 
+# ==== Session names ====
+
 _session_name_cache: dict[str, str] = {}
 _session_name_cache_ts: float = 0.0
 
@@ -238,7 +285,7 @@ def load_session_names() -> dict[str, str]:
 
     Claude Code writes one JSON file per running session there (named after pid),
     each carrying a `sessionId` and an optional `name`. The file is removed when
-    the session exits, so we accumulate known names across calls — once a name has
+    the session exits, so we accumulate known names across calls: once a name has
     been observed it stays available even after the session is gone. Cached for
     SESSION_NAME_CACHE_TTL seconds to avoid hitting the filesystem on every render.
     """
@@ -276,6 +323,8 @@ def session_label(sid: str, name_map: dict[str, str] | None = None) -> str:
             return name
     return sid[:8] if sid else "--------"
 
+
+# ==== Session colors ====
 
 _session_color_cache: dict[str, str] = {}
 _session_color_cache_ts: float = 0.0
@@ -345,7 +394,7 @@ def load_session_colors(session_ids) -> dict[str, str]:
             continue
         last_pos = _transcript_positions.get(sid, 0)
         if size < last_pos:
-            # file got truncated/rewritten — re-scan from the start
+            # file got truncated/rewritten, re-scan from the start
             last_pos = 0
         if size == last_pos:
             continue
@@ -363,6 +412,9 @@ def load_session_colors(session_ids) -> dict[str, str]:
     return _session_color_cache
 
 
+# ==== Format / parse helpers ====
+
+
 def _platform_opener() -> str:
     """Return the platform-default file launcher (`open` on macOS, `xdg-open` elsewhere)."""
     if sys.platform == "darwin":
@@ -375,7 +427,9 @@ def normalize_cmd(cmd: str) -> str:
     return " ".join(cmd.split())
 
 
-def parse_line(line: str) -> dict | None:
+def parse_line(line: str) -> LogEntry | None:
+    # Annotation only: at runtime this returns whatever JSON the line held
+    # (a plain dict), so tests asserting plain-dict equality still pass.
     try:
         return json.loads(line)
     except (json.JSONDecodeError, ValueError):
@@ -392,9 +446,12 @@ def format_time(ts: str) -> str:
         return "??:??:??"
 
 
+# ==== Rendering: table ====
+
+
 def get_display_entries(
-    entries: list[dict], max_rows: int, offset: int = 0
-) -> list[dict]:
+    entries: list[LogEntry], max_rows: int, offset: int = 0
+) -> list[LogEntry]:
     """Return up to max_rows entries in newest-first order, skipping the first `offset`."""
     if not entries:
         return []
@@ -403,7 +460,7 @@ def get_display_entries(
 
 
 def build_table(
-    entries: list[dict],
+    entries: list[LogEntry],
     max_rows: int,
     visible_cols: dict[int, bool],
     cursor: int,
@@ -411,6 +468,14 @@ def build_table(
     name_map: dict[str, str] | None = None,
     color_map: dict[str, str] | None = None,
 ) -> Table:
+    """Render up to `max_rows` entries as a Rich table, newest first.
+
+    Cursor/offset contract: rows are shown newest-first (index 0 = newest).
+    `offset` skips the N newest rows (scrolling down through history), and the
+    cursor is highlighted at `highlight_idx = cursor - offset` within the
+    displayed slice; when the cursor is scrolled out of view that index falls
+    outside the slice and no row is highlighted.
+    """
     table = Table(
         box=box.SIMPLE_HEAVY,
         expand=True,
@@ -435,6 +500,9 @@ def build_table(
     return table
 
 
+# ==== Side-effecting actions ====
+
+
 def filter_session_log(session_id: str) -> str | None:
     """Filter the command log down to one session, write it to a temp file, and
     return that path (or None if there is nothing to show)."""
@@ -450,11 +518,11 @@ def filter_session_log(session_id: str) -> str | None:
     return out_path
 
 
-def open_file_folder(entry: dict) -> None:
+def open_file_folder(entry: LogEntry) -> None:
     """Open the folder containing files referenced in the command."""
     cmd = entry.get("command", "")
     cwd = entry.get("cwd", "")
-    paths = FILE_PATH_RE.findall(cmd)
+    paths = find_paths(cmd)
 
     target = None
     for p in paths:
@@ -478,6 +546,9 @@ def open_file_folder(entry: dict) -> None:
         )
 
 
+# ==== Rendering: panels ====
+
+
 def _panel_title(extra: str = "") -> str:
     """Title bar markup: ` claude-trail vX.Y.Z [extra] `."""
     parts = ["[bold cyan] claude-trail [/bold cyan]"]
@@ -489,7 +560,7 @@ def _panel_title(extra: str = "") -> str:
 
 
 def build_detail_panel(
-    entry: dict,
+    entry: LogEntry,
     term_height: int,
     name_map: dict[str, str] | None = None,
     color_map: dict[str, str] | None = None,
@@ -540,8 +611,29 @@ def visible_row_count(term_height: int) -> int:
     return max(term_height - CHROME_ROWS, MIN_VISIBLE_ROWS)
 
 
+def count_active_sessions(
+    entries: list[LogEntry], now: datetime, window: int = ACTIVE_WINDOW_SECONDS
+) -> int:
+    """Count DISTINCT session_ids with an entry within the last `window` seconds.
+
+    `now` should be timezone-aware. Entries whose timestamp fails to parse, or
+    whose naive/aware-ness makes the subtraction invalid, are ignored (the
+    `datetime.fromisoformat` parse and the elapsed-time check share one
+    try/except, matching the original inline logic exactly).
+    """
+    active = set()
+    for entry in entries:
+        try:
+            ts = datetime.fromisoformat(entry.get("timestamp", ""))
+            if (now - ts).total_seconds() < window:
+                active.add(entry.get("session_id", ""))
+        except (ValueError, TypeError):
+            pass
+    return len(active)
+
+
 def build_panel(
-    entries: list[dict],
+    entries: list[LogEntry],
     term_height: int,
     visible_cols: dict[int, bool],
     cursor: int,
@@ -549,6 +641,13 @@ def build_panel(
     name_map: dict[str, str] | None = None,
     color_map: dict[str, str] | None = None,
 ) -> Panel:
+    """Wrap the table (or the empty-state hint) plus the status bar in a Panel.
+
+    Cursor/offset contract matches `build_table`: the display is newest-first,
+    the highlighted row is at `highlight_idx = cursor - offset`, and `offset`
+    skips the N newest rows. The status bar reports `cursor + 1`/`len(entries)`
+    (1-based over the newest-first view).
+    """
     max_rows = visible_row_count(term_height)
 
     if not entries:
@@ -558,17 +657,7 @@ def build_panel(
     else:
         content = build_table(entries, max_rows, visible_cols, cursor, offset, name_map, color_map)
 
-    # Count sessions active in the last 5 minutes
-    now = datetime.now().astimezone()
-    active_sessions = set()
-    for entry in entries:
-        try:
-            ts = datetime.fromisoformat(entry.get("timestamp", ""))
-            if (now - ts).total_seconds() < 300:
-                active_sessions.add(entry.get("session_id", ""))
-        except (ValueError, TypeError):
-            pass
-    active_count = len(active_sessions)
+    active_count = count_active_sessions(entries, datetime.now().astimezone())
 
     col_toggles = " ".join(
         f"[bold]{k}[/bold]" if visible_cols[k] else f"[dim]{k}[/dim]"
@@ -598,6 +687,9 @@ def build_panel(
         padding=(1, 2),
         height=term_height,
     )
+
+
+# ==== Input decoding (read_key) ====
 
 
 def _read_pending_byte(fd: int, timeout: float = 0.02) -> bytes:
@@ -660,6 +752,9 @@ def read_key(fd: int) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+# ==== File tailing ====
+
+
 def tail_file(path: Path, last_pos: int) -> tuple[list[str], int]:
     """Read new complete lines from file starting at last_pos. Partial trailing line is left for next call."""
     if not path.exists():
@@ -681,7 +776,7 @@ def tail_file(path: Path, last_pos: int) -> tuple[list[str], int]:
     return text.splitlines(keepends=True), new_pos
 
 
-def read_last_entries(path: Path, n: int) -> tuple[list[dict], int]:
+def read_last_entries(path: Path, n: int) -> tuple[list[LogEntry], int]:
     """Read up to n most recent entries from path. Returns (entries, end_pos)."""
     if not path.exists():
         return [], 0
@@ -689,16 +784,31 @@ def read_last_entries(path: Path, n: int) -> tuple[list[dict], int]:
     chunk_size = 8192
     data = b""
     pos = size
-    while pos > 0 and data.count(b"\n") < n + 1:
-        read_size = min(chunk_size, pos)
-        pos -= read_size
-        with open(path, "rb") as f:
+    # Open once and seek backward within the single handle: read fixed-size
+    # chunks from the end until we have more than n newlines (or hit the start).
+    with open(path, "rb") as f:
+        while pos > 0 and data.count(b"\n") < n + 1:
+            read_size = min(chunk_size, pos)
+            pos -= read_size
             f.seek(pos)
             data = f.read(read_size) + data
     text = data.decode("utf-8", errors="replace")
     lines = text.splitlines()[-n:]
     entries = [e for e in (parse_line(l) for l in lines) if e]
     return entries, size
+
+
+# ==== Hook ====
+
+
+def _new_entry(timestamp: str, command: str, cwd: str, session_id: str) -> LogEntry:
+    """Build a log entry in the exact key order the hook emits to JSONL."""
+    return {
+        "timestamp": timestamp,
+        "command": command,
+        "cwd": cwd,
+        "session_id": session_id,
+    }
 
 
 def hook_main(stream=None) -> int:
@@ -713,16 +823,19 @@ def hook_main(stream=None) -> int:
     if not isinstance(data, dict) or data.get("tool_name") != "Bash":
         return 0
     tool_input = data.get("tool_input") or {}
-    entry = {
-        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "command": tool_input.get("command", ""),
-        "cwd": data.get("cwd", ""),
-        "session_id": data.get("session_id", ""),
-    }
+    entry = _new_entry(
+        timestamp=datetime.now().astimezone().isoformat(timespec="seconds"),
+        command=tool_input.get("command", ""),
+        cwd=data.get("cwd", ""),
+        session_id=data.get("session_id", ""),
+    )
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(LOG_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
     return 0
+
+
+# ==== AppState + apply_key ====
 
 
 class Action(enum.Enum):
@@ -744,15 +857,15 @@ class AppState:
     reversing `entries`.
     """
 
-    entries: list[dict]
+    entries: list[LogEntry]
     cursor: int = 0
     scroll_offset: int = 0
     visible_cols: dict[int, bool] = field(
         default_factory=lambda: {c.key: True for c in COLUMNS}
     )
-    detail_entry: dict | None = None
+    detail_entry: LogEntry | None = None
 
-    def selected_entry(self) -> dict | None:
+    def selected_entry(self) -> LogEntry | None:
         """The entry the cursor points at in the newest-first view, or None."""
         if not self.entries or self.cursor < 0 or self.cursor >= len(self.entries):
             return None
@@ -853,6 +966,9 @@ def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
     return Action.NONE
 
 
+# ==== Main ====
+
+
 def _signal_exit(signum, frame):
     """Fatal-signal handler: raise SystemExit so main()'s finally restores the tty.
 
@@ -902,7 +1018,7 @@ def main():
             refresh_per_second=4,
         ) as live:
 
-            def open_session_log(entry: dict) -> None:
+            def open_session_log(entry: LogEntry) -> None:
                 out_path = filter_session_log(entry.get("session_id", ""))
                 if not out_path:
                     return
