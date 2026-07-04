@@ -68,11 +68,23 @@ python3 claude_trail.py   # if running from a clone
 
 ## Columns
 
+Columns are data-driven: a single ordered `COLUMNS` list of frozen `Column`
+records is the one source of truth. A `Column` has `key` (the stable digit
+1..5 used by the toggle keys and the `1 2 3 4 5` status bar), `name`, `style`,
+`kwargs` (passed to `Table.add_column`), and `render`. `render(entry, ctx)`
+returns that column's cell for one log entry as a `str` or `rich.text.Text`.
+Adding a column is a single entry in the list.
+
+`ctx` is a frozen `RenderCtx` carrying the per-render state cells need
+(`name_map`, `color_map`); render callables call the module-level helpers
+(`format_time`, `session_label`, `rich_color`, `short_path`, `extract_files`,
+`is_dangerous`, `normalize_cmd`) directly.
+
 | # | Name | Content |
 |---|------|---------|
-| 1 | Time | HH:MM:SS timestamp |
+| 1 | Time | HH:MM:SS timestamp (`format_time`) |
 | 2 | Session | Session name from `~/.claude/sessions/<pid>.json` if set, else first 8 chars of session_id, tinted with the color the user picked via Claude Code's `/color` command (parsed from the session transcript) |
-| 3 | Directory | Abbreviated cwd |
+| 3 | Directory | Abbreviated cwd (`short_path`) |
 | 4 | Files | File paths extracted from command (basenames, max 3 shown) |
 | 5 | Command | Full command text, dangerous commands prefixed with red `*` |
 
@@ -89,5 +101,6 @@ python3 claude_trail.py   # if running from a clone
 - Panel title shows the installed version (`claude-trail vX.Y.Z`), read from package metadata via `importlib.metadata`; blank when run from a clone without an install.
 - Session names are read from `~/.claude/sessions/<pid>.json` (`name` field). Cached for 2s in `load_session_names()`; the cache accumulates so a session's name remains resolvable after Claude Code removes its pid.json on exit.
 - Session color comes from the latest `/color <value>` event in `~/.claude/projects/*/<session-id>.jsonl` (`system/local_command` events). `load_session_colors()` tails each transcript incrementally and refreshes at most every 5s. Names like `orange`/`pink`/`gray` are translated to Rich-compatible equivalents (`orange1`, `pink1`, `grey50`) via `CLAUDE_COLOR_ALIASES`.
+- Columns are defined once in the module-level `COLUMNS` list of frozen `Column` records (`key`, `name`, `style`, `kwargs`, `render`). `build_table` builds a `RenderCtx(name_map, color_map)` and, for each visible column in list order, calls `col.render(entry, ctx)`; there is no per-column `if col_id == ...` ladder. `build_detail_panel` reuses `_render_session` for the Session tint and `_danger_prefixed` for the Command danger `* ` marker (it keeps the raw, un-normalized command so newlines survive). Default visibility is derived from the list (`{c.key: True for c in COLUMNS}`); the digit-toggle branch in `apply_key` accepts `ch.isdigit() and int(ch) in visible_cols` and still refuses to hide the last visible column.
 - Column visibility persists during session, status bar shows toggle state as `1 2 3 4 5`
 - Platform-specific file launcher: `xdg-open` on Linux, `open` on macOS, selected via `claude_trail._platform_opener()`. Honours `$VISUAL` first if set.
