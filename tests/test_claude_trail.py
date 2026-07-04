@@ -1008,6 +1008,18 @@ class TestAppState:
         assert len(state.entries) == feed.MAX_ENTRIES
         assert state.entries[-1] == {"command": "overflow"}
 
+    def test_ingest_does_not_clamp_may_leave_cursor_out_of_bounds(self):
+        # ingest re-anchors and trims but deliberately does NOT clamp; the cursor
+        # can legitimately exceed len-1 until the caller clamps. Do NOT "fix" this
+        # by clamping inside ingest - it would break anchored scrolling.
+        n = feed.MAX_ENTRIES
+        state = feed.AppState(entries=self._entries(n), cursor=n - 1, scroll_offset=n - 1)
+        state.ingest(['{"command": "a"}\n', '{"command": "b"}\n', '{"command": "c"}\n'])
+        assert len(state.entries) == n                  # trimmed back to the cap
+        assert state.cursor > len(state.entries) - 1    # re-anchored past the end, unclamped
+        state.clamp(10)
+        assert state.cursor == len(state.entries) - 1   # caller's clamp restores it
+
     def test_clamp_keeps_cursor_visible_after_shrink(self):
         state = feed.AppState(entries=self._entries(20), cursor=15, scroll_offset=0)
         state.clamp(5)
@@ -1077,6 +1089,22 @@ class TestApplyKey:
         entries = self._entries(3)
         state = feed.AppState(entries=entries, detail_entry=entries[0])
         assert feed.apply_key(state, "\x03", 10) is feed.Action.QUIT
+
+    def test_detail_mode_q_closes_not_quits(self):
+        # q while the modal is open must CLOSE it, not quit the app: the modal
+        # branch is checked before the global q/ctrl-c quit. Guards a reorder.
+        entries = self._entries(3)
+        state = feed.AppState(entries=entries, detail_entry=entries[0])
+        result = feed.apply_key(state, "q", 10)
+        assert result is feed.Action.NONE
+        assert state.detail_entry is None
+
+    def test_detail_mode_enter_closes_not_reopens(self):
+        entries = self._entries(3)
+        state = feed.AppState(entries=entries, detail_entry=entries[0])
+        result = feed.apply_key(state, "\r", 10)
+        assert result is feed.Action.NONE
+        assert state.detail_entry is None
 
     def test_digit_toggles_column(self):
         state = feed.AppState(entries=[])
