@@ -22,7 +22,8 @@ Claude Code session
 
 ## Key Paths
 
-- **Log file:** `~/.claude/command-log.jsonl`
+- **Config dir:** all paths derive from `CONFIG_DIR = $CLAUDE_CONFIG_DIR` when set, else `~/.claude`. `LOG_PATH`, `SESSIONS_DIR`, and `PROJECTS_DIR` are module-level constants built from it (so tests can `patch.object` them, and a relocated config still resolves).
+- **Log file:** `~/.claude/command-log.jsonl` (`CONFIG_DIR/command-log.jsonl`)
 - **Hook config:** `~/.claude/settings.json` → `hooks.PostToolUse`
 - **Session metadata:** `~/.claude/sessions/<pid>.json` (read by the TUI to resolve session names)
 
@@ -62,7 +63,7 @@ python3 claude_trail.py   # if running from a clone
 | `Esc` | Close the detail view (also `q` or `Enter` while it is open) |
 | `o` | Open selected session's commands (filtered JSONL) in `$VISUAL` or the platform default launcher |
 | `f` | Open file manager on folder of files referenced in selected command |
-| `1`–`5` | Toggle columns: 1=Time, 2=Session, 3=Directory, 4=Files, 5=Command |
+| `1`-`5` | Toggle columns: 1=Time, 2=Session, 3=Directory, 4=Files, 5=Command |
 | `c` | Clear display |
 | `q` | Quit |
 
@@ -90,11 +91,11 @@ Adding a column is a single entry in the list.
 
 ## Conventions
 
-- Log format is JSONL with fields: `timestamp`, `command`, `cwd`, `session_id`
+- Log format is JSONL with fields: `timestamp`, `command`, `cwd`, `session_id` (modeled as the `LogEntry` TypedDict; annotation only, `parse_line` still returns a plain dict at runtime). `hook_main` builds each line via `_new_entry()` to fix the key order.
 - Dangerous commands (rm, sudo, git reset, chmod, etc.) are flagged with red `*` prefix
-- Display shows newest-first, max 50 entries, with active session count
+- Display shows newest-first, max 50 entries, with active session count = distinct `session_id`s seen within `ACTIVE_WINDOW_SECONDS` (300s), computed by `count_active_sessions(entries, now, window=ACTIVE_WINDOW_SECONDS)`
 - Poll interval: 300ms
-- File paths extracted via regex matching absolute (`/...`), home (`~/...`), and relative (`./...`) paths
+- File paths extracted by `find_paths(cmd)` (regex matching absolute `/...`, home `~/...`, relative `./...`; order-preserving dedupe via `dict.fromkeys`). `extract_files()` is a thin basename formatter over it and `open_file_folder()` reuses it.
 - `Enter` opens an in-TUI detail view (`build_detail_panel()`) showing the selected command in full: untruncated, newlines preserved, with the danger `*` marker and a metadata header (time, session, directory, files). `Esc`/`q`/`Enter` close it. The view is modal: while open, navigation/column/clear keys are ignored (only `Ctrl-C` still quits).
 - Session JSONL written under `tempfile.gettempdir()` (default `/tmp`) as `claude-trail-session-{sanitized-id}.jsonl` on `o`. If `$VISUAL`/`$EDITOR` is set, `open_session_log()` suspends the `Live` display, restores the terminal, runs that editor in the foreground (so terminal editors like nvim get the tty), then resumes; otherwise it hands the file to the GUI launcher detached.
 - Arrow keys are read in both CSI (`ESC [ A`/`B`) and SS3 (`ESC O A`/`B`, application-cursor-keys mode) forms by `read_key()`, which parses one complete CSI sequence per call (parameter bytes, one final byte) so modified arrows (`ESC [ 1 ; 5 A`) and function keys never leak stray bytes into the key dispatch; a final byte of `A`/`B` navigates regardless of modifier parameters.

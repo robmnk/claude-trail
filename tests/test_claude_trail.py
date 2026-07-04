@@ -470,6 +470,32 @@ class TestExtractFiles:
         assert feed.extract_files("ls /") == ""
 
 
+class TestFindPaths:
+    """find_paths returns raw paths (not basenames), order-preserving deduped."""
+
+    def test_no_paths(self):
+        assert feed.find_paths("ls -la") == []
+
+    def test_absolute_paths_in_order(self):
+        assert feed.find_paths("cp /tmp/a.txt /tmp/b.txt") == ["/tmp/a.txt", "/tmp/b.txt"]
+
+    def test_dedupes_preserving_first_seen_order(self):
+        assert feed.find_paths("diff /tmp/b /tmp/a /tmp/b") == ["/tmp/b", "/tmp/a"]
+
+    def test_home_and_relative_paths(self):
+        assert feed.find_paths("cat ~/notes/todo.md ./src/main.py") == [
+            "~/notes/todo.md",
+            "./src/main.py",
+        ]
+
+    def test_extract_files_is_a_formatter_over_find_paths(self):
+        # extract_files basenames exactly the paths find_paths reports.
+        cmd = "cp /tmp/a.txt /tmp/b.txt"
+        assert feed.extract_files(cmd) == ", ".join(
+            os.path.basename(p) for p in feed.find_paths(cmd)
+        )
+
+
 class TestGetDisplayEntries:
     def test_empty_list(self):
         assert feed.get_display_entries([], 10) == []
@@ -520,6 +546,52 @@ class TestPlatformOpener:
     def test_other_platforms_default_to_xdg_open(self):
         with patch.object(feed.sys, "platform", "freebsd14"):
             assert feed._platform_opener() == "xdg-open"
+
+
+class TestConfigDir:
+    """CONFIG_DIR and the paths derived from it honor $CLAUDE_CONFIG_DIR."""
+
+    def _reload_with_true_env(self, monkeypatch):
+        # Undo our env changes FIRST, then reload, so the module is left
+        # consistent with the real outer environment (whatever it is), not with
+        # this test's temporary env. Order matters: reloading before the undo
+        # would leave the module and the environment disagreeing.
+        import importlib
+        monkeypatch.undo()
+        importlib.reload(feed)
+
+    def test_env_override_reshapes_derived_paths(self, monkeypatch):
+        import importlib
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/custom/cfg")
+        importlib.reload(feed)
+        try:
+            assert feed.CONFIG_DIR == Path("/custom/cfg")
+            assert feed.LOG_PATH == Path("/custom/cfg/command-log.jsonl")
+            assert feed.SESSIONS_DIR == Path("/custom/cfg/sessions")
+            assert feed.PROJECTS_DIR == Path("/custom/cfg/projects")
+        finally:
+            self._reload_with_true_env(monkeypatch)
+
+    def test_empty_env_falls_back_to_home(self, monkeypatch):
+        # Empty string must fall back to ~/.claude (the reason CONFIG_DIR uses
+        # `or` rather than os.environ.get with a default argument).
+        import importlib
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "")
+        importlib.reload(feed)
+        try:
+            assert feed.CONFIG_DIR == Path.home() / ".claude"
+        finally:
+            self._reload_with_true_env(monkeypatch)
+
+    def test_default_is_home_dot_claude(self, monkeypatch):
+        import importlib
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        importlib.reload(feed)
+        try:
+            assert feed.CONFIG_DIR == Path.home() / ".claude"
+            assert feed.LOG_PATH == Path.home() / ".claude" / "command-log.jsonl"
+        finally:
+            self._reload_with_true_env(monkeypatch)
 
 
 class TestHookMain:
@@ -787,6 +859,69 @@ class TestRendering:
         out = self._text(feed.build_detail_panel(self._entry(command="sudo rm -rf /"), 40))
         assert "* " in out
         assert "sudo rm -rf /" in out
+
+
+class TestCountActiveSessions:
+    """count_active_sessions: distinct session_ids seen within the window."""
+
+    def _now(self):
+        from datetime import datetime as _dt, timezone as _tz
+        return _dt(2025, 1, 1, 12, 0, 0, tzinfo=_tz.utc)
+
+    def _entry(self, sid, ts):
+        return {"session_id": sid, "timestamp": ts}
+
+    def _ago(self, now, seconds):
+        from datetime import timedelta
+        return (now - timedelta(seconds=seconds)).isoformat()
+
+    def test_empty_entries(self):
+        assert feed.count_active_sessions([], self._now()) == 0
+
+    def test_entry_just_inside_window_counts(self):
+        now = self._now()
+        assert feed.count_active_sessions([self._entry("s1", self._ago(now, 299))], now) == 1
+
+    def test_entry_at_exact_window_excluded(self):
+        # strict `<` means exactly `window` seconds ago is NOT active
+        now = self._now()
+        assert feed.count_active_sessions([self._entry("s1", self._ago(now, 300))], now) == 0
+
+    def test_entry_just_outside_window_excluded(self):
+        now = self._now()
+        assert feed.count_active_sessions([self._entry("s1", self._ago(now, 301))], now) == 0
+
+    def test_duplicate_session_ids_counted_once(self):
+        now = self._now()
+        entries = [
+            self._entry("s1", self._ago(now, 10)),
+            self._entry("s1", self._ago(now, 20)),
+            self._entry("s2", self._ago(now, 30)),
+        ]
+        assert feed.count_active_sessions(entries, now) == 2
+
+    def test_malformed_timestamp_ignored(self):
+        now = self._now()
+        entries = [
+            self._entry("s1", "not-a-date"),
+            self._entry("s2", self._ago(now, 5)),
+        ]
+        assert feed.count_active_sessions(entries, now) == 1
+
+    def test_naive_timestamp_ignored(self):
+        # A naive timestamp (no offset) vs an aware `now` raises TypeError in the
+        # subtraction; the shared try/except swallows it so it is not counted.
+        now = self._now()
+        assert feed.count_active_sessions([self._entry("s1", "2025-01-01T12:00:00")], now) == 0
+
+    def test_custom_window_is_honored(self):
+        now = self._now()
+        entries = [self._entry("s1", self._ago(now, 50))]
+        assert feed.count_active_sessions(entries, now, window=60) == 1
+        assert feed.count_active_sessions(entries, now, window=40) == 0
+
+    def test_default_window_is_active_window_seconds(self):
+        assert feed.ACTIVE_WINDOW_SECONDS == 300
 
 
 class TestFilterSessionLog:
