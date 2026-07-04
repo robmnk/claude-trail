@@ -926,3 +926,168 @@ class TestColumnRender:
         out = console.export_text()
         assert "Extra" in out   # header rendered
         assert marker in out    # cell rendered
+
+
+class TestVisibleRowCount:
+    def test_subtracts_chrome_rows(self):
+        assert feed.visible_row_count(40) == 40 - feed.CHROME_ROWS
+
+    def test_floors_at_min_visible_rows(self):
+        assert feed.visible_row_count(1) == feed.MIN_VISIBLE_ROWS
+
+
+class TestAppState:
+    """Pure view-state logic lifted out of main()."""
+
+    def _entries(self, n):
+        # oldest-first (append order): c0 is oldest, c{n-1} is newest.
+        return [{"command": f"c{i}"} for i in range(n)]
+
+    def test_default_visible_cols_all_true(self):
+        state = feed.AppState(entries=[])
+        assert state.visible_cols == {c.key: True for c in feed.COLUMNS}
+
+    def test_selected_entry_none_when_empty(self):
+        assert feed.AppState(entries=[]).selected_entry() is None
+
+    def test_cursor_zero_selects_newest(self):
+        state = feed.AppState(entries=self._entries(5))
+        assert state.selected_entry() == {"command": "c4"}
+
+    def test_goto_bottom_selects_oldest(self):
+        state = feed.AppState(entries=self._entries(5))
+        state.goto_bottom()
+        assert state.cursor == 4
+        assert state.selected_entry() == {"command": "c0"}
+
+    def test_move_up_at_top_stays_zero(self):
+        state = feed.AppState(entries=self._entries(3), cursor=0)
+        state.move_up()
+        assert state.cursor == 0
+
+    def test_move_down_clamps_to_last(self):
+        state = feed.AppState(entries=self._entries(3), cursor=2)
+        state.move_down()
+        assert state.cursor == 2
+
+    def test_toggle_col_hides_visible_column(self):
+        state = feed.AppState(entries=[])
+        state.toggle_col(3)
+        assert state.visible_cols[3] is False
+
+    def test_toggle_col_refuses_to_hide_final_visible(self):
+        state = feed.AppState(
+            entries=[], visible_cols={1: True, 2: False, 3: False, 4: False, 5: False}
+        )
+        state.toggle_col(1)
+        assert state.visible_cols[1] is True  # cannot hide the last visible column
+
+    def test_ingest_at_top_keeps_cursor_zero(self):
+        state = feed.AppState(entries=self._entries(1))
+        added = state.ingest(['{"command": "c1"}\n', '{"command": "c2"}\n'])
+        assert added == 2
+        assert state.cursor == 0
+        assert state.scroll_offset == 0
+
+    def test_ingest_reanchors_when_scrolled(self):
+        state = feed.AppState(entries=self._entries(2), cursor=1, scroll_offset=1)
+        added = state.ingest(['{"command": "c2"}\n'])
+        assert added == 1
+        assert state.cursor == 2       # 1 + new_count
+        assert state.scroll_offset == 2
+
+    def test_ingest_skips_malformed_lines(self):
+        state = feed.AppState(entries=[])
+        added = state.ingest(["not json\n", '{"command": "ok"}\n'])
+        assert added == 1
+        assert state.entries == [{"command": "ok"}]
+
+    def test_ingest_trims_to_max_entries(self):
+        state = feed.AppState(entries=self._entries(feed.MAX_ENTRIES))
+        state.ingest(['{"command": "overflow"}\n'])
+        assert len(state.entries) == feed.MAX_ENTRIES
+        assert state.entries[-1] == {"command": "overflow"}
+
+    def test_clamp_keeps_cursor_visible_after_shrink(self):
+        state = feed.AppState(entries=self._entries(20), cursor=15, scroll_offset=0)
+        state.clamp(5)
+        assert state.cursor == 15
+        assert state.scroll_offset <= state.cursor < state.scroll_offset + 5
+
+    def test_clamp_empty_resets(self):
+        state = feed.AppState(entries=[], cursor=9, scroll_offset=4)
+        state.clamp(10)
+        assert state.cursor == 0
+        assert state.scroll_offset == 0
+
+
+class TestApplyKey:
+    def _entries(self, n):
+        return [{"command": f"c{i}"} for i in range(n)]
+
+    def test_q_quits(self):
+        state = feed.AppState(entries=[])
+        assert feed.apply_key(state, "q", 10) is feed.Action.QUIT
+
+    def test_ctrl_c_quits(self):
+        state = feed.AppState(entries=[])
+        assert feed.apply_key(state, "\x03", 10) is feed.Action.QUIT
+
+    def test_o_returns_open_session_without_moving_cursor(self):
+        state = feed.AppState(entries=self._entries(3), cursor=1)
+        result = feed.apply_key(state, "o", 10)
+        assert result is feed.Action.OPEN_SESSION
+        assert state.cursor == 1
+
+    def test_f_returns_open_files_without_moving_cursor(self):
+        state = feed.AppState(entries=self._entries(3), cursor=1)
+        result = feed.apply_key(state, "f", 10)
+        assert result is feed.Action.OPEN_FILES
+        assert state.cursor == 1
+
+    def test_j_moves_cursor_down(self):
+        state = feed.AppState(entries=self._entries(3), cursor=0)
+        result = feed.apply_key(state, "j", 10)
+        assert result is feed.Action.NONE
+        assert state.cursor == 1
+
+    def test_enter_opens_detail(self):
+        entries = self._entries(3)
+        state = feed.AppState(entries=entries, cursor=0)
+        result = feed.apply_key(state, "\r", 10)
+        assert result is feed.Action.NONE
+        assert state.detail_entry == {"command": "c2"}  # newest
+
+    def test_detail_mode_j_is_inert(self):
+        entries = self._entries(3)
+        state = feed.AppState(entries=entries, cursor=1, detail_entry=entries[0])
+        result = feed.apply_key(state, "j", 10)
+        assert result is feed.Action.NONE
+        assert state.cursor == 1                 # navigation ignored while modal
+        assert state.detail_entry is entries[0]  # still open
+
+    def test_detail_mode_esc_closes(self):
+        entries = self._entries(3)
+        state = feed.AppState(entries=entries, detail_entry=entries[0])
+        result = feed.apply_key(state, "\x1b", 10)
+        assert result is feed.Action.NONE
+        assert state.detail_entry is None
+
+    def test_detail_mode_ctrl_c_still_quits(self):
+        entries = self._entries(3)
+        state = feed.AppState(entries=entries, detail_entry=entries[0])
+        assert feed.apply_key(state, "\x03", 10) is feed.Action.QUIT
+
+    def test_digit_toggles_column(self):
+        state = feed.AppState(entries=[])
+        result = feed.apply_key(state, "3", 10)
+        assert result is feed.Action.NONE
+        assert state.visible_cols[3] is False
+
+    def test_clear_empties_entries(self):
+        state = feed.AppState(entries=self._entries(5), cursor=3, scroll_offset=2)
+        result = feed.apply_key(state, "c", 10)
+        assert result is feed.Action.NONE
+        assert state.entries == []
+        assert state.cursor == 0
+        assert state.scroll_offset == 0
