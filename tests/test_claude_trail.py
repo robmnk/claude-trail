@@ -1,8 +1,10 @@
+import os
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import claude_trail as feed
+from rich.console import Console
 from unittest.mock import patch
 
 
@@ -201,14 +203,9 @@ class TestScanChunkForColor:
 class TestLoadSessionColors:
     """Covers transcript discovery, incremental tailing, and TTL caching.
 
-    Each test mutates module-level cache state and resets it explicitly.
+    Module-level cache state is cleared before each test by the autouse
+    fixture in conftest.py.
     """
-
-    def _reset(self):
-        feed._session_color_cache.clear()
-        feed._session_color_cache_ts = 0.0
-        feed._transcript_path_cache.clear()
-        feed._transcript_positions.clear()
 
     def _color_event(self, sid, color):
         import json
@@ -230,7 +227,6 @@ class TestLoadSessionColors:
         return path
 
     def test_reads_color_from_transcript(self, tmp_path):
-        self._reset()
         sid = "aaa-111"
         self._write_transcript(tmp_path, sid, [self._color_event(sid, "yellow")])
         with patch.object(feed, "PROJECTS_DIR", tmp_path), \
@@ -239,7 +235,6 @@ class TestLoadSessionColors:
         assert colors == {sid: "yellow"}
 
     def test_picks_latest_color_when_multiple_set(self, tmp_path):
-        self._reset()
         sid = "bbb-222"
         self._write_transcript(tmp_path, sid, [
             self._color_event(sid, "red"),
@@ -251,7 +246,6 @@ class TestLoadSessionColors:
         assert colors == {sid: "blue"}
 
     def test_session_without_color_command_returns_empty(self, tmp_path):
-        self._reset()
         sid = "ccc-333"
         self._write_transcript(tmp_path, sid, [
             '{"type":"user","content":"hello"}\n',
@@ -262,14 +256,12 @@ class TestLoadSessionColors:
         assert colors == {}
 
     def test_missing_transcript_is_skipped(self, tmp_path):
-        self._reset()
         with patch.object(feed, "PROJECTS_DIR", tmp_path), \
              patch.object(feed, "SESSION_COLOR_CACHE_TTL", 0.0):
             colors = feed.load_session_colors(["never-existed"])
         assert colors == {}
 
     def test_missing_projects_dir_is_tolerated(self, tmp_path):
-        self._reset()
         with patch.object(feed, "PROJECTS_DIR", tmp_path / "absent"), \
              patch.object(feed, "SESSION_COLOR_CACHE_TTL", 0.0):
             colors = feed.load_session_colors(["any"])
@@ -277,7 +269,6 @@ class TestLoadSessionColors:
 
     def test_picks_up_color_appended_to_transcript(self, tmp_path):
         """Mid-session /color must be observed on the next non-cached refresh."""
-        self._reset()
         sid = "ddd-444"
         path = self._write_transcript(tmp_path, sid, [self._color_event(sid, "red")])
         with patch.object(feed, "PROJECTS_DIR", tmp_path), \
@@ -290,7 +281,6 @@ class TestLoadSessionColors:
     def test_cache_retains_color_after_transcript_removed(self, tmp_path):
         """If Claude Code rotates or removes a transcript, the last-known color
         should still be available."""
-        self._reset()
         sid = "eee-555"
         path = self._write_transcript(tmp_path, sid, [self._color_event(sid, "cyan")])
         with patch.object(feed, "PROJECTS_DIR", tmp_path), \
@@ -304,18 +294,12 @@ class TestLoadSessionColors:
 class TestLoadSessionNames:
     """Covers reading ~/.claude/sessions/*.json with mocked SESSIONS_DIR.
 
-    These tests mutate module-level cache state (`_session_name_cache`,
-    `_session_name_cache_ts`); each method resets it explicitly so order
-    does not matter.
+    The `_session_name_cache` / `_session_name_cache_ts` globals are cleared
+    before each test by the autouse fixture in conftest.py.
     """
-
-    def _reset_cache(self):
-        feed._session_name_cache.clear()
-        feed._session_name_cache_ts = 0.0
 
     def test_reads_name_from_json(self, tmp_path):
         import json
-        self._reset_cache()
         (tmp_path / "1234.json").write_text(
             json.dumps({"sessionId": "abc-123", "name": "my-session"})
         )
@@ -326,7 +310,6 @@ class TestLoadSessionNames:
 
     def test_skips_sessions_without_name(self, tmp_path):
         import json
-        self._reset_cache()
         (tmp_path / "1.json").write_text(json.dumps({"sessionId": "a"}))
         (tmp_path / "2.json").write_text(
             json.dumps({"sessionId": "b", "name": "labeled"})
@@ -338,7 +321,6 @@ class TestLoadSessionNames:
 
     def test_skips_entry_without_session_id(self, tmp_path):
         import json
-        self._reset_cache()
         (tmp_path / "orphan.json").write_text(json.dumps({"name": "no-id"}))
         with patch.object(feed, "SESSIONS_DIR", tmp_path), \
              patch.object(feed, "SESSION_NAME_CACHE_TTL", 0.0):
@@ -347,7 +329,6 @@ class TestLoadSessionNames:
 
     def test_skips_malformed_json(self, tmp_path):
         import json
-        self._reset_cache()
         (tmp_path / "broken.json").write_text("not json at all")
         (tmp_path / "good.json").write_text(
             json.dumps({"sessionId": "x", "name": "ok"})
@@ -359,7 +340,6 @@ class TestLoadSessionNames:
 
     def test_skips_non_json_files(self, tmp_path):
         import json
-        self._reset_cache()
         (tmp_path / "README").write_text("ignore me")
         (tmp_path / "lock.txt").write_text("ignore me too")
         (tmp_path / "ok.json").write_text(
@@ -371,7 +351,6 @@ class TestLoadSessionNames:
         assert names == {"y": "kept"}
 
     def test_missing_directory_returns_empty(self, tmp_path):
-        self._reset_cache()
         missing = tmp_path / "does-not-exist"
         with patch.object(feed, "SESSIONS_DIR", missing), \
              patch.object(feed, "SESSION_NAME_CACHE_TTL", 0.0):
@@ -383,7 +362,6 @@ class TestLoadSessionNames:
         the pid.json on session exit, so the TUI can still label historical rows.
         """
         import json
-        self._reset_cache()
         pid_file = tmp_path / "999.json"
         pid_file.write_text(json.dumps({"sessionId": "s1", "name": "first"}))
         with patch.object(feed, "SESSIONS_DIR", tmp_path), \
@@ -412,6 +390,23 @@ class TestExtractFiles:
     def test_more_than_three_paths(self):
         result = feed.extract_files("cat /a/1.txt /a/2.txt /a/3.txt /a/4.txt /a/5.txt")
         assert "+2" in result
+
+    def test_home_path_basename(self):
+        assert feed.extract_files("cat ~/notes/todo.md") == "todo.md"
+
+    def test_relative_path_basename(self):
+        assert feed.extract_files("cat ./src/main.py") == "main.py"
+
+    def test_parent_relative_path_basename(self):
+        assert feed.extract_files("cat ../sibling/x.txt") == "x.txt"
+
+    def test_trailing_slash_stripped(self):
+        assert feed.extract_files("ls /tmp/logs/") == "logs"
+
+    def test_bare_slash_yields_empty(self):
+        # FILE_PATH_RE needs at least one char after the slash, so a lone "/"
+        # argument matches nothing and yields "".
+        assert feed.extract_files("ls /") == ""
 
 
 class TestGetDisplayEntries:
@@ -579,3 +574,197 @@ class TestSigtermExit:
         import pytest
         with pytest.raises(SystemExit):
             feed._sigterm_exit(15, None)
+
+
+class TestTailFile:
+    def test_returns_complete_lines_and_offset(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        p.write_text("a\nb\n", encoding="utf-8")
+        lines, pos = feed.tail_file(p, 0)
+        assert lines == ["a\n", "b\n"]
+        assert pos == p.stat().st_size
+
+    def test_partial_trailing_line_withheld_then_returned(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        p.write_text("a\nb", encoding="utf-8")  # 'b' not yet newline-terminated
+        lines, pos = feed.tail_file(p, 0)
+        assert lines == ["a\n"]
+        assert pos == 2
+        p.write_text("a\nb\n", encoding="utf-8")  # line completes
+        lines2, pos2 = feed.tail_file(p, pos)
+        assert lines2 == ["b\n"]
+        assert pos2 == p.stat().st_size
+
+    def test_no_newline_yet_returns_nothing(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        p.write_text("partial", encoding="utf-8")
+        assert feed.tail_file(p, 0) == ([], 0)
+
+    def test_truncation_resets_to_zero(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        p.write_text("aaaa\nbbbb\n", encoding="utf-8")
+        big = p.stat().st_size
+        p.write_text("x\n", encoding="utf-8")  # shrinks below last_pos
+        lines, pos = feed.tail_file(p, big)
+        assert lines == ["x\n"]
+        assert pos == p.stat().st_size
+
+    def test_no_change_returns_empty(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        p.write_text("a\n", encoding="utf-8")
+        size = p.stat().st_size
+        assert feed.tail_file(p, size) == ([], size)
+
+    def test_missing_file(self, tmp_path):
+        assert feed.tail_file(tmp_path / "absent.jsonl", 0) == ([], 0)
+
+
+class TestReadLastEntries:
+    def _line(self, i, **extra):
+        import json
+        d = {"command": f"cmd{i}", "session_id": "s", "cwd": "/w", "timestamp": "t"}
+        d.update(extra)
+        return json.dumps(d) + "\n"
+
+    def test_fewer_than_n_returns_all(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        p.write_text(self._line(0) + self._line(1), encoding="utf-8")
+        entries, pos = feed.read_last_entries(p, 10)
+        assert [e["command"] for e in entries] == ["cmd0", "cmd1"]
+        assert pos == p.stat().st_size
+
+    def test_more_than_n_returns_last_n_in_order(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        p.write_text("".join(self._line(i) for i in range(10)), encoding="utf-8")
+        entries, _ = feed.read_last_entries(p, 3)
+        assert [e["command"] for e in entries] == ["cmd7", "cmd8", "cmd9"]
+
+    def test_last_n_span_chunk_boundary(self, tmp_path):
+        # Pad each line so the last 15 lines span more than one 8192-byte
+        # backward-read chunk, exercising the reassembly loop.
+        p = tmp_path / "log.jsonl"
+        p.write_text("".join(self._line(i, pad="x" * 1000) for i in range(20)), encoding="utf-8")
+        entries, pos = feed.read_last_entries(p, 15)
+        assert len(entries) == 15
+        assert entries[0]["command"] == "cmd5"
+        assert entries[-1]["command"] == "cmd19"
+        assert pos == p.stat().st_size
+
+    def test_malformed_lines_dropped(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        p.write_text(self._line(0) + "not json\n" + self._line(1), encoding="utf-8")
+        entries, _ = feed.read_last_entries(p, 10)
+        assert [e["command"] for e in entries] == ["cmd0", "cmd1"]
+
+    def test_missing_file(self, tmp_path):
+        assert feed.read_last_entries(tmp_path / "absent", 5) == ([], 0)
+
+
+class TestRendering:
+    ALL = {1: True, 2: True, 3: True, 4: True, 5: True}
+
+    def _entry(self, **kw):
+        e = {"timestamp": "2025-01-01T12:00:00+00:00", "command": "ls -la",
+             "cwd": "/work", "session_id": "abcd1234"}
+        e.update(kw)
+        return e
+
+    def _text(self, panel):
+        console = Console(width=120, record=True)
+        console.print(panel)
+        return console.export_text()
+
+    def test_empty_shows_waiting(self):
+        out = self._text(feed.build_panel([], 40, self.ALL, 0))
+        assert "Waiting for commands..." in out
+
+    def test_dangerous_entry_has_marker(self):
+        out = self._text(feed.build_panel([self._entry(command="rm -rf /tmp/x")], 40, self.ALL, 0))
+        assert "* " in out
+
+    def test_benign_entry_has_no_marker(self):
+        out = self._text(feed.build_panel([self._entry(command="ls -la")], 40, self.ALL, 0))
+        assert "ls -la" in out
+        assert "* " not in out
+
+    def test_column_toggle_bar_and_hidden_column(self):
+        cols = {1: True, 2: True, 3: False, 4: True, 5: True}
+        out = self._text(feed.build_panel([self._entry()], 40, cols, 0))
+        assert "cols:" in out
+        assert "Directory" not in out  # column 3 hidden -> header absent
+
+    def test_cursor_position_in_status(self):
+        entries = [self._entry(command=f"cmd{i}") for i in range(3)]
+        out = self._text(feed.build_panel(entries, 40, self.ALL, 0))
+        assert "1/3" in out
+
+    def test_detail_panel_shows_full_command_and_marker(self):
+        out = self._text(feed.build_detail_panel(self._entry(command="sudo rm -rf /"), 40))
+        assert "* " in out
+        assert "sudo rm -rf /" in out
+
+
+class TestFilterSessionLog:
+    def test_none_when_empty_session_id(self):
+        assert feed.filter_session_log("") is None
+
+    def test_none_when_log_missing(self, tmp_path):
+        with patch.object(feed, "LOG_PATH", tmp_path / "absent.jsonl"):
+            assert feed.filter_session_log("abc12345") is None
+
+    def test_filters_to_one_session(self, tmp_path):
+        import json
+        log = tmp_path / "command-log.jsonl"
+        log.write_text(
+            json.dumps({"session_id": "aaa", "command": "one"}) + "\n"
+            + json.dumps({"session_id": "bbb", "command": "two"}) + "\n"
+            + json.dumps({"session_id": "aaa", "command": "three"}) + "\n",
+            encoding="utf-8",
+        )
+        with patch.object(feed, "LOG_PATH", log), \
+             patch.object(feed.tempfile, "gettempdir", return_value=str(tmp_path)):
+            out = feed.filter_session_log("aaa")
+        content = Path(out).read_text(encoding="utf-8")
+        assert '"command": "one"' in content
+        assert '"command": "three"' in content
+        assert '"two"' not in content
+
+    def test_sanitizes_session_id_in_filename(self, tmp_path):
+        import json
+        log = tmp_path / "command-log.jsonl"
+        log.write_text(json.dumps({"session_id": "../../etc", "command": "x"}) + "\n", encoding="utf-8")
+        with patch.object(feed, "LOG_PATH", log), \
+             patch.object(feed.tempfile, "gettempdir", return_value=str(tmp_path)):
+            out = feed.filter_session_log("../../etc")
+        base = os.path.basename(out)
+        assert ".." not in base and "/" not in base
+        assert base.startswith("claude-trail-session-")
+
+
+class TestOpenFileFolder:
+    def test_opens_parent_of_absolute_file(self, tmp_path):
+        f = tmp_path / "sub" / "file.txt"
+        f.parent.mkdir(parents=True)
+        f.write_text("x")
+        with patch.object(feed.subprocess, "Popen") as popen:
+            feed.open_file_folder({"command": f"cat {f}", "cwd": ""})
+        popen.assert_called_once()
+        assert os.path.realpath(popen.call_args[0][0][-1]) == os.path.realpath(str(f.parent))
+
+    def test_relative_path_joined_with_cwd(self, tmp_path):
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "file.txt").write_text("x")
+        with patch.object(feed.subprocess, "Popen") as popen:
+            feed.open_file_folder({"command": "cat ./sub/file.txt", "cwd": str(tmp_path)})
+        assert os.path.realpath(popen.call_args[0][0][-1]) == os.path.realpath(str(sub))
+
+    def test_falls_back_to_cwd(self, tmp_path):
+        with patch.object(feed.subprocess, "Popen") as popen:
+            feed.open_file_folder({"command": "echo hi", "cwd": str(tmp_path)})
+        assert os.path.realpath(popen.call_args[0][0][-1]) == os.path.realpath(str(tmp_path))
+
+    def test_no_popen_when_nothing_resolves(self, tmp_path):
+        with patch.object(feed.subprocess, "Popen") as popen:
+            feed.open_file_folder({"command": "echo hi", "cwd": str(tmp_path / "absent")})
+        popen.assert_not_called()
