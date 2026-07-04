@@ -129,18 +129,23 @@ Or run a periodic truncation manually (e.g. via cron) once the file exceeds a si
 
 ## Development
 
+See [ARCHITECTURE.md](ARCHITECTURE.md) for a tour of the internals (data flow,
+module map, and the column / `AppState` extension points), and
+[CONTRIBUTING.md](CONTRIBUTING.md) for dev setup, style, and PR expectations.
+
 Work from a clone with the dev dependencies installed:
 
 ```bash
 git clone https://github.com/robmnk/claude-trail
 cd claude-trail
-pip install -e '.[dev]'   # editable install plus pytest
+pip install -e '.[dev]'   # editable install plus pytest and ruff
 ```
 
-Run the tests:
+Run the tests and the linter:
 
 ```bash
 pytest
+ruff check .
 ```
 
 Run the TUI straight from the checkout without installing:

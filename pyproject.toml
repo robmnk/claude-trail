@@ -12,10 +12,17 @@ license = "MIT"
 dependencies = ["rich>=13.0"]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "ruff>=0.15,<0.16"]
 
 [project.scripts]
 claude-trail = "claude_trail:main"
 
 [tool.hatch.build.targets.wheel]
 include = ["claude_trail.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
