@@ -51,12 +51,12 @@ order:
 | Session /color parsing + aliases | `COLOR_CMD_RE`, `CLAUDE_COLOR_ALIASES`, `rich_color` |
 | Danger detection + path extraction | `is_dangerous`, `find_paths`, `extract_files`, `short_path` |
 | Session names | `load_session_names`, `session_label`, plus the name cache globals |
-| Session colors | `load_session_colors`, `_find_transcript`, `_scan_chunk_for_color`, plus the color cache globals |
+| Session colors | `_find_transcript`, `_scan_chunk_for_color`, `load_session_colors`, plus the color cache globals |
 | Format / parse helpers | `_platform_opener`, `normalize_cmd`, `parse_line`, `format_time` |
 | Rendering: table | `get_display_entries`, `build_table` |
 | Side-effecting actions | `filter_session_log`, `open_file_folder` |
 | Rendering: panels | `_panel_title`, `build_detail_panel`, `visible_row_count`, `count_active_sessions`, `build_panel` |
-| Input decoding | `_read_pending_byte`, `read_key` |
+| Input decoding (read_key) | `_read_pending_byte`, `read_key` |
 | File tailing | `tail_file`, `read_last_entries` |
 | Hook | `_new_entry`, `hook_main` |
 | AppState + apply_key | `Action`, `AppState`, `apply_key` |
@@ -69,8 +69,9 @@ order:
 - `claude-trail hook` dispatches to `hook_main()`. It reads one PostToolUse
   event from stdin, and if `tool_name == "Bash"` it appends a log line built by
   `_new_entry()` (which fixes the key order). It never touches the terminal, so
-  it is cheap to run on every Bash call. All error paths return `0` so a bad
-  event never breaks Claude Code's tool pipeline.
+  it is cheap to run on every Bash call. Malformed input (bad JSON, a non-Bash
+  event, missing fields) returns `0` rather than raising, so a bad event never
+  breaks Claude Code's tool pipeline.
 - `claude-trail` with no subcommand runs the TUI: read the tail of the log,
   build an `AppState`, put the terminal into cbreak mode, then loop over
   poll / drain-keys / tail / clamp / render.
@@ -91,9 +92,10 @@ backward chunked scan), seeds an `AppState`, and enters a `Live` loop:
    lines, or a terminal resize.
 5. Refresh the session name/color maps, then `live.update(render_panel())`.
 
-Rendering is pure: `build_panel` (or `build_detail_panel`) takes state and
-returns a Rich `Panel`, so both are unit-testable against a recording console
-with no terminal.
+Rendering is side-effect-free (`build_panel` reads the wall clock once for the
+active-session count, but writes nothing): it takes state and returns a Rich
+`Panel`, so both `build_panel` and `build_detail_panel` are unit-testable
+against a recording console with no terminal.
 
 ### Cursor / offset contract
 
@@ -127,7 +129,7 @@ name is known.
 
 ## Session-color parsing
 
-`load_session_colors()` maps `session_id -> the color the user picked with
+`load_session_colors()` maps `session_id` to the color the user picked with
 Claude Code's `/color` slash command. It reads each session transcript at
 `~/.claude/projects/*/<session-id>.jsonl` and looks for `system` /
 `local_command` events whose content matches `COLOR_CMD_RE` (the
