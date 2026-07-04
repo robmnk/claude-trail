@@ -13,9 +13,11 @@ import tempfile
 import termios
 import time
 import tty
+from dataclasses import dataclass
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 from pathlib import Path
+from typing import Callable
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -89,13 +91,79 @@ FILE_PATH_RE = re.compile(
     r")"
 )
 
-COLUMNS = {
-    1: ("Time", "cyan", {"width": 8, "no_wrap": True}),
-    2: ("Session", "magenta", {"width": 20, "no_wrap": True, "overflow": "ellipsis"}),
-    3: ("Directory", "green", {"width": 14, "no_wrap": True}),
-    4: ("Files", "yellow", {"width": 20, "no_wrap": True, "overflow": "ellipsis"}),
-    5: ("Command", "white", {"ratio": 1, "no_wrap": True, "overflow": "ellipsis"}),
-}
+@dataclass(frozen=True)
+class RenderCtx:
+    """Per-render state a column cell may need.
+
+    Bundles the session name/color maps so a column's `render` callable has one
+    argument for everything table-wide. The module-level helper functions
+    (`format_time`, `session_label`, `rich_color`, ...) are called directly.
+    """
+
+    name_map: dict[str, str] | None = None
+    color_map: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class Column:
+    """One table column.
+
+    `key` is the stable digit (1..5) the toggle keys / status bar use. `style`
+    and `kwargs` are passed to `Table.add_column`. `render(entry, ctx)` produces
+    that column's cell for a single log entry as a `str` or `rich.text.Text`.
+    Adding a column is a single entry in the `COLUMNS` list below.
+    """
+
+    key: int
+    name: str
+    style: str
+    kwargs: dict
+    render: Callable[[dict, RenderCtx], object]
+
+
+def _danger_prefixed(cmd: str, body: str) -> Text:
+    """A `Text` of `body`, prefixed with a bold-red `* ` when `cmd` is dangerous."""
+    text = Text()
+    if is_dangerous(cmd):
+        text.append("* ", style="bold red")
+    text.append(body)
+    return text
+
+
+def _render_time(entry: dict, ctx: RenderCtx):
+    return format_time(entry.get("timestamp", ""))
+
+
+def _render_session(entry: dict, ctx: RenderCtx):
+    sid = entry.get("session_id", "")
+    label = session_label(sid, ctx.name_map)
+    color = rich_color(ctx.color_map.get(sid)) if ctx.color_map else None
+    return Text(label, style=color) if color else label
+
+
+def _render_directory(entry: dict, ctx: RenderCtx):
+    return short_path(entry.get("cwd", ""))
+
+
+def _render_files(entry: dict, ctx: RenderCtx):
+    return extract_files(entry.get("command", ""))
+
+
+def _render_command(entry: dict, ctx: RenderCtx):
+    cmd = entry.get("command", "")
+    return _danger_prefixed(cmd, normalize_cmd(cmd))
+
+
+COLUMNS = [
+    Column(1, "Time", "cyan", {"width": 8, "no_wrap": True}, _render_time),
+    Column(2, "Session", "magenta",
+           {"width": 20, "no_wrap": True, "overflow": "ellipsis"}, _render_session),
+    Column(3, "Directory", "green", {"width": 14, "no_wrap": True}, _render_directory),
+    Column(4, "Files", "yellow",
+           {"width": 20, "no_wrap": True, "overflow": "ellipsis"}, _render_files),
+    Column(5, "Command", "white",
+           {"ratio": 1, "no_wrap": True, "overflow": "ellipsis"}, _render_command),
+]
 
 # Matches the `/color <value>` slash command as it appears in transcript
 # system/local_command events: a single line containing
@@ -347,41 +415,17 @@ def build_table(
         row_styles=["", "dim"],
     )
 
-    for col_id in sorted(visible_cols):
-        if not visible_cols[col_id]:
-            continue
-        name, style, kwargs = COLUMNS[col_id]
-        table.add_column(name, style=style, **kwargs)
+    ctx = RenderCtx(name_map=name_map, color_map=color_map)
+    active = [col for col in COLUMNS if visible_cols.get(col.key)]
+    for col in active:
+        table.add_column(col.name, style=col.style, **col.kwargs)
 
     display = get_display_entries(entries, max_rows, offset)
     highlight_idx = cursor - offset
 
     for idx, entry in enumerate(display):
-        cmd = entry.get("command", "")
         row_style = "on grey23" if idx == highlight_idx else None
-
-        cells = []
-        for col_id in sorted(visible_cols):
-            if not visible_cols[col_id]:
-                continue
-            if col_id == 1:
-                cells.append(format_time(entry.get("timestamp", "")))
-            elif col_id == 2:
-                sid = entry.get("session_id", "")
-                label = session_label(sid, name_map)
-                color = rich_color(color_map.get(sid)) if color_map else None
-                cells.append(Text(label, style=color) if color else label)
-            elif col_id == 3:
-                cells.append(short_path(entry.get("cwd", "")))
-            elif col_id == 4:
-                cells.append(extract_files(cmd))
-            elif col_id == 5:
-                cmd_text = Text()
-                if is_dangerous(cmd):
-                    cmd_text.append("* ", style="bold red")
-                cmd_text.append(normalize_cmd(cmd))
-                cells.append(cmd_text)
-
+        cells = [col.render(entry, ctx) for col in active]
         table.add_row(*cells, style=row_style)
 
     return table
@@ -448,25 +492,22 @@ def build_detail_panel(
 ) -> Panel:
     """Full-screen view of a single command: metadata header plus the complete,
     untruncated command text (newlines preserved)."""
-    sid = entry.get("session_id", "")
     cmd = entry.get("command", "")
+    ctx = RenderCtx(name_map=name_map, color_map=color_map)
 
     meta = Table.grid(padding=(0, 2))
     meta.add_column(style="dim", justify="right", no_wrap=True)
     meta.add_column(ratio=1)
     meta.add_row("Time", format_time(entry.get("timestamp", "")))
-    label = session_label(sid, name_map)
-    color = rich_color(color_map.get(sid)) if color_map else None
-    meta.add_row("Session", Text(label, style=color) if color else label)
+    meta.add_row("Session", _render_session(entry, ctx))
     meta.add_row("Directory", entry.get("cwd", "") or "(none)")
     files = extract_files(cmd)
     if files:
         meta.add_row("Files", files)
 
-    cmd_text = Text()
-    if is_dangerous(cmd):
-        cmd_text.append("* ", style="bold red")
-    cmd_text.append(cmd or "(empty)")
+    # Reuse the Command column's danger marker, but keep the raw (un-normalized)
+    # command so newlines are preserved in this full-screen view.
+    cmd_text = _danger_prefixed(cmd, cmd or "(empty)")
 
     cmd_panel = Panel(
         cmd_text,
@@ -691,7 +732,7 @@ def main():
     console = Console()
     cursor = 0
     scroll_offset = 0
-    visible_cols = {1: True, 2: True, 3: True, 4: True, 5: True}
+    visible_cols = {c.key: True for c in COLUMNS}
     detail_entry: dict | None = None  # when set, render the full-command view
 
     entries, last_pos = read_last_entries(LOG_PATH, MAX_ENTRIES)
@@ -808,7 +849,7 @@ def main():
                 elif ch == "G":
                     cursor = max(0, len(entries) - 1)
                     clamp_view()
-                elif ch in ("1", "2", "3", "4", "5"):
+                elif ch.isdigit() and int(ch) in visible_cols:
                     col = int(ch)
                     if not visible_cols[col] or sum(visible_cols.values()) > 1:
                         visible_cols[col] = not visible_cols[col]

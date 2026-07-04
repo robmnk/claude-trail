@@ -853,3 +853,70 @@ class TestOpenFileFolder:
         with patch.object(feed.subprocess, "Popen") as popen:
             feed.open_file_folder({"command": "echo hi", "cwd": str(tmp_path / "absent")})
         popen.assert_not_called()
+
+
+class TestColumnRender:
+    """Each Column's `render(entry, ctx)` produces the right cell, and adding a
+    Column is a single list entry (data-driven columns)."""
+
+    def _entry(self, **kw):
+        e = {"timestamp": "2025-01-01T12:00:00+00:00", "command": "ls -la",
+             "cwd": "/work", "session_id": "abcd1234"}
+        e.update(kw)
+        return e
+
+    def _col(self, key):
+        return next(c for c in feed.COLUMNS if c.key == key)
+
+    def test_time_column_renders_hms(self):
+        from datetime import datetime as _dt, timezone as _tz
+        expected = _dt(2025, 1, 1, 12, 0, 0, tzinfo=_tz.utc).astimezone().strftime("%H:%M:%S")
+        assert self._col(1).render(self._entry(), feed.RenderCtx()) == expected
+
+    def test_session_column_applies_color_tint(self):
+        from rich.text import Text
+        # "orange" must be mapped through rich_color -> "orange1"
+        ctx = feed.RenderCtx(color_map={"abcd1234": "orange"})
+        cell = self._col(2).render(self._entry(), ctx)
+        assert isinstance(cell, Text)
+        assert cell.style == "orange1"
+        assert cell.plain == "abcd1234"
+
+    def test_session_column_plain_string_without_color(self):
+        cell = self._col(2).render(self._entry(), feed.RenderCtx())
+        assert cell == "abcd1234"  # plain str, no tint
+
+    def test_command_column_marks_dangerous(self):
+        from rich.text import Text
+        cell = self._col(5).render(self._entry(command="rm -rf /tmp/x"), feed.RenderCtx())
+        assert isinstance(cell, Text)
+        assert cell.plain.startswith("* ")
+
+    def test_command_column_benign_has_no_marker(self):
+        cell = self._col(5).render(self._entry(command="ls -la"), feed.RenderCtx())
+        assert not cell.plain.startswith("* ")
+        assert cell.plain == "ls -la"
+
+    def test_appending_one_column_shows_in_table(self):
+        """One extra Column entry is enough to add a rendered column end-to-end.
+
+        Mutates the module-level COLUMNS list and restores it afterward so no
+        global state leaks (build_table reads the module-level list directly).
+        """
+        marker = "EXTRA_MARK"
+        extra = feed.Column(
+            key=6, name="Extra", style="white",
+            kwargs={"width": 20, "no_wrap": True},
+            render=lambda entry, ctx: marker,
+        )
+        original = feed.COLUMNS
+        feed.COLUMNS = original + [extra]
+        try:
+            cols = {c.key: True for c in feed.COLUMNS}
+            console = Console(width=200, record=True)
+            console.print(feed.build_table([self._entry()], 20, cols, 0))
+            out = console.export_text()
+            assert "Extra" in out   # header rendered
+            assert marker in out    # cell rendered
+        finally:
+            feed.COLUMNS = original
