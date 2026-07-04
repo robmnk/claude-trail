@@ -35,7 +35,7 @@ except PackageNotFoundError:  # running from a clone without an install
 LOG_PATH = Path.home() / ".claude" / "command-log.jsonl"
 SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
-MAX_ENTRIES = 50
+MAX_ENTRIES = 1000
 POLL_INTERVAL = 0.3
 CHROME_ROWS = 10  # title, status, padding
 MIN_VISIBLE_ROWS = 3
