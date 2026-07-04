@@ -596,7 +596,8 @@ class TestConfigDir:
 
 class TestHookMain:
     def _run_hook(self, tmp_path, payload):
-        import io, json
+        import io
+        import json
         log_file = tmp_path / "command-log.jsonl"
         with patch.object(feed, "LOG_PATH", log_file):
             stream = io.StringIO(json.dumps(payload))
@@ -647,7 +648,8 @@ class TestHookMain:
         assert entry["session_id"] == ""
 
     def test_creates_parent_directory(self, tmp_path):
-        import io, json
+        import io
+        import json
         log = tmp_path / "nested" / "subdir" / "command-log.jsonl"
         with patch.object(feed, "LOG_PATH", log):
             rc = feed.hook_main(stream=io.StringIO(json.dumps({
