@@ -551,6 +551,15 @@ class TestPlatformOpener:
 class TestConfigDir:
     """CONFIG_DIR and the paths derived from it honor $CLAUDE_CONFIG_DIR."""
 
+    def _reload_with_true_env(self, monkeypatch):
+        # Undo our env changes FIRST, then reload, so the module is left
+        # consistent with the real outer environment (whatever it is), not with
+        # this test's temporary env. Order matters: reloading before the undo
+        # would leave the module and the environment disagreeing.
+        import importlib
+        monkeypatch.undo()
+        importlib.reload(feed)
+
     def test_env_override_reshapes_derived_paths(self, monkeypatch):
         import importlib
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/custom/cfg")
@@ -561,15 +570,28 @@ class TestConfigDir:
             assert feed.SESSIONS_DIR == Path("/custom/cfg/sessions")
             assert feed.PROJECTS_DIR == Path("/custom/cfg/projects")
         finally:
-            monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-            importlib.reload(feed)  # restore module to default-env state
+            self._reload_with_true_env(monkeypatch)
+
+    def test_empty_env_falls_back_to_home(self, monkeypatch):
+        # Empty string must fall back to ~/.claude (the reason CONFIG_DIR uses
+        # `or` rather than os.environ.get with a default argument).
+        import importlib
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "")
+        importlib.reload(feed)
+        try:
+            assert feed.CONFIG_DIR == Path.home() / ".claude"
+        finally:
+            self._reload_with_true_env(monkeypatch)
 
     def test_default_is_home_dot_claude(self, monkeypatch):
         import importlib
         monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
         importlib.reload(feed)
-        assert feed.CONFIG_DIR == Path.home() / ".claude"
-        assert feed.LOG_PATH == Path.home() / ".claude" / "command-log.jsonl"
+        try:
+            assert feed.CONFIG_DIR == Path.home() / ".claude"
+            assert feed.LOG_PATH == Path.home() / ".claude" / "command-log.jsonl"
+        finally:
+            self._reload_with_true_env(monkeypatch)
 
 
 class TestHookMain:

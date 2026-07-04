@@ -3,16 +3,17 @@
 
 Pipeline:
     A PostToolUse hook (`claude-trail hook`) appends one JSON line per Bash
-    command to ~/.claude/command-log.jsonl. The TUI tails that file, folds the
-    new lines into an AppState (entries plus cursor/scroll/column view state),
-    and Rich renders the state as a newest-first table or a full-command
-    detail panel.
+    command to CONFIG_DIR/command-log.jsonl (default ~/.claude). The TUI tails
+    that file, folds the new lines into an AppState (entries plus cursor/scroll/
+    column view state), and Rich renders the state as a newest-first table or a
+    full-command detail panel.
 
 Layout: the file is split into `# ==== <name> ====` banners, in file order:
     config/paths, danger + path patterns, columns, session /color parsing,
     danger detection + path extraction, session names, session colors,
-    format/parse helpers, rendering, side-effecting actions, input decoding,
-    file tailing, hook, AppState + apply_key, main.
+    format/parse helpers, rendering (table), side-effecting actions,
+    rendering (panels), input decoding, file tailing, hook,
+    AppState + apply_key, main.
 """
 
 import enum
@@ -75,6 +76,7 @@ class LogEntry(TypedDict):
     command: str
     cwd: str
     session_id: str
+
 
 # ==== Danger + path patterns ====
 
