@@ -6,6 +6,7 @@ import os
 import re
 import select
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -48,15 +49,22 @@ DANGEROUS_PATTERNS = re.compile(
     r"|git\s+checkout\s+--"            # git discard
     r"|git\s+clean\b|git\s+branch\s+-[dD]" # git cleanup
     r"|truncate\b"                     # write/overwrite
-    r"|>\s*/"                          # redirect to absolute path
     r"|curl\b.*\|\s*(?:bash|sh)\b"     # pipe to shell
     r"|wget\b|curl\b.*-o\b"           # download/write
     r"|pip\s+install\b|npm\s+install\b" # package install
     r"|docker\s+rm\b|docker\s+rmi\b"   # container removal
-    r"|systemctl\b|service\b"          # service control
+    # only mutating systemctl subcommands; bare `service` collided with
+    # `docker service ls` / `kubectl get service`
+    r"|systemctl\s+(?:start|stop|restart|reload|enable|disable|mask|daemon-reload)\b"
     r")",
     re.IGNORECASE,
 )
+
+# A write-redirect to an absolute path (e.g. `> /etc/hosts`, `2>/var/log/x`),
+# excluding the ubiquitous `/dev/null` discard and pure fd-duplication like
+# `2>&1` (which has no `/` target). Kept separate from DANGEROUS_PATTERNS
+# because that group's leading \b rejects a space-separated `> /path`.
+DANGEROUS_REDIRECT = re.compile(r">>?\s*/(?!dev/null\b)")
 
 # Extract file paths from command strings
 FILE_PATH_RE = re.compile(
@@ -103,7 +111,7 @@ def rich_color(claude_color: str | None) -> str | None:
 
 
 def is_dangerous(cmd: str) -> bool:
-    return bool(DANGEROUS_PATTERNS.search(cmd))
+    return bool(DANGEROUS_PATTERNS.search(cmd) or DANGEROUS_REDIRECT.search(cmd))
 
 
 def extract_files(cmd: str) -> str:
@@ -525,12 +533,23 @@ def build_panel(
     )
 
 
+def _read_pending_byte(fd: int, timeout: float = 0.02) -> bytes:
+    """Return one byte from `fd` if one arrives within `timeout`, else b""."""
+    ready, _, _ = select.select([fd], [], [], timeout)
+    if not ready:
+        return b""
+    try:
+        return os.read(fd, 1)
+    except OSError:
+        return b""
+
+
 def read_key(fd: int) -> str:
     """Read one keypress from `fd`, decoding arrow-key escape sequences.
 
     Reads via os.read (unbuffered) instead of sys.stdin on purpose: the poll
     loop calls select() on this same fd, and Python's buffered text stdin would
-    read ahead into its own buffer where select() can't see it — dropping the
+    read ahead into its own buffer where select() can't see it, dropping the
     trailing bytes of arrow sequences and stalling queued keys (the cause of
     laggy navigation). os.read keeps reads and select() consistent.
     """
@@ -541,17 +560,14 @@ def read_key(fd: int) -> str:
     if not data:
         return ""
     if data == b"\x1b":
-        # Arrow keys arrive as a multi-byte escape sequence. Grab whatever is
-        # already buffered on the fd; a lone ESC has nothing waiting.
-        ready, _, _ = select.select([fd], [], [], 0.02)
-        if ready:
-            try:
-                tail = os.read(fd, 8)
-            except OSError:
-                tail = b""
-            seq = tail.decode("utf-8", errors="replace")
-            # CSI ("[A"/"[B") is the normal cursor-key form; SS3 ("OA"/"OB") is
-            # what a terminal in application-cursor-keys mode sends.
+        # Consume exactly one escape sequence: the CSI ("[") or SS3 ("O")
+        # introducer plus its final byte. Reading one byte at a time (rather
+        # than os.read(fd, 8)) leaves any following sequence on the fd for the
+        # next call. Holding an arrow key queues several, and a greedy read
+        # would swallow the rest and surface a lone ESC, dropping keystrokes.
+        intro = _read_pending_byte(fd)
+        if intro in (b"[", b"O"):
+            seq = (intro + _read_pending_byte(fd)).decode("utf-8", errors="replace")
             if seq in ("[A", "OA"):
                 return "up"
             if seq in ("[B", "OB"):
@@ -625,6 +641,15 @@ def hook_main(stream=None) -> int:
     return 0
 
 
+def _sigterm_exit(signum, frame):
+    """SIGTERM handler: raise SystemExit so main()'s finally restores the tty.
+
+    SystemExit is a BaseException, so the loop's `except KeyboardInterrupt`
+    does not swallow it and it propagates to the terminal-restoring finally.
+    """
+    raise SystemExit(143)  # 128 + SIGTERM (15)
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "hook":
         sys.exit(hook_main())
@@ -644,6 +669,10 @@ def main():
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
         tty.setcbreak(fd)
+        # Without this, a SIGTERM (kill/pkill from another pane) would terminate
+        # the process without unwinding, leaving the terminal in no-echo cbreak
+        # mode. Raising SystemExit lets the finally below restore it.
+        signal.signal(signal.SIGTERM, _sigterm_exit)
 
     def calc_max_rows():
         return max(console.height - 10, 3)
