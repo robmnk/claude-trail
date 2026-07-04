@@ -886,22 +886,32 @@ class TestColumnRender:
         cell = self._col(2).render(self._entry(), feed.RenderCtx())
         assert cell == "abcd1234"  # plain str, no tint
 
+    def test_directory_column_shortens_cwd(self):
+        # a swap of _render_directory / _render_files in COLUMNS must fail here
+        cell = self._col(3).render(self._entry(cwd="/home/user/project"), feed.RenderCtx())
+        assert cell == feed.short_path("/home/user/project")
+
+    def test_files_column_extracts_basenames(self):
+        cell = self._col(4).render(self._entry(command="cat /etc/hosts"), feed.RenderCtx())
+        assert cell == "hosts"
+
     def test_command_column_marks_dangerous(self):
-        from rich.text import Text
+        from rich.text import Span, Text
         cell = self._col(5).render(self._entry(command="rm -rf /tmp/x"), feed.RenderCtx())
         assert isinstance(cell, Text)
         assert cell.plain.startswith("* ")
+        assert Span(0, 2, "bold red") in cell.spans  # marker keeps its style
 
     def test_command_column_benign_has_no_marker(self):
         cell = self._col(5).render(self._entry(command="ls -la"), feed.RenderCtx())
         assert not cell.plain.startswith("* ")
         assert cell.plain == "ls -la"
 
-    def test_appending_one_column_shows_in_table(self):
+    def test_appending_one_column_shows_in_table(self, monkeypatch):
         """One extra Column entry is enough to add a rendered column end-to-end.
 
-        Mutates the module-level COLUMNS list and restores it afterward so no
-        global state leaks (build_table reads the module-level list directly).
+        build_table reads the module-level COLUMNS list directly; monkeypatch
+        restores it after the test so no global state leaks.
         """
         marker = "EXTRA_MARK"
         extra = feed.Column(
@@ -909,14 +919,10 @@ class TestColumnRender:
             kwargs={"width": 20, "no_wrap": True},
             render=lambda entry, ctx: marker,
         )
-        original = feed.COLUMNS
-        feed.COLUMNS = original + [extra]
-        try:
-            cols = {c.key: True for c in feed.COLUMNS}
-            console = Console(width=200, record=True)
-            console.print(feed.build_table([self._entry()], 20, cols, 0))
-            out = console.export_text()
-            assert "Extra" in out   # header rendered
-            assert marker in out    # cell rendered
-        finally:
-            feed.COLUMNS = original
+        monkeypatch.setattr(feed, "COLUMNS", feed.COLUMNS + [extra])
+        cols = {c.key: True for c in feed.COLUMNS}
+        console = Console(width=200, record=True)
+        console.print(feed.build_table([self._entry()], 20, cols, 0))
+        out = console.export_text()
+        assert "Extra" in out   # header rendered
+        assert marker in out    # cell rendered

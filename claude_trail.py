@@ -91,7 +91,8 @@ FILE_PATH_RE = re.compile(
     r")"
 )
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, eq=False)
 class RenderCtx:
     """Per-render state a column cell may need.
 
@@ -104,7 +105,7 @@ class RenderCtx:
     color_map: dict[str, str] | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Column:
     """One table column.
 
