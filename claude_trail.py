@@ -22,6 +22,7 @@ import os
 import re
 import select
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -65,6 +66,10 @@ AGENT_LABEL_CACHE_TTL = 2.0  # seconds
 SESSION_MODEL_CACHE_TTL = 2.0  # seconds; keeps the modal's running->done live
 AGENT_TOOLUSE_BYTE_CAP = 512 * 1024  # cap per agent transcript when counting tool_use
 ACTIVE_WINDOW_SECONDS = 300  # a session counts as active if seen within this window
+SEARCH_RESULT_LIMIT = 500  # max hits kept per search; the rest are dropped (capped)
+SEARCH_TIMEOUT = 5.0  # seconds before rg/grep is killed so a huge tree can't hang the UI
+# Editors that accept a `+<line>` argument to open a file at a line (vi family).
+_VI_FAMILY = frozenset({"vi", "vim", "nvim", "view", "vimdiff", "nvi", "gvim"})
 
 
 class LogEntry(TypedDict):
@@ -721,6 +726,135 @@ def load_session_model(sid: str) -> SessionModel:
     return model
 
 
+# ==== Search (per-session recursive grep) ====
+
+# One search hit: (absolute path, 1-based line number, matched line text).
+Match = tuple[str, int, str]
+
+
+def _other_root(root: str) -> str:
+    """The other of the two search roots ("transcript" <-> "cwd")."""
+    return "cwd" if root == "transcript" else "transcript"
+
+
+def search_roots(
+    sid: str, selected_entry: dict | None, model: "SessionModel | None" = None
+) -> dict[str, list[Path]]:
+    """Resolve the two search roots for a session.
+
+    "transcript": the session transcript `<sid>.jsonl` plus its sibling `<sid>/`
+    dir (which holds `subagents/**` and `subagents/workflows/**`), whichever
+    exist. "cwd": the session's launch dir (pid.json cwd via a live `model`) or,
+    for an ended session, the selected row's `cwd`. A path that does not exist is
+    skipped, and a root with no resolvable path is omitted entirely so the panel
+    can disable it. All returned paths are absolute (transcript paths come from
+    `_find_transcript`, which resolves under `PROJECTS_DIR`).
+    """
+    roots: dict[str, list[Path]] = {}
+
+    transcript = _find_transcript(sid) if sid else None
+    transcript_paths: list[Path] = []
+    if transcript is not None and transcript.exists():
+        transcript_paths.append(transcript)
+        subdir = transcript.parent / sid
+        if subdir.is_dir():
+            transcript_paths.append(subdir)
+    if transcript_paths:
+        roots["transcript"] = transcript_paths
+
+    cwd = ""
+    if model is not None and model.live and model.cwd:
+        cwd = model.cwd
+    elif selected_entry and selected_entry.get("cwd"):
+        cwd = selected_entry.get("cwd", "")
+    elif model is not None and model.cwd:
+        cwd = model.cwd
+    if cwd:
+        cwd_path = Path(cwd)
+        if cwd_path.exists():
+            roots["cwd"] = [cwd_path]
+
+    return roots
+
+
+def _parse_grep_line(line: str) -> Match | None:
+    """Parse one `path:line:text` result line into a Match, or None if malformed."""
+    parts = line.split(":", 2)
+    if len(parts) < 3:
+        return None
+    path, lineno, text = parts
+    try:
+        return (path, int(lineno), text)
+    except ValueError:
+        return None
+
+
+def run_search(
+    query: str,
+    paths,
+    *,
+    ignore_case: bool | None = None,
+    limit: int = SEARCH_RESULT_LIMIT,
+    timeout: float = SEARCH_TIMEOUT,
+) -> tuple[list[Match], bool, str | None]:
+    """Recursively grep `paths` for `query`, returning `(matches, capped, error)`.
+
+    Uses `rg` when available, else `grep -rInE` (`-I` skip binary, `-n` line
+    numbers). Smart-case by default (rg `-S`; grep has no smart-case so it stays
+    case-sensitive); an explicit `ignore_case` overrides. The query is passed as
+    an argv element (`shell=False`), so there is no shell-injection surface.
+
+    `matches` is truncated to `limit` (with `capped=True` when there were more).
+    rg/grep exit 1 (no matches) is an empty result, not an error; a bad regex or
+    a timeout returns a short `error` string. Never raises.
+    """
+    query = query or ""
+    path_args = [str(p) for p in paths if str(p)]
+    if not query.strip() or not path_args:
+        return [], False, None
+
+    if shutil.which("rg"):
+        argv = ["rg", "-n", "--no-heading", "--color=never"]
+        if ignore_case is True:
+            argv.append("-i")
+        elif ignore_case is False:
+            argv.append("-s")  # force case-sensitive
+        else:
+            argv.append("-S")  # smart-case
+        argv += ["-e", query, "--", *path_args]
+    else:
+        argv = ["grep", "-rInE"]
+        if ignore_case:
+            argv.append("-i")
+        argv += ["-e", query, "--", *path_args]
+
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return [], False, f"timed out after {timeout:g}s"
+    except OSError as exc:
+        return [], False, str(exc)
+
+    # rg/grep: exit 0 = matches, 1 = no matches, >=2 = a real error (bad regex).
+    if proc.returncode >= 2:
+        stderr_lines = (proc.stderr or "").strip().splitlines()
+        return [], False, stderr_lines[-1] if stderr_lines else "search failed"
+    if proc.returncode == 1:
+        return [], False, None
+
+    matches: list[Match] = []
+    capped = False
+    for line in proc.stdout.splitlines():
+        parsed = _parse_grep_line(line)
+        if parsed is None:
+            continue
+        if len(matches) >= limit:
+            capped = True
+            break
+        matches.append(parsed)
+    return matches, capped, None
+
+
 # ==== Format / parse helpers ====
 
 
@@ -866,6 +1000,26 @@ def open_file_folder(entry: LogEntry) -> None:
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+
+
+def open_containing_folder(path: str) -> str:
+    """Open the folder containing `path` in the platform file manager and return
+    the folder that was opened (for the search panel's confirmation flash).
+
+    Reuses `open_file_folder`'s detached `Popen(_platform_opener(), ...)` pattern.
+    `path` is absolute (search roots are absolute), so `dirname` gives its folder.
+    """
+    folder = os.path.dirname(path) or path
+    try:
+        subprocess.Popen(
+            [_platform_opener(), folder],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+    return folder
 
 
 # ==== Rendering: panels ====
@@ -1028,6 +1182,114 @@ def build_session_panel(
         body,
         title=_panel_title("· session"),
         subtitle=Text(model.transcript_path, style="dim"),
+        box=box.ROUNDED,
+        padding=(1, 2),
+        height=term_height,
+    )
+
+
+def _search_root_base(search: "SearchState") -> str:
+    """The dir to display match paths relative to (the active root's parent).
+
+    For the transcript root the first path is `<sid>.jsonl`, so its parent (the
+    project dir) is the base and `subagents/...` hits show relatively. For the
+    cwd root the first path is the cwd dir itself, so it is the base.
+    """
+    paths = search.roots.get(search.root, [])
+    if not paths:
+        return ""
+    first = str(paths[0])
+    return first if os.path.isdir(first) else os.path.dirname(first)
+
+
+def _rel_to(path: str, base: str) -> str:
+    """`path` relative to `base` (unchanged if `base` is empty or unrelated)."""
+    if not base:
+        return path
+    try:
+        return os.path.relpath(path, base)
+    except ValueError:
+        return path
+
+
+def build_search_panel(search: "SearchState", term_height: int = 40) -> Panel:
+    """Full-screen per-session search view (opened with `/`).
+
+    Header: the `/ <query>` line (a cursor block in INPUT mode) plus a tag with
+    the match count / `capped` marker / error; a root chip row showing which of
+    `transcript` / `cwd` is active (a root with no resolvable path is struck
+    through). Body: in RESULTS a table of `(root-relative path, line, snippet)`
+    with the cursor row highlighted, else an empty-state or the type-a-query
+    hint. Footer: mode-specific key hints plus a transient green `flash` line
+    confirming the last open-folder target.
+    """
+    query = Text("/ ", style="bold cyan")
+    query.append(search.query or "")
+    if search.mode == "INPUT":
+        query.append("▊", style="cyan")  # cursor block
+
+    tag = Text()
+    if search.error:
+        tag.append(search.error, style="red")
+    elif search.mode == "RESULTS":
+        n = len(search.results)
+        tag.append(f"{n} match{'es' if n != 1 else ''}", style="yellow")
+        if search.capped:
+            tag.append(f"  (capped {SEARCH_RESULT_LIMIT})", style="red")
+    else:
+        tag.append("[Tab] switch root", style="dim")
+
+    head = Table.grid(expand=True)
+    head.add_column(ratio=1)
+    head.add_column(justify="right")
+    head.add_row(query, tag)
+
+    roots = Text("  root:  ", style="dim")
+    for r in ("transcript", "cwd"):
+        if r == search.root:
+            style = "bold reverse cyan"
+        elif r in search.roots:
+            style = "dim"
+        else:
+            style = "dim strike"  # unavailable root
+        roots.append(f" {r} ", style=style)
+
+    if search.mode == "RESULTS" and search.results:
+        tbl = Table(box=None, pad_edge=False, header_style="dim", expand=True)
+        tbl.add_column("File", width=44, no_wrap=True, overflow="ellipsis")
+        tbl.add_column("Line", justify="right", width=6)
+        tbl.add_column("Match", ratio=1, no_wrap=True, overflow="ellipsis")
+        base = _search_root_base(search)
+        for i, (path, line, text) in enumerate(search.results):
+            tbl.add_row(
+                _rel_to(path, base), str(line), text.strip(),
+                style="on grey23" if i == search.cursor else None,
+            )
+        body = tbl
+    elif search.mode == "RESULTS":
+        body = Text("no matches", style="dim italic")
+    else:
+        body = Text(
+            "type a query, then ↵ to search  ·  Tab switches root",
+            style="dim italic",
+        )
+
+    hint = Text.from_markup(
+        "[dim italic]↵ run · tab root · esc cancel[/dim italic]"
+        if search.mode == "INPUT"
+        else "[dim italic]j/k move · ↵ open · f folder · "
+             "/ edit · tab root · esc back[/dim italic]"
+    )
+
+    parts = [head, roots, Text(""), body, Text("")]
+    if search.flash:
+        parts.append(Text(f"  ▸ {search.flash}", style="green"))
+    parts.append(hint)
+
+    return Panel(
+        Group(*parts),
+        title=_panel_title("· search"),
+        subtitle=Text(f"session {search.sid[:8]} · {search.root}", style="dim"),
         box=box.ROUNDED,
         padding=(1, 2),
         height=term_height,
@@ -1294,7 +1556,33 @@ class Action(enum.Enum):
     QUIT = enum.auto()
     OPEN_SESSION = enum.auto()
     OPEN_FILES = enum.auto()
+    RUN_SEARCH = enum.auto()        # run rg/grep for the open search modal
+    OPEN_MATCH = enum.auto()        # open the selected search hit at its line
+    OPEN_MATCH_FOLDER = enum.auto()  # open the folder containing the selected hit
     NONE = enum.auto()
+
+
+@dataclass
+class SearchState:
+    """View state for the per-session search modal (opened with `/`).
+
+    Two sub-modes resolve the type-vs-navigate conflict: in INPUT letters build
+    `query` (no navigation); in RESULTS `j`/`k` browse hits (letters do not
+    type). `roots` maps "transcript"/"cwd" to the absolute paths grep runs over
+    (from `search_roots`); `root` picks the active one and `Tab` flips it.
+    `flash` is a transient confirmation line set by main() after an open-folder.
+    """
+
+    sid: str
+    roots: dict[str, list[Path]]
+    root: str = "transcript"
+    query: str = ""
+    mode: str = "INPUT"  # "INPUT" | "RESULTS"
+    results: list[Match] = field(default_factory=list)
+    cursor: int = 0
+    capped: bool = False
+    error: str | None = None
+    flash: str | None = None
 
 
 @dataclass
@@ -1315,6 +1603,7 @@ class AppState:
     )
     detail_entry: LogEntry | None = None
     session_detail: str | None = None  # a session_id while the session modal is open
+    search: "SearchState | None" = None  # set while the search modal is open
 
     def modal_open(self) -> bool:
         """True while either full-screen modal (command detail or session detail)
@@ -1382,11 +1671,59 @@ class AppState:
         self.scroll_offset = max(0, min(self.scroll_offset, max_offset))
 
 
+def _apply_search_key(state: AppState, search: SearchState, ch: str) -> Action:
+    """Handle one keypress while the search modal is open (mutation only).
+
+    Stays pure: it mutates the SearchState / closes the modal and returns an
+    Action; main() runs the grep (RUN_SEARCH) and the editor / file-manager side
+    effects (OPEN_MATCH / OPEN_MATCH_FOLDER). Any keypress clears a stale `flash`.
+    """
+    if ch == "\x03":
+        return Action.QUIT
+    search.flash = None
+    if search.mode == "INPUT":
+        if ch in ("\r", "\n"):
+            return Action.RUN_SEARCH
+        if ch == "\x1b":
+            state.search = None
+        elif ch == "\t":
+            search.root = _other_root(search.root)
+        elif ch in ("\x7f", "\x08"):
+            search.query = search.query[:-1]
+        elif len(ch) == 1 and ch.isprintable():
+            search.query += ch
+        return Action.NONE
+    # RESULTS mode: j/k browse, enter/f act, / edits, tab re-runs on the other root
+    if ch in ("\x1b", "q"):
+        state.search = None
+    elif ch == "/":
+        search.mode = "INPUT"
+    elif ch == "\t":
+        search.root = _other_root(search.root)
+        return Action.RUN_SEARCH
+    elif ch in ("\r", "\n"):
+        if search.results:
+            return Action.OPEN_MATCH
+    elif ch == "f":
+        if search.results:
+            return Action.OPEN_MATCH_FOLDER
+    elif ch in ("j", "down"):
+        if search.results:
+            search.cursor = min(len(search.results) - 1, search.cursor + 1)
+    elif ch in ("k", "up"):
+        search.cursor = max(0, search.cursor - 1)
+    return Action.NONE
+
+
 def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
     """Apply one keypress to `state`, returning the Action main() must perform.
 
     Mutates `state` but spawns no processes and touches no terminal.
     """
+    if state.search is not None:
+        # The search modal is mutually exclusive with the command/session modals
+        # and takes precedence: it owns every key while open.
+        return _apply_search_key(state, state.search, ch)
     if state.modal_open():
         # Modal view (command detail or session detail): esc / q / enter return
         # to the table; Ctrl-C still quits. Clearing both fields keeps the two
@@ -1425,6 +1762,17 @@ def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
         # Treat an empty/missing session_id (hand-edited or legacy line) as no
         # session so the modal stays closed instead of showing a blank identity.
         state.session_detail = (entry.get("session_id") or None) if entry else None
+    elif ch == "/":
+        # Open the per-session search modal for the selected row's session,
+        # resolving its transcript-folder and cwd roots up front (S.1).
+        entry = state.selected_entry()
+        if entry is not None:
+            sid = entry.get("session_id") or ""
+            model = load_session_model(sid) if sid else None
+            roots = search_roots(sid, entry, model)
+            default_root = "transcript" if "transcript" in roots else (
+                "cwd" if "cwd" in roots else "transcript")
+            state.search = SearchState(sid=sid, roots=roots, root=default_root)
     elif ch == "o":
         return Action.OPEN_SESSION
     elif ch == "f":
@@ -1471,6 +1819,8 @@ def main():
         tty.setcbreak(fd)
 
     def render_panel() -> Panel:
+        if state.search is not None:
+            return build_search_panel(state.search, console.height)
         if state.session_detail is not None:
             return build_session_panel(
                 load_session_model(state.session_detail),
@@ -1519,6 +1869,39 @@ def main():
                     except OSError:
                         pass
 
+            def open_match(path: str, line: int) -> None:
+                # Open a search hit at its line, reusing open_session_log's
+                # suspend-Live / restore-tty pattern for terminal editors and its
+                # detached GUI-launcher fallback. vi-family editors get `+<line>`.
+                editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+                if editor and interactive:
+                    try:
+                        argv = shlex.split(editor)
+                    except ValueError:
+                        argv = []
+                    if argv:
+                        if os.path.basename(argv[0]) in _VI_FAMILY:
+                            argv.append(f"+{line}")
+                        argv.append(path)
+                        live.stop()
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                        try:
+                            subprocess.call(argv)
+                        except (OSError, ValueError):
+                            pass
+                        tty.setcbreak(fd)
+                        live.start(refresh=True)
+                        return
+                try:
+                    subprocess.Popen(
+                        [_platform_opener(), path],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                except OSError:
+                    pass
+
             try:
                 while True:
                     max_rows = visible_row_count(console.height)
@@ -1546,6 +1929,24 @@ def main():
                                 entry = state.selected_entry()
                                 if entry:
                                     open_file_folder(entry)
+                            elif action is Action.RUN_SEARCH:
+                                s = state.search
+                                if s is not None:
+                                    results, capped, err = run_search(
+                                        s.query, s.roots.get(s.root, []))
+                                    s.results, s.capped, s.error = results, capped, err
+                                    s.mode, s.cursor = "RESULTS", 0
+                            elif action is Action.OPEN_MATCH:
+                                s = state.search
+                                if s is not None and s.results:
+                                    path, line, _ = s.results[s.cursor]
+                                    open_match(path, line)
+                            elif action is Action.OPEN_MATCH_FOLDER:
+                                s = state.search
+                                if s is not None and s.results:
+                                    folder = open_containing_folder(
+                                        s.results[s.cursor][0])
+                                    s.flash = f"opened folder: {folder}"
                             ready, _, _ = select.select([fd], [], [], 0)
                         if quit_now:
                             break
