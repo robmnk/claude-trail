@@ -432,6 +432,196 @@ class TestLoadSessionNames:
             assert feed.load_session_names() == {"s1": "first"}
 
 
+class TestAgentLabel:
+    """entry_agent_id / agent_label resolution (pure, no disk)."""
+
+    def test_main_agent_entry_has_no_label(self):
+        assert feed.entry_agent_id({"session_id": "s"}) is None
+        assert feed.agent_label({"session_id": "s"}, {}) is None
+
+    def test_empty_agent_id_is_none(self):
+        assert feed.entry_agent_id({"agent_id": ""}) is None
+        assert feed.agent_label({"agent_id": ""}, {}) is None
+
+    def test_resolves_description(self):
+        amap = {"aid1": {"type": "general-purpose", "description": "Implement Phase 4"}}
+        assert feed.agent_label({"agent_id": "aid1"}, amap) == "Implement Phase 4"
+
+    def test_falls_back_to_type_then_id(self):
+        amap = {"aid1": {"type": "Explore", "description": ""}}
+        assert feed.agent_label({"agent_id": "aid1"}, amap) == "Explore"
+        # unknown agent_id -> first 8 chars of the id
+        assert feed.agent_label({"agent_id": "abcdef1234"}, {}) == "abcdef12"
+
+
+def _make_session(projects_root, sid, *, agents, completed=(),
+                  extra_events=None, proj="-home-naka-Projects-x",
+                  cwd="/home/naka/Projects/x"):
+    """Build a fake `<proj>/<sid>.jsonl` + `<sid>/subagents/` tree.
+
+    `agents` maps agent_id -> (agent_type, description, n_tool_use); `completed`
+    lists agent_ids to mark done via a <task-notification>. Returns the project
+    directory path.
+    """
+    import json
+    project = projects_root / proj
+    subagents = project / sid / "subagents"
+    subagents.mkdir(parents=True, exist_ok=True)
+
+    lines = [json.dumps({"type": "user", "cwd": cwd, "content": "hi"}) + "\n"]
+    for aid in completed:
+        # inner newlines are escaped by json.dumps, so this stays one physical line
+        notif = (f"<task-notification>\n<task-id>{aid}</task-id>\n"
+                 f"<tool-use-id>toolu_{aid}</tool-use-id>\n"
+                 f"<status>completed</status>\n</task-notification>")
+        lines.append(json.dumps({"type": "user", "content": notif}) + "\n")
+    for line in (extra_events or []):
+        lines.append(line)
+    (project / f"{sid}.jsonl").write_text("".join(lines), encoding="utf-8")
+
+    for aid, (atype, desc, n_use) in agents.items():
+        meta = {"agentType": atype, "toolUseId": f"toolu_{aid}", "spawnDepth": 1}
+        if desc is not None:
+            meta["description"] = desc
+        (subagents / f"agent-{aid}.meta.json").write_text(
+            json.dumps(meta), encoding="utf-8")
+        body = "".join(
+            '{"type":"assistant","message":{"content":['
+            '{"type":"tool_use","name":"Bash"}]}}\n'
+            for _ in range(n_use)
+        )
+        (subagents / f"agent-{aid}.jsonl").write_text(body, encoding="utf-8")
+    return project
+
+
+class TestLoadAgentLabels:
+    def test_reads_meta_including_workflow_agents(self, tmp_path):
+        sid = "sid-labels"
+        project = _make_session(tmp_path, sid, agents={
+            "aaa111": ("general-purpose", "Implement Phase 4", 2),
+        })
+        # a workflow agent nested one level deeper, no description
+        wf = project / sid / "subagents" / "workflows" / "wf_1"
+        wf.mkdir(parents=True)
+        (wf / "agent-bbb222.meta.json").write_text(
+            '{"agentType":"workflow-subagent","spawnDepth":1}', encoding="utf-8")
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed, "AGENT_LABEL_CACHE_TTL", 0.0):
+            labels = feed.load_agent_labels([sid])
+        assert labels["aaa111"] == {"type": "general-purpose",
+                                    "description": "Implement Phase 4"}
+        assert labels["bbb222"] == {"type": "workflow-subagent", "description": ""}
+
+    def test_missing_session_is_skipped(self, tmp_path):
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed, "AGENT_LABEL_CACHE_TTL", 0.0):
+            assert feed.load_agent_labels(["nope", ""]) == {}
+
+
+class TestLoadSessionModel:
+    def test_live_session_reports_running_and_done(self, tmp_path):
+        import json
+        sid = "sid-live"
+        _make_session(tmp_path, sid, agents={
+            "done1": ("general-purpose", "Review Phase 4", 3),
+            "run1": ("Explore", "Search the tree", 1),
+        }, completed=["done1"])
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        (sessions / "1467.json").write_text(json.dumps({
+            "pid": 1467, "sessionId": sid, "cwd": "/home/naka/Projects/x",
+            "version": "2.1.200", "kind": "interactive", "name": "my-sess",
+            "status": "busy", "startedAt": 1783058624928,
+        }), encoding="utf-8")
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed, "SESSIONS_DIR", sessions), \
+             patch.object(feed, "SESSION_MODEL_CACHE_TTL", 0.0):
+            model = feed.load_session_model(sid)
+
+        assert model.live is True
+        assert model.name == "my-sess"
+        assert model.status == "busy"
+        assert model.cwd == "/home/naka/Projects/x"
+        assert model.version == "2.1.200"
+        assert model.kind == "interactive"
+        assert model.started_at == 1783058624928
+        assert model.transcript_path.endswith(f"{sid}.jsonl")
+
+        by_id = {s.agent_id: s for s in model.subagents}
+        assert by_id["done1"].status == "done"
+        assert by_id["done1"].command_count == 3
+        assert by_id["run1"].status == "running"
+        assert by_id["run1"].command_count == 1
+        # active agents sort first
+        assert model.subagents[0].agent_id == "run1"
+
+    def test_ended_session_marks_incomplete_stopped(self, tmp_path):
+        sid = "sid-ended"
+        _make_session(tmp_path, sid, agents={
+            "gone1": ("general-purpose", "Never finished", 0),
+        })
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()  # no pid.json -> ended session
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed, "SESSIONS_DIR", sessions), \
+             patch.object(feed, "SESSION_NAME_CACHE_TTL", 0.0), \
+             patch.object(feed, "SESSION_MODEL_CACHE_TTL", 0.0):
+            model = feed.load_session_model(sid)
+        assert model.live is False
+        assert model.cwd == "/home/naka/Projects/x"  # from first transcript event
+        assert model.subagents[0].status == "stopped"
+
+    def test_failed_and_killed_map_to_stopped(self, tmp_path):
+        import json
+        sid = "sid-terminal"
+        # two agents completed via task-notification with non-completed statuses
+        extra = []
+        for aid, st in (("failA", "failed"), ("killB", "killed")):
+            notif = (f"<task-notification>\n<task-id>{aid}</task-id>\n"
+                     f"<status>{st}</status>\n</task-notification>")
+            extra.append(json.dumps({"type": "user", "content": notif}) + "\n")
+        _make_session(tmp_path, sid, agents={
+            "failA": ("general-purpose", "boom", 0),
+            "killB": ("general-purpose", "zap", 0),
+        }, extra_events=extra)
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        (sessions / "1.json").write_text(json.dumps({
+            "sessionId": sid, "name": "s", "cwd": "/x",
+        }), encoding="utf-8")  # live, but both agents have terminal notifications
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed, "SESSIONS_DIR", sessions), \
+             patch.object(feed, "SESSION_MODEL_CACHE_TTL", 0.0):
+            model = feed.load_session_model(sid)
+        assert {s.status for s in model.subagents} == {"stopped"}
+
+    def test_session_without_subagents(self, tmp_path):
+        sid = "sid-bare"
+        _make_session(tmp_path, sid, agents={})
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed, "SESSIONS_DIR", sessions), \
+             patch.object(feed, "SESSION_NAME_CACHE_TTL", 0.0), \
+             patch.object(feed, "SESSION_MODEL_CACHE_TTL", 0.0):
+            model = feed.load_session_model(sid)
+        assert model.subagents == ()
+
+    def test_command_count_byte_cap(self, tmp_path):
+        sid = "sid-cap"
+        _make_session(tmp_path, sid, agents={"big": ("general-purpose", "big", 3)})
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        # cap below the transcript size -> capped flag set
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed, "SESSIONS_DIR", sessions), \
+             patch.object(feed, "SESSION_NAME_CACHE_TTL", 0.0), \
+             patch.object(feed, "AGENT_TOOLUSE_BYTE_CAP", 10), \
+             patch.object(feed, "SESSION_MODEL_CACHE_TTL", 0.0):
+            model = feed.load_session_model(sid)
+        assert model.subagents[0].command_count_capped is True
+
+
 class TestExtractFiles:
     def test_no_paths(self):
         assert feed.extract_files("ls") == ""
