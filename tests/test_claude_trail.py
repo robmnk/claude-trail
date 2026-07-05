@@ -1368,6 +1368,34 @@ class TestAgentTree:
         assert out.count("─") >= 2  # each is its own single-row run
         assert "first" in out and "second" in out
 
+    def test_same_agent_id_across_sessions_breaks_the_run(self):
+        # the run key is (session_id, agent_id): the same agent id in two
+        # different sessions must not merge into a single run.
+        entries = [
+            self._entry("s1", "one", aid="a1"),
+            self._entry("s2", "two", aid="a1"),
+        ]
+        amap = {"a1": {"type": "gp", "description": "shared"}}
+        cols = {c.key: True for c in feed.COLUMNS}
+        out = self._text(feed.build_table(entries, 10, cols, 0, agent_map=amap))
+        assert out.count("─") == 2       # two separate single-row runs
+        assert out.count("┌") == 0       # neither is a multi-row run
+        assert out.count("shared") == 2  # label re-shown for each run
+
+    def test_scroll_offset_reanchors_run_label_at_slice_top(self):
+        # a run longer than the visible slice: with a nonzero offset the label
+        # and top connector re-anchor at the top of the slice (slice-local
+        # run detection), keeping the label visible while scrolling.
+        entries = [self._entry("s1", f"cmd {i}", aid="a1") for i in range(5)]
+        amap = {"a1": {"type": "gp", "description": "long run"}}
+        cols = {c.key: True for c in feed.COLUMNS}
+        out = self._text(
+            feed.build_table(entries, 10, cols, 0, offset=2, agent_map=amap))
+        assert out.count("long run") == 1  # label shown once, at the slice top
+        assert out.count("┌") == 1         # top connector re-anchored at slice edge
+        assert out.count("└") == 1         # slice bottom closes the run
+        assert "│" in out                  # a middle continuation row remains
+
     def test_toggle_six_hides_agent_column(self):
         entries = [self._entry("s1", "cmd", aid="a1")]
         amap = {"a1": {"type": "general-purpose", "description": "solo task"}}
