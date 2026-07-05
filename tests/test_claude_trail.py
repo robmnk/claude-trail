@@ -432,6 +432,196 @@ class TestLoadSessionNames:
             assert feed.load_session_names() == {"s1": "first"}
 
 
+class TestAgentLabel:
+    """entry_agent_id / agent_label resolution (pure, no disk)."""
+
+    def test_main_agent_entry_has_no_label(self):
+        assert feed.entry_agent_id({"session_id": "s"}) is None
+        assert feed.agent_label({"session_id": "s"}, {}) is None
+
+    def test_empty_agent_id_is_none(self):
+        assert feed.entry_agent_id({"agent_id": ""}) is None
+        assert feed.agent_label({"agent_id": ""}, {}) is None
+
+    def test_resolves_description(self):
+        amap = {"aid1": {"type": "general-purpose", "description": "Implement Phase 4"}}
+        assert feed.agent_label({"agent_id": "aid1"}, amap) == "Implement Phase 4"
+
+    def test_falls_back_to_type_then_id(self):
+        amap = {"aid1": {"type": "Explore", "description": ""}}
+        assert feed.agent_label({"agent_id": "aid1"}, amap) == "Explore"
+        # unknown agent_id -> first 8 chars of the id
+        assert feed.agent_label({"agent_id": "abcdef1234"}, {}) == "abcdef12"
+
+
+def _make_session(projects_root, sid, *, agents, completed=(),
+                  extra_events=None, proj="-home-naka-Projects-x",
+                  cwd="/home/naka/Projects/x"):
+    """Build a fake `<proj>/<sid>.jsonl` + `<sid>/subagents/` tree.
+
+    `agents` maps agent_id -> (agent_type, description, n_tool_use); `completed`
+    lists agent_ids to mark done via a <task-notification>. Returns the project
+    directory path.
+    """
+    import json
+    project = projects_root / proj
+    subagents = project / sid / "subagents"
+    subagents.mkdir(parents=True, exist_ok=True)
+
+    lines = [json.dumps({"type": "user", "cwd": cwd, "content": "hi"}) + "\n"]
+    for aid in completed:
+        # inner newlines are escaped by json.dumps, so this stays one physical line
+        notif = (f"<task-notification>\n<task-id>{aid}</task-id>\n"
+                 f"<tool-use-id>toolu_{aid}</tool-use-id>\n"
+                 f"<status>completed</status>\n</task-notification>")
+        lines.append(json.dumps({"type": "user", "content": notif}) + "\n")
+    for line in (extra_events or []):
+        lines.append(line)
+    (project / f"{sid}.jsonl").write_text("".join(lines), encoding="utf-8")
+
+    for aid, (atype, desc, n_use) in agents.items():
+        meta = {"agentType": atype, "toolUseId": f"toolu_{aid}", "spawnDepth": 1}
+        if desc is not None:
+            meta["description"] = desc
+        (subagents / f"agent-{aid}.meta.json").write_text(
+            json.dumps(meta), encoding="utf-8")
+        body = "".join(
+            '{"type":"assistant","message":{"content":['
+            '{"type":"tool_use","name":"Bash"}]}}\n'
+            for _ in range(n_use)
+        )
+        (subagents / f"agent-{aid}.jsonl").write_text(body, encoding="utf-8")
+    return project
+
+
+class TestLoadAgentLabels:
+    def test_reads_meta_including_workflow_agents(self, tmp_path):
+        sid = "sid-labels"
+        project = _make_session(tmp_path, sid, agents={
+            "aaa111": ("general-purpose", "Implement Phase 4", 2),
+        })
+        # a workflow agent nested one level deeper, no description
+        wf = project / sid / "subagents" / "workflows" / "wf_1"
+        wf.mkdir(parents=True)
+        (wf / "agent-bbb222.meta.json").write_text(
+            '{"agentType":"workflow-subagent","spawnDepth":1}', encoding="utf-8")
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed, "AGENT_LABEL_CACHE_TTL", 0.0):
+            labels = feed.load_agent_labels([sid])
+        assert labels["aaa111"] == {"type": "general-purpose",
+                                    "description": "Implement Phase 4"}
+        assert labels["bbb222"] == {"type": "workflow-subagent", "description": ""}
+
+    def test_missing_session_is_skipped(self, tmp_path):
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed, "AGENT_LABEL_CACHE_TTL", 0.0):
+            assert feed.load_agent_labels(["nope", ""]) == {}
+
+
+class TestLoadSessionModel:
+    def test_live_session_reports_running_and_done(self, tmp_path):
+        import json
+        sid = "sid-live"
+        _make_session(tmp_path, sid, agents={
+            "done1": ("general-purpose", "Review Phase 4", 3),
+            "run1": ("Explore", "Search the tree", 1),
+        }, completed=["done1"])
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        (sessions / "1467.json").write_text(json.dumps({
+            "pid": 1467, "sessionId": sid, "cwd": "/home/naka/Projects/x",
+            "version": "2.1.200", "kind": "interactive", "name": "my-sess",
+            "status": "busy", "startedAt": 1783058624928,
+        }), encoding="utf-8")
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed, "SESSIONS_DIR", sessions), \
+             patch.object(feed, "SESSION_MODEL_CACHE_TTL", 0.0):
+            model = feed.load_session_model(sid)
+
+        assert model.live is True
+        assert model.name == "my-sess"
+        assert model.status == "busy"
+        assert model.cwd == "/home/naka/Projects/x"
+        assert model.version == "2.1.200"
+        assert model.kind == "interactive"
+        assert model.started_at == 1783058624928
+        assert model.transcript_path.endswith(f"{sid}.jsonl")
+
+        by_id = {s.agent_id: s for s in model.subagents}
+        assert by_id["done1"].status == "done"
+        assert by_id["done1"].command_count == 3
+        assert by_id["run1"].status == "running"
+        assert by_id["run1"].command_count == 1
+        # active agents sort first
+        assert model.subagents[0].agent_id == "run1"
+
+    def test_ended_session_marks_incomplete_stopped(self, tmp_path):
+        sid = "sid-ended"
+        _make_session(tmp_path, sid, agents={
+            "gone1": ("general-purpose", "Never finished", 0),
+        })
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()  # no pid.json -> ended session
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed, "SESSIONS_DIR", sessions), \
+             patch.object(feed, "SESSION_NAME_CACHE_TTL", 0.0), \
+             patch.object(feed, "SESSION_MODEL_CACHE_TTL", 0.0):
+            model = feed.load_session_model(sid)
+        assert model.live is False
+        assert model.cwd == "/home/naka/Projects/x"  # from first transcript event
+        assert model.subagents[0].status == "stopped"
+
+    def test_failed_and_killed_map_to_stopped(self, tmp_path):
+        import json
+        sid = "sid-terminal"
+        # two agents completed via task-notification with non-completed statuses
+        extra = []
+        for aid, st in (("failA", "failed"), ("killB", "killed")):
+            notif = (f"<task-notification>\n<task-id>{aid}</task-id>\n"
+                     f"<status>{st}</status>\n</task-notification>")
+            extra.append(json.dumps({"type": "user", "content": notif}) + "\n")
+        _make_session(tmp_path, sid, agents={
+            "failA": ("general-purpose", "boom", 0),
+            "killB": ("general-purpose", "zap", 0),
+        }, extra_events=extra)
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        (sessions / "1.json").write_text(json.dumps({
+            "sessionId": sid, "name": "s", "cwd": "/x",
+        }), encoding="utf-8")  # live, but both agents have terminal notifications
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed, "SESSIONS_DIR", sessions), \
+             patch.object(feed, "SESSION_MODEL_CACHE_TTL", 0.0):
+            model = feed.load_session_model(sid)
+        assert {s.status for s in model.subagents} == {"stopped"}
+
+    def test_session_without_subagents(self, tmp_path):
+        sid = "sid-bare"
+        _make_session(tmp_path, sid, agents={})
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed, "SESSIONS_DIR", sessions), \
+             patch.object(feed, "SESSION_NAME_CACHE_TTL", 0.0), \
+             patch.object(feed, "SESSION_MODEL_CACHE_TTL", 0.0):
+            model = feed.load_session_model(sid)
+        assert model.subagents == ()
+
+    def test_command_count_byte_cap(self, tmp_path):
+        sid = "sid-cap"
+        _make_session(tmp_path, sid, agents={"big": ("general-purpose", "big", 3)})
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        # cap below the transcript size -> capped flag set
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed, "SESSIONS_DIR", sessions), \
+             patch.object(feed, "SESSION_NAME_CACHE_TTL", 0.0), \
+             patch.object(feed, "AGENT_TOOLUSE_BYTE_CAP", 10), \
+             patch.object(feed, "SESSION_MODEL_CACHE_TTL", 0.0):
+            model = feed.load_session_model(sid)
+        assert model.subagents[0].command_count_capped is True
+
+
 class TestExtractFiles:
     def test_no_paths(self):
         assert feed.extract_files("ls") == ""
@@ -658,6 +848,48 @@ class TestHookMain:
             })))
         assert rc == 0
         assert log.exists()
+
+    def test_subagent_event_records_agent(self, tmp_path):
+        import json
+        rc, log = self._run_hook(tmp_path, {
+            "tool_name": "Bash",
+            "tool_input": {"command": "pytest -q"},
+            "cwd": "/work",
+            "session_id": "abcdef12",
+            "agent_id": "af6978028df59ded3",
+            "agent_type": "general-purpose",
+        })
+        assert rc == 0
+        entry = json.loads(log.read_text(encoding="utf-8").strip())
+        assert entry["agent_id"] == "af6978028df59ded3"
+        assert entry["agent_type"] == "general-purpose"
+
+    def test_main_agent_event_omits_agent_keys(self, tmp_path):
+        # No agent_id in the payload (main thread) -> no agent_* keys written,
+        # so absent agent_id can mean "the main agent" downstream.
+        import json
+        rc, log = self._run_hook(tmp_path, {
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "session_id": "abcdef12",
+        })
+        assert rc == 0
+        entry = json.loads(log.read_text(encoding="utf-8").strip())
+        assert "agent_id" not in entry
+        assert "agent_type" not in entry
+
+    def test_agent_type_defaults_to_empty_when_missing(self, tmp_path):
+        # agent_id present but agent_type absent -> agent_type stored as "".
+        import json
+        rc, log = self._run_hook(tmp_path, {
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "agent_id": "af69",
+        })
+        assert rc == 0
+        entry = json.loads(log.read_text(encoding="utf-8").strip())
+        assert entry["agent_id"] == "af69"
+        assert entry["agent_type"] == ""
 
 
 class TestReadKey:
@@ -1063,6 +1295,127 @@ class TestColumnRender:
         out = console.export_text()
         assert "Extra" in out   # header rendered
         assert marker in out    # cell rendered
+
+
+class TestAgentTree:
+    """The Agent column (key 6): tree glyphs over consecutive
+    (session_id, agent_id) runs, label shown once, blank for the main agent."""
+
+    def _entry(self, sid, cmd, aid=None):
+        e = {"timestamp": "2025-01-01T12:00:00+00:00", "command": cmd,
+             "cwd": "/work", "session_id": sid}
+        if aid:
+            e["agent_id"] = aid
+            e["agent_type"] = "general-purpose"
+        return e
+
+    def _agent_col(self):
+        return next(c for c in feed.COLUMNS if c.key == 6)
+
+    def _text(self, table, width=140):
+        console = Console(width=width, record=True)
+        console.print(table)
+        return console.export_text()
+
+    def test_main_agent_row_renders_blank(self):
+        from rich.text import Text
+        ctx = feed.RenderCtx(agent_label=None, run_first=True, run_last=True)
+        cell = self._agent_col().render(self._entry("s1", "x"), ctx)
+        assert isinstance(cell, Text)
+        assert cell.plain == ""
+
+    def test_single_row_run_uses_dash_glyph_with_label(self):
+        ctx = feed.RenderCtx(agent_label="Solo", run_first=True, run_last=True)
+        cell = self._agent_col().render(self._entry("s1", "x", aid="a1"), ctx)
+        assert cell.plain == "─ Solo"
+
+    def test_run_glyphs_and_label_only_on_first_row(self):
+        col = self._agent_col()
+        top = col.render(self._entry("s1", "x", aid="a1"),
+                         feed.RenderCtx(agent_label="Run", run_first=True, run_last=False))
+        mid = col.render(self._entry("s1", "x", aid="a1"),
+                         feed.RenderCtx(agent_label="Run", run_first=False, run_last=False))
+        bot = col.render(self._entry("s1", "x", aid="a1"),
+                         feed.RenderCtx(agent_label="Run", run_first=False, run_last=True))
+        assert top.plain == "┌ Run"       # label on the first (newest) row only
+        assert mid.plain == "│ "          # continuation carries the connector alone
+        assert bot.plain == "└ "
+
+    def test_consecutive_run_shows_label_once_between_connectors(self):
+        # oldest-first; display reverses to [sub two, sub one, main]
+        entries = [
+            self._entry("s1", "main cmd"),
+            self._entry("s1", "sub one", aid="a1"),
+            self._entry("s1", "sub two", aid="a1"),
+        ]
+        amap = {"a1": {"type": "general-purpose", "description": "reviewer run"}}
+        cols = {c.key: True for c in feed.COLUMNS}
+        out = self._text(feed.build_table(entries, 10, cols, 0, agent_map=amap))
+        assert out.count("reviewer run") == 1  # label shown once per run
+        assert out.count("┌") == 1 and out.count("└") == 1  # a single top/bottom pair
+        assert "│" not in out  # a two-row run has no middle connector; main row blank
+
+    def test_different_agent_id_breaks_the_run(self):
+        # two same-session subagents with different ids must not merge into one run
+        entries = [
+            self._entry("s1", "one", aid="a1"),
+            self._entry("s1", "two", aid="a2"),
+        ]
+        amap = {"a1": {"type": "gp", "description": "first"},
+                "a2": {"type": "gp", "description": "second"}}
+        cols = {c.key: True for c in feed.COLUMNS}
+        out = self._text(feed.build_table(entries, 10, cols, 0, agent_map=amap))
+        assert out.count("─") >= 2  # each is its own single-row run
+        assert "first" in out and "second" in out
+
+    def test_same_agent_id_across_sessions_breaks_the_run(self):
+        # the run key is (session_id, agent_id): the same agent id in two
+        # different sessions must not merge into a single run.
+        entries = [
+            self._entry("s1", "one", aid="a1"),
+            self._entry("s2", "two", aid="a1"),
+        ]
+        amap = {"a1": {"type": "gp", "description": "shared"}}
+        cols = {c.key: True for c in feed.COLUMNS}
+        out = self._text(feed.build_table(entries, 10, cols, 0, agent_map=amap))
+        assert out.count("─") == 2       # two separate single-row runs
+        assert out.count("┌") == 0       # neither is a multi-row run
+        assert out.count("shared") == 2  # label re-shown for each run
+
+    def test_scroll_offset_reanchors_run_label_at_slice_top(self):
+        # a run longer than the visible slice: with a nonzero offset the label
+        # and top connector re-anchor at the top of the slice (slice-local
+        # run detection), keeping the label visible while scrolling.
+        entries = [self._entry("s1", f"cmd {i}", aid="a1") for i in range(5)]
+        amap = {"a1": {"type": "gp", "description": "long run"}}
+        cols = {c.key: True for c in feed.COLUMNS}
+        out = self._text(
+            feed.build_table(entries, 10, cols, 0, offset=2, agent_map=amap))
+        assert out.count("long run") == 1  # label shown once, at the slice top
+        assert out.count("┌") == 1         # top connector re-anchored at slice edge
+        assert out.count("└") == 1         # slice bottom closes the run
+        assert "│" in out                  # a middle continuation row remains
+
+    def test_toggle_six_hides_agent_column(self):
+        entries = [self._entry("s1", "cmd", aid="a1")]
+        amap = {"a1": {"type": "general-purpose", "description": "solo task"}}
+        cols = {c.key: True for c in feed.COLUMNS}
+        cols[6] = False
+        out = self._text(feed.build_table(entries, 10, cols, 0, agent_map=amap))
+        assert "Agent" not in out       # header gone
+        assert "solo task" not in out   # label not rendered
+
+    def test_apply_key_six_toggles_agent_column(self):
+        state = feed.AppState(entries=[])
+        assert state.visible_cols[6] is True
+        assert feed.apply_key(state, "6", 10) is feed.Action.NONE
+        assert state.visible_cols[6] is False
+
+    def test_last_visible_column_guard_holds_for_agent_column(self):
+        state = feed.AppState(entries=[], visible_cols={
+            1: False, 2: False, 3: False, 4: False, 5: False, 6: True})
+        state.toggle_col(6)
+        assert state.visible_cols[6] is True  # cannot hide the last visible column
 
 
 class TestVisibleRowCount:
