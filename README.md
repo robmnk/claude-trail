@@ -75,6 +75,7 @@ python3 claude_trail.py   # if running from a clone
 | `Esc` | Close the open modal, command detail or session detail (also `q` or `Enter` while it is open) |
 | `o` | Open the selected session's commands (filtered JSONL) in `$VISUAL` / `$EDITOR`, else the platform launcher (`xdg-open` on Linux, `open` on macOS) |
 | `f` | Open the file manager on the folder of files referenced in the selected command |
+| `/` | Search the selected row's session recursively (`rg`, else `grep`). `Tab` toggles the root between the transcript folder and the session's cwd; `Enter` runs the query. In results: `j` / `k` browse, `Enter` opens a hit at its line, `f` opens the hit's folder, `/` edits the query, `Esc` / `q` close |
 | `1`-`5` | Toggle columns (1=Time, 2=Session, 3=Directory, 4=Files, 5=Command) |
 | `c` | Clear display |
 | `q` | Quit |
