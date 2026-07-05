@@ -15,7 +15,7 @@ Claude Code session
 
 | File | Purpose |
 |------|---------|
-| `claude_trail.py` | Module: TUI (`main`) and PostToolUse hook (`hook_main`). Tails `command-log.jsonl`, renders 5-column table with cursor navigation, column toggles, and action keys |
+| `claude_trail.py` | Module: TUI (`main`) and PostToolUse hook (`hook_main`). Tails `command-log.jsonl`, renders 6-column table with cursor navigation, column toggles, and action keys |
 | `hook.sh` | Legacy bash version of the hook (deprecated, kept for users who still reference it). New installs should use `claude-trail hook`. |
 | `pyproject.toml` | Package metadata and `claude-trail` entry point |
 | `requirements.txt` | Python deps (`rich>=13.0`) |
@@ -65,7 +65,7 @@ python3 claude_trail.py   # if running from a clone
 | `o` | Open selected session's commands (filtered JSONL) in `$VISUAL` or the platform default launcher |
 | `f` | Open file manager on folder of files referenced in selected command |
 | `/` | Open per-session recursive search for the selected row's session. Type a query then `Enter` to run; `Tab` toggles the root between the transcript folder (`<sid>.jsonl` + `subagents/**`) and the session's cwd. In results: `j`/`k` browse, `Enter` opens the hit at its line, `f` opens the hit's folder, `/` edits the query, `Esc`/`q` close |
-| `1`-`5` | Toggle columns: 1=Time, 2=Session, 3=Directory, 4=Files, 5=Command |
+| `1`-`6` | Toggle columns: 1=Time, 2=Session, 3=Directory, 4=Files, 5=Command, 6=Agent |
 | `c` | Clear display |
 | `q` | Quit |
 
@@ -73,13 +73,13 @@ python3 claude_trail.py   # if running from a clone
 
 Columns are data-driven: a single ordered `COLUMNS` list of frozen `Column`
 records is the one source of truth. A `Column` has `key` (the stable digit
-1..5 used by the toggle keys and the `1 2 3 4 5` status bar), `name`, `style`,
+1..6 used by the toggle keys and the `1 2 3 4 5 6` status bar), `name`, `style`,
 `kwargs` (passed to `Table.add_column`), and `render`. `render(entry, ctx)`
 returns that column's cell for one log entry as a `str` or `rich.text.Text`.
 Adding a column is a single entry in the list.
 
 `ctx` is a frozen `RenderCtx` carrying the per-render state cells need
-(`name_map`, `color_map`); render callables call the module-level helpers
+(`name_map`, `color_map`, `agent_map`, plus the per-row `agent_label`/`run_first`/`run_last` the Agent column reads); render callables call the module-level helpers
 (`format_time`, `session_label`, `rich_color`, `short_path`, `extract_files`,
 `is_dangerous`, `normalize_cmd`) directly.
 
@@ -87,6 +87,7 @@ Adding a column is a single entry in the list.
 |---|------|---------|
 | 1 | Time | HH:MM:SS timestamp (`format_time`) |
 | 2 | Session | Session name from `~/.claude/sessions/<pid>.json` if set, else first 8 chars of session_id, tinted with the color the user picked via Claude Code's `/color` command (parsed from the session transcript) |
+| 6 | Agent | Tree gutter attributing the row to a subagent run (blank for the main agent); glyphs `─`/`┌`/`│`/`└` connect a consecutive `(session_id, agent_id)` run with the label shown once, drawn right after Session (`_render_agent`) |
 | 3 | Directory | Abbreviated cwd (`short_path`) |
 | 4 | Files | File paths extracted from command (basenames, max 3 shown) |
 | 5 | Command | Full command text, dangerous commands prefixed with red `*` |
@@ -94,6 +95,7 @@ Adding a column is a single entry in the list.
 ## Conventions
 
 - Log format is JSONL with fields: `timestamp`, `command`, `cwd`, `session_id`, plus optional `agent_id`/`agent_type` on a subagent's commands (PostToolUse adds them only inside a subagent, so an absent `agent_id` means the main agent). Modeled as the `LogEntry` TypedDict; annotation only, `parse_line` still returns a plain dict at runtime. `hook_main` builds each line via `_new_entry()` to fix the key order.
+- The feed attributes each row to the agent that ran it via the forward-only hook `agent_id`: `load_agent_labels(session_ids)` maps `agent_id -> {type, description}` from `PROJECTS_DIR/*/<sid>/subagents/**/agent-*.meta.json` (cached `AGENT_LABEL_CACHE_TTL` = 2s, accumulating), and `agent_label(entry, agent_map)` / `entry_agent_id(entry)` resolve a row's label (`None` for the main agent). The Agent column (`_render_agent`, `key=6`) draws an in-place tree gutter over the time-ordered feed: `build_table` marks each row's position in its consecutive `(session_id, agent_id)` run (`run_first`/`run_last`) and picks the glyph (`─`/`┌`/`│`/`└`), showing the label once per run; rows stay one-per-row so cursor/scroll/tail math is unchanged. Attribution is forward-only (rows logged before the hook enrichment, and every main-agent row, render blank), while the session modal (`s`) is retroactive: it reconstructs every subagent from disk regardless of when the row was logged.
 - Dangerous commands (rm, sudo, git reset, chmod, etc.) are flagged with red `*` prefix
 - Display shows newest-first, max 50 entries, with active session count = distinct `session_id`s seen within `ACTIVE_WINDOW_SECONDS` (300s), computed by `count_active_sessions(entries, now, window=ACTIVE_WINDOW_SECONDS)`
 - Poll interval: 300ms
@@ -106,6 +108,6 @@ Adding a column is a single entry in the list.
 - Panel title shows the installed version (`claude-trail vX.Y.Z`), read from package metadata via `importlib.metadata`; blank when run from a clone without an install.
 - Session names are read from `~/.claude/sessions/<pid>.json` (`name` field). Cached for 2s in `load_session_names()`; the cache accumulates so a session's name remains resolvable after Claude Code removes its pid.json on exit.
 - Session color comes from the latest `/color <value>` event in `~/.claude/projects/*/<session-id>.jsonl` (`system/local_command` events). `load_session_colors()` tails each transcript incrementally and refreshes at most every 5s. Names like `orange`/`pink`/`gray` are translated to Rich-compatible equivalents (`orange1`, `pink1`, `grey50`) via `CLAUDE_COLOR_ALIASES`.
-- Columns are defined once in the module-level `COLUMNS` list of frozen `Column` records (`key`, `name`, `style`, `kwargs`, `render`). `build_table` builds a `RenderCtx(name_map, color_map)` and, for each visible column in list order, calls `col.render(entry, ctx)`; there is no per-column `if col_id == ...` ladder. `build_detail_panel` reuses `_render_session` for the Session tint and `_danger_prefixed` for the Command danger `* ` marker (it keeps the raw, un-normalized command so newlines survive). Default visibility is derived from the list (`{c.key: True for c in COLUMNS}`); the digit-toggle branch in `apply_key` accepts `ch.isdigit() and int(ch) in visible_cols` and still refuses to hide the last visible column.
-- Column visibility persists during session, status bar shows toggle state as `1 2 3 4 5`
+- Columns are defined once in the module-level `COLUMNS` list of frozen `Column` records (`key`, `name`, `style`, `kwargs`, `render`). `build_table` builds a base `RenderCtx(name_map, color_map, agent_map)`, computes each row's `(session_id, agent_id)` run boundaries, and per row `dataclasses.replace`s the base ctx with that row's `agent_label`/`run_first`/`run_last` before calling `col.render(entry, ctx)` for each visible column in list order; there is no per-column `if col_id == ...` ladder. `build_detail_panel` reuses `_render_session` for the Session tint and `_danger_prefixed` for the Command danger `* ` marker (it keeps the raw, un-normalized command so newlines survive). Default visibility is derived from the list (`{c.key: True for c in COLUMNS}`); the digit-toggle branch in `apply_key` accepts `ch.isdigit() and int(ch) in visible_cols` and still refuses to hide the last visible column.
+- Column visibility persists during session, status bar shows toggle state as `1 2 3 4 5 6`
 - Platform-specific file launcher: `xdg-open` on Linux, `open` on macOS, selected via `claude_trail._platform_opener()`. Honours `$VISUAL` first if set.
