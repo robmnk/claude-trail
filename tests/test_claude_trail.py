@@ -1751,3 +1751,395 @@ class TestSessionModal:
         out = self._text(feed.build_session_panel(model, term_height=30))
         assert "~/Projects/x" in out
         assert home + "/Projects/x" not in out  # absolute home prefix hidden
+
+
+class TestSearchRoots:
+    """search_roots resolves the transcript folder + cwd roots and skips paths
+    that do not exist (a root with no path is omitted so the panel disables it)."""
+
+    def test_resolves_transcript_file_dir_and_cwd(self, tmp_path):
+        sid = "sid-search"
+        _make_session(tmp_path, sid, agents={"a1": ("gp", "run", 1)})
+        cwd_dir = tmp_path / "work"
+        cwd_dir.mkdir()
+        entry = {"session_id": sid, "cwd": str(cwd_dir)}
+        with patch.object(feed, "PROJECTS_DIR", tmp_path):
+            roots = feed.search_roots(sid, entry, None)
+        tpaths = [str(p) for p in roots["transcript"]]
+        assert any(p.endswith(f"{sid}.jsonl") for p in tpaths)  # transcript file
+        assert any(p.endswith(sid) for p in tpaths)             # sibling <sid>/ dir
+        assert len(roots["transcript"]) == 2
+        assert roots["cwd"] == [cwd_dir]
+
+    def test_skips_missing_cwd(self, tmp_path):
+        sid = "sid-nocwd"
+        _make_session(tmp_path, sid, agents={})
+        entry = {"session_id": sid, "cwd": str(tmp_path / "does-not-exist")}
+        with patch.object(feed, "PROJECTS_DIR", tmp_path):
+            roots = feed.search_roots(sid, entry, None)
+        assert "cwd" not in roots       # missing dir dropped
+        assert "transcript" in roots
+
+    def test_absent_transcript_yields_only_cwd(self, tmp_path):
+        cwd_dir = tmp_path / "w"
+        cwd_dir.mkdir()
+        entry = {"session_id": "ghost", "cwd": str(cwd_dir)}
+        with patch.object(feed, "PROJECTS_DIR", tmp_path):
+            roots = feed.search_roots("ghost", entry, None)
+        assert roots == {"cwd": [cwd_dir]}  # no transcript on disk -> only cwd
+
+    def test_live_model_cwd_preferred_over_entry(self, tmp_path):
+        # a live session's launch dir (model.cwd) wins over the row's cwd
+        live_dir = tmp_path / "launch"
+        live_dir.mkdir()
+        model = feed.SessionModel(
+            session_id="s", name="", status="busy", live=True,
+            cwd=str(live_dir), version="", kind="", started_at=0,
+            transcript_path="", subagents=())
+        entry = {"session_id": "s", "cwd": str(tmp_path)}
+        with patch.object(feed, "PROJECTS_DIR", tmp_path):
+            roots = feed.search_roots("s", entry, model)
+        assert roots["cwd"] == [live_dir]
+
+
+class TestRunSearch:
+    """run_search: rg/grep runner. shutil.which is forced to None so these run
+    against the always-present grep and exercise the parse/limit/error paths."""
+
+    def _tree(self, tmp_path):
+        (tmp_path / "a.txt").write_text(
+            "alpha\nbeta hello\ngamma\n", encoding="utf-8")
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "b.txt").write_text("hello there\nhello world\n", encoding="utf-8")
+        return tmp_path
+
+    def test_parses_matches_with_grep(self, tmp_path):
+        root = self._tree(tmp_path)
+        with patch.object(feed.shutil, "which", return_value=None):  # force grep
+            matches, capped, err = feed.run_search("hello", [root])
+        assert err is None and capped is False
+        assert {m[2] for m in matches} >= {"beta hello", "hello there", "hello world"}
+        assert all(isinstance(m[1], int) for m in matches)  # line numbers parsed
+        assert len(matches) == 3
+
+    def test_respects_limit(self, tmp_path):
+        root = self._tree(tmp_path)
+        with patch.object(feed.shutil, "which", return_value=None):
+            matches, capped, err = feed.run_search("hello", [root], limit=2)
+        assert len(matches) == 2
+        assert capped is True
+        assert err is None
+
+    def test_no_match_returns_empty(self, tmp_path):
+        root = self._tree(tmp_path)
+        with patch.object(feed.shutil, "which", return_value=None):
+            matches, capped, err = feed.run_search("zzz-no-such", [root])
+        assert matches == [] and capped is False and err is None
+
+    def test_bad_regex_returns_error(self, tmp_path):
+        root = self._tree(tmp_path)
+        with patch.object(feed.shutil, "which", return_value=None):
+            matches, capped, err = feed.run_search("[", [root])
+        assert matches == [] and capped is False
+        assert err is not None  # exit >= 2 surfaces a message, never raises
+
+    def test_empty_query_or_paths_is_noop(self, tmp_path):
+        with patch.object(feed.shutil, "which", return_value=None):
+            assert feed.run_search("", [tmp_path]) == ([], False, None)
+            assert feed.run_search("   ", [tmp_path]) == ([], False, None)
+            assert feed.run_search("hello", []) == ([], False, None)
+
+    def test_parse_grep_line_helper(self):
+        assert feed._parse_grep_line("/p/a.py:42:def main():") == (
+            "/p/a.py", 42, "def main():")
+        assert feed._parse_grep_line("no colons here") is None
+        assert feed._parse_grep_line("/p:notanumber:x") is None
+
+    def test_single_file_target_with_grep(self, tmp_path):
+        # A transcript root with no subagents dir is one explicit file; -H must
+        # keep the filename so _parse_grep_line yields a real path, not a lineno.
+        f = tmp_path / "a.txt"
+        f.write_text("alpha\nbeta hello\ngamma\n", encoding="utf-8")
+        with patch.object(feed.shutil, "which", return_value=None):  # force grep
+            matches, capped, err = feed.run_search("hello", [f])
+        assert err is None and capped is False
+        assert len(matches) == 1
+        path, line, text = matches[0]
+        assert path == str(f)  # filename retained, not the line number "2"
+        assert line == 2
+        assert "hello" in text
+
+    def test_single_file_target_with_rg(self, tmp_path):
+        # Same single-file case but exercising the real rg branch (the one the
+        # bug lived in); skipped when rg is not installed.
+        if not feed.shutil.which("rg"):
+            import pytest
+            pytest.skip("rg not installed")
+        f = tmp_path / "a.txt"
+        f.write_text("alpha\nbeta hello\ngamma\n", encoding="utf-8")
+        matches, capped, err = feed.run_search("hello", [f])
+        assert err is None and capped is False
+        assert len(matches) == 1
+        path, line, text = matches[0]
+        assert path == str(f)  # -H keeps the filename even for one file arg
+        assert line == 2
+        assert "hello" in text
+
+
+class TestSearchApplyKey:
+    """apply_key handling for the search modal: INPUT builds the query, RESULTS
+    browses hits, and the feed `/` opener builds a SearchState."""
+
+    def _searching(self, root="transcript", mode="INPUT"):
+        state = feed.AppState(entries=[{"command": "c", "session_id": "s1"}])
+        state.search = feed.SearchState(
+            sid="s1",
+            roots={"transcript": [Path("/t.jsonl")], "cwd": [Path("/w")]},
+            root=root, mode=mode)
+        return state, state.search
+
+    def test_other_root_flips(self):
+        assert feed._other_root("transcript") == "cwd"
+        assert feed._other_root("cwd") == "transcript"
+
+    # ---- INPUT sub-mode ----
+    def test_input_typing_builds_query(self):
+        state, s = self._searching()
+        for c in "pytest":
+            assert feed.apply_key(state, c, 10) is feed.Action.NONE
+        assert s.query == "pytest"
+
+    def test_input_backspace_trims(self):
+        state, s = self._searching()
+        for c in "abc":
+            feed.apply_key(state, c, 10)
+        feed.apply_key(state, "\x7f", 10)
+        assert s.query == "ab"
+
+    def test_input_tab_flips_root(self):
+        state, s = self._searching()
+        assert feed.apply_key(state, "\t", 10) is feed.Action.NONE
+        assert s.root == "cwd"
+        feed.apply_key(state, "\t", 10)
+        assert s.root == "transcript"
+
+    def test_input_enter_returns_run_search(self):
+        state, s = self._searching()
+        s.query = "x"
+        assert feed.apply_key(state, "\r", 10) is feed.Action.RUN_SEARCH
+        assert s.mode == "INPUT"  # apply_key is pure; main() flips to RESULTS
+
+    def test_input_enter_blank_query_is_noop(self):
+        # Enter on an empty/whitespace query must not flip to RESULTS (which
+        # would render a misleading "no matches" for a search that never ran).
+        state, s = self._searching()
+        s.query = "   "
+        assert feed.apply_key(state, "\r", 10) is feed.Action.NONE
+        assert s.mode == "INPUT"
+        assert state.search is not None
+
+    def _one_root(self, root="transcript", mode="INPUT"):
+        # A SearchState whose "other" root is absent (e.g. ended session with a
+        # deleted cwd), so Tab has nowhere valid to switch to.
+        state = feed.AppState(entries=[{"command": "c", "session_id": "s1"}])
+        roots = {root: [Path("/only")]}
+        state.search = feed.SearchState(sid="s1", roots=roots, root=root, mode=mode)
+        return state, state.search
+
+    def test_input_tab_to_unavailable_root_is_noop_with_flash(self):
+        state, s = self._one_root(root="transcript", mode="INPUT")
+        assert feed.apply_key(state, "\t", 10) is feed.Action.NONE
+        assert s.root == "transcript"  # did not flip to the absent cwd root
+        assert s.flash and "cwd" in s.flash
+
+    def test_results_tab_to_unavailable_root_does_not_rerun(self):
+        state, s = self._one_root(root="cwd", mode="RESULTS")
+        # No RUN_SEARCH over an empty root (which would show a bogus "no matches").
+        assert feed.apply_key(state, "\t", 10) is feed.Action.NONE
+        assert s.root == "cwd"
+        assert s.flash and "transcript" in s.flash
+
+    def test_input_esc_closes(self):
+        state, s = self._searching()
+        assert feed.apply_key(state, "\x1b", 10) is feed.Action.NONE
+        assert state.search is None
+
+    def test_input_ctrl_c_quits(self):
+        state, _ = self._searching()
+        assert feed.apply_key(state, "\x03", 10) is feed.Action.QUIT
+
+    def test_search_open_swallows_s_and_enter_openers(self):
+        # search takes precedence: `s` types into the query, no session modal opens
+        state, s = self._searching()
+        feed.apply_key(state, "s", 10)
+        assert s.query == "s"
+        assert state.session_detail is None
+        assert state.detail_entry is None
+
+    # ---- RESULTS sub-mode ----
+    def test_results_jk_move_cursor(self):
+        state, s = self._searching(mode="RESULTS")
+        s.results = [("/f", 1, "a"), ("/f", 2, "b"), ("/f", 3, "c")]
+        assert feed.apply_key(state, "j", 10) is feed.Action.NONE
+        assert s.cursor == 1
+        feed.apply_key(state, "j", 10)
+        feed.apply_key(state, "j", 10)
+        assert s.cursor == 2  # clamped at the last hit
+        feed.apply_key(state, "k", 10)
+        assert s.cursor == 1
+
+    def test_results_letters_do_not_type(self):
+        state, s = self._searching(mode="RESULTS")
+        s.query, s.results = "keep", [("/f", 1, "a")]
+        feed.apply_key(state, "z", 10)
+        assert s.query == "keep"  # query frozen while browsing
+
+    def test_results_enter_opens_match(self):
+        state, s = self._searching(mode="RESULTS")
+        s.results = [("/f", 1, "a")]
+        assert feed.apply_key(state, "\r", 10) is feed.Action.OPEN_MATCH
+
+    def test_results_enter_without_results_is_noop(self):
+        state, _ = self._searching(mode="RESULTS")
+        assert feed.apply_key(state, "\r", 10) is feed.Action.NONE
+
+    def test_results_f_opens_match_folder(self):
+        state, s = self._searching(mode="RESULTS")
+        s.results = [("/f/x.py", 1, "a")]
+        assert feed.apply_key(state, "f", 10) is feed.Action.OPEN_MATCH_FOLDER
+
+    def test_results_tab_flips_root_and_reruns(self):
+        state, s = self._searching(mode="RESULTS")
+        assert feed.apply_key(state, "\t", 10) is feed.Action.RUN_SEARCH
+        assert s.root == "cwd"
+
+    def test_results_slash_returns_to_input_keeping_query(self):
+        state, s = self._searching(mode="RESULTS")
+        s.query = "keep"
+        assert feed.apply_key(state, "/", 10) is feed.Action.NONE
+        assert s.mode == "INPUT"
+        assert s.query == "keep"
+
+    def test_results_esc_closes(self):
+        state, _ = self._searching(mode="RESULTS")
+        assert feed.apply_key(state, "\x1b", 10) is feed.Action.NONE
+        assert state.search is None
+
+    def test_results_q_closes(self):
+        state, _ = self._searching(mode="RESULTS")
+        assert feed.apply_key(state, "q", 10) is feed.Action.NONE
+        assert state.search is None
+
+    def test_any_keypress_clears_flash(self):
+        state, s = self._searching(mode="RESULTS")
+        s.results, s.flash = [("/f", 1, "a")], "opened folder: /f"
+        feed.apply_key(state, "j", 10)  # any move clears the transient flash
+        assert s.flash is None
+
+    # ---- feed `/` opener ----
+    def test_feed_slash_opens_search_for_selected_session(self, tmp_path):
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        state = feed.AppState(entries=[
+            {"command": "c0", "session_id": "sid-a", "cwd": "/x"},
+            {"command": "c1", "session_id": "sid-b", "cwd": "/y"},
+        ], cursor=0)
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed, "SESSIONS_DIR", sessions), \
+             patch.object(feed, "SESSION_MODEL_CACHE_TTL", 0.0):
+            result = feed.apply_key(state, "/", 10)
+        assert result is feed.Action.NONE
+        assert state.search is not None
+        assert state.search.sid == "sid-b"  # cursor 0 = newest = last appended
+        assert state.search.mode == "INPUT"
+
+    def test_feed_slash_on_empty_feed_is_noop(self):
+        state = feed.AppState(entries=[])
+        assert feed.apply_key(state, "/", 10) is feed.Action.NONE
+        assert state.search is None
+
+
+class TestSearchPanel:
+    """build_search_panel rendering for both sub-modes."""
+
+    def _text(self, panel, width=100):
+        console = Console(width=width, record=True)
+        console.print(panel)
+        return console.export_text()
+
+    def test_input_mode_shows_query_and_root_chips(self):
+        s = feed.SearchState(
+            sid="abcdef123456",
+            roots={"transcript": [Path("/t.jsonl")], "cwd": [Path("/w")]},
+            query="pytest")
+        out = self._text(feed.build_search_panel(s, term_height=20))
+        assert "/ pytest" in out
+        assert "transcript" in out and "cwd" in out
+        assert "abcdef12" in out  # sid[:8] in the subtitle
+
+    def test_results_mode_lists_matches(self):
+        s = feed.SearchState(
+            sid="s1", roots={"cwd": [Path("/proj")]}, root="cwd",
+            query="def", mode="RESULTS",
+            results=[("/proj/app.py", 42, "def main():")])
+        out = self._text(feed.build_search_panel(s, term_height=20))
+        assert "1 match" in out
+        assert "app.py" in out and "42" in out and "def main():" in out
+
+    def test_capped_marker_shown(self):
+        s = feed.SearchState(
+            sid="s1", roots={"cwd": [Path("/p")]}, root="cwd", mode="RESULTS",
+            results=[("/p/a", 1, "x")], capped=True)
+        assert f"capped {feed.SEARCH_RESULT_LIMIT}" in self._text(
+            feed.build_search_panel(s, 20))
+
+    def test_empty_results_shows_no_matches(self):
+        s = feed.SearchState(
+            sid="s1", roots={"cwd": [Path("/p")]}, root="cwd", mode="RESULTS",
+            results=[])
+        assert "no matches" in self._text(feed.build_search_panel(s, 20))
+
+    def test_error_is_shown(self):
+        s = feed.SearchState(
+            sid="s1", roots={"cwd": [Path("/p")]}, root="cwd", mode="RESULTS",
+            error="grep: bad regex")
+        assert "grep: bad regex" in self._text(feed.build_search_panel(s, 20))
+
+    def test_flash_line_rendered(self):
+        s = feed.SearchState(
+            sid="s1", roots={"cwd": [Path("/p")]}, root="cwd", mode="RESULTS",
+            results=[("/p/a", 1, "x")], flash="opened folder: /p")
+        assert "opened folder: /p" in self._text(feed.build_search_panel(s, 20))
+
+    def test_result_window_helper(self):
+        # Fits: whole list.
+        assert feed._result_window(0, 5, 10) == (0, 5)
+        assert feed._result_window(3, 5, 5) == (0, 5)
+        # Longer than capacity: cursor stays inside a capacity-sized window.
+        start, end = feed._result_window(90, 100, 10)
+        assert end - start == 10 and start <= 90 < end
+        # Clamped at the ends.
+        assert feed._result_window(0, 100, 10)[0] == 0
+        assert feed._result_window(99, 100, 10) == (90, 100)
+
+    def test_results_window_follows_cursor(self):
+        # 100 hits in a 20-row terminal: the cursor near the bottom must be on
+        # screen and the first rows must have scrolled off.
+        results = [(f"/p/f{i}.py", i + 1, f"match-{i}") for i in range(100)]
+        s = feed.SearchState(
+            sid="s1", roots={"cwd": [Path("/p")]}, root="cwd", mode="RESULTS",
+            results=results, cursor=90)
+        out = self._text(feed.build_search_panel(s, term_height=20))
+        assert "match-90" in out       # cursor row rendered
+        assert "match-0 " not in out   # top rows windowed out
+        assert "of 100" in out         # range indicator in the tag
+
+    def test_results_window_shows_all_when_fitting(self):
+        results = [(f"/p/f{i}.py", i + 1, f"m-{i}") for i in range(3)]
+        s = feed.SearchState(
+            sid="s1", roots={"cwd": [Path("/p")]}, root="cwd", mode="RESULTS",
+            results=results, cursor=0)
+        out = self._text(feed.build_search_panel(s, term_height=40))
+        assert "m-0" in out and "m-1" in out and "m-2" in out
+        assert "of 3" not in out  # no range indicator when everything fits
