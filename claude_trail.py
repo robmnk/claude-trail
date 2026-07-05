@@ -61,6 +61,9 @@ CHROME_ROWS = 10  # title, status, padding
 MIN_VISIBLE_ROWS = 3
 SESSION_NAME_CACHE_TTL = 2.0  # seconds
 SESSION_COLOR_CACHE_TTL = 5.0  # seconds
+AGENT_LABEL_CACHE_TTL = 2.0  # seconds
+SESSION_MODEL_CACHE_TTL = 2.0  # seconds; keeps the modal's running->done live
+AGENT_TOOLUSE_BYTE_CAP = 512 * 1024  # cap per agent transcript when counting tool_use
 ACTIVE_WINDOW_SECONDS = 300  # a session counts as active if seen within this window
 
 
@@ -414,6 +417,277 @@ def load_session_colors(session_ids) -> dict[str, str]:
             _session_color_cache[sid] = color
     _session_color_cache_ts = now
     return _session_color_cache
+
+
+# ==== Agent labels + session model ====
+
+# A subagent's meta/transcript live in a per-session sibling of the transcript
+# file: <proj>/<sid>/subagents/agent-<id>.jsonl (+ .meta.json). Workflow agents
+# nest one level deeper under subagents/workflows/wf_*/. The `subagents/**/`
+# glob (pathlib `**` matches zero or more dirs) covers both.
+_agent_label_cache: dict[str, dict] = {}
+_agent_label_cache_ts: float = 0.0
+_session_model_cache: dict[str, tuple] = {}  # sid -> (monotonic_ts, SessionModel)
+
+# Terminal task-notification tags in a parent transcript. For a Task/Agent
+# subagent the <task-id> equals its agent_id (empirically confirmed), so this
+# doubles as agent_id -> completed/failed/killed. Workflow/background
+# notifications carry unrelated task-ids and simply never match an agent.
+_TASK_ID_RE = re.compile(r"<task-id>([^<]+)</task-id>")
+_TASK_STATUS_RE = re.compile(r"<status>([a-z]+)</status>")
+
+
+@dataclass(frozen=True)
+class SubagentInfo:
+    """One subagent under a session: its identity, derived run status, and how
+    many tool calls its transcript holds."""
+
+    agent_id: str
+    agent_type: str
+    description: str
+    status: str  # "running" | "done" | "stopped"
+    command_count: int
+    command_count_capped: bool = False
+
+
+@dataclass(frozen=True)
+class SessionModel:
+    """Everything the session-detail modal shows for one session.
+
+    `live` is True when a `sessions/<pid>.json` still exists for the session
+    (so `status`/`version`/`kind`/`started_at` come from it); for an ended
+    session those are blank/0 and `cwd`/`name` fall back to the transcript and
+    the accumulated name cache. `started_at` is epoch ms (0 if unknown).
+    """
+
+    session_id: str
+    name: str
+    status: str
+    live: bool
+    cwd: str
+    version: str
+    kind: str
+    started_at: int
+    transcript_path: str
+    subagents: tuple = ()
+
+
+def _session_subdir(sid: str) -> Path | None:
+    """The `<proj>/<sid>/` dir holding `subagents/` for a session, or None."""
+    transcript = _find_transcript(sid)
+    if transcript is None:
+        return None
+    subdir = transcript.parent / sid
+    return subdir if subdir.is_dir() else None
+
+
+def load_agent_labels(session_ids) -> dict[str, dict]:
+    """Map agent_id -> {"type", "description"} from each session's
+    `subagents/**/agent-*.meta.json`.
+
+    Accumulates across calls like `load_session_names` (a label stays resolvable
+    after its session ends) and refreshes at most every AGENT_LABEL_CACHE_TTL
+    seconds. Any unreadable/malformed meta file is skipped, never raised.
+    """
+    global _agent_label_cache_ts
+    now = time.monotonic()
+    if now - _agent_label_cache_ts < AGENT_LABEL_CACHE_TTL:
+        return _agent_label_cache
+    for sid in session_ids:
+        if not sid:
+            continue
+        subdir = _session_subdir(sid)
+        if subdir is None:
+            continue
+        for meta in subdir.glob("subagents/**/agent-*.meta.json"):
+            try:
+                data = json.loads(meta.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            agent_id = meta.name[len("agent-"):-len(".meta.json")]
+            _agent_label_cache[agent_id] = {
+                "type": data.get("agentType", ""),
+                "description": data.get("description", ""),
+            }
+    _agent_label_cache_ts = now
+    return _agent_label_cache
+
+
+def entry_agent_id(entry: dict) -> str | None:
+    """The subagent id that ran this command, or None for a main-agent command."""
+    return entry.get("agent_id") or None
+
+
+def agent_label(entry: dict, agent_map: dict[str, dict]) -> str | None:
+    """Human label for the agent that ran this command, or None for the main agent."""
+    aid = entry_agent_id(entry)
+    if not aid:
+        return None
+    info = agent_map.get(aid) or {}
+    return info.get("description") or info.get("type") or aid[:8]
+
+
+def _find_session_pid_info(sid: str) -> dict | None:
+    """The live `sessions/<pid>.json` dict whose sessionId == sid, or None."""
+    try:
+        files = list(SESSIONS_DIR.iterdir())
+    except (OSError, FileNotFoundError):
+        return None
+    for entry in files:
+        if entry.suffix != ".json":
+            continue
+        try:
+            data = json.loads(entry.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("sessionId") == sid:
+            return data
+    return None
+
+
+def _first_transcript_cwd(path: Path) -> str:
+    """The first `cwd` recorded in a transcript (ended-session folder fallback)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    evt = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(evt, dict) and evt.get("cwd"):
+                    return evt["cwd"]
+    except OSError:
+        pass
+    return ""
+
+
+def _scan_terminal_statuses(transcript_text: str) -> dict[str, str]:
+    """Map task-id -> terminal status ("completed"/"failed"/"killed") from the
+    `<task-notification>` events in a parent transcript.
+
+    Each notification is one JSONL line (its inner newlines are backslash-escaped
+    inside the JSON string), so pairing the task-id and status per physical line
+    can never mis-associate them across notifications.
+    """
+    result: dict[str, str] = {}
+    for line in transcript_text.splitlines():
+        if "task-notification" not in line:
+            continue
+        tid = _TASK_ID_RE.search(line)
+        st = _TASK_STATUS_RE.search(line)
+        if tid and st:
+            result[tid.group(1)] = st.group(1)
+    return result
+
+
+def _count_tool_uses(path: Path) -> tuple[int, bool]:
+    """(#`tool_use` blocks, capped?) in an agent transcript, reading at most
+    AGENT_TOOLUSE_BYTE_CAP bytes so a huge transcript can't stall the modal."""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            data = f.read(AGENT_TOOLUSE_BYTE_CAP)
+    except OSError:
+        return 0, False
+    return data.count(b'"type":"tool_use"'), size > AGENT_TOOLUSE_BYTE_CAP
+
+
+_SUBAGENT_STATUS_ORDER = {"running": 0, "done": 1, "stopped": 2}
+
+
+def _load_subagents(sid: str, transcript: Path | None, live: bool) -> tuple:
+    """Build the sorted `SubagentInfo` tuple for a session (active agents first)."""
+    subdir = _session_subdir(sid)
+    if subdir is None:
+        return ()
+    terminal: dict[str, str] = {}
+    if transcript is not None:
+        try:
+            terminal = _scan_terminal_statuses(
+                transcript.read_text(encoding="utf-8", errors="replace")
+            )
+        except OSError:
+            terminal = {}
+    infos = []
+    for meta_path in subdir.glob("subagents/**/agent-*.meta.json"):
+        agent_id = meta_path.name[len("agent-"):-len(".meta.json")]
+        try:
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        st = terminal.get(agent_id)
+        if st == "completed":
+            status = "done"
+        elif st in ("failed", "killed"):
+            status = "stopped"  # spawned, ended without completing
+        elif live:
+            status = "running"
+        else:
+            status = "stopped"
+        count, capped = _count_tool_uses(meta_path.parent / f"agent-{agent_id}.jsonl")
+        infos.append(SubagentInfo(
+            agent_id=agent_id,
+            agent_type=data.get("agentType", ""),
+            description=data.get("description", ""),
+            status=status,
+            command_count=count,
+            command_count_capped=capped,
+        ))
+    infos.sort(key=lambda s: (_SUBAGENT_STATUS_ORDER.get(s.status, 3),
+                              s.description, s.agent_id))
+    return tuple(infos)
+
+
+def _build_session_model(sid: str) -> SessionModel:
+    pid_info = _find_session_pid_info(sid)
+    live = pid_info is not None
+    transcript = _find_transcript(sid)
+    transcript_path = str(transcript) if transcript else ""
+
+    if live:
+        name = pid_info.get("name") or session_label(sid)
+        status = pid_info.get("status", "")
+        cwd = pid_info.get("cwd", "")
+        version = pid_info.get("version", "")
+        kind = pid_info.get("kind", "")
+        started_raw = pid_info.get("startedAt") or 0
+    else:
+        name = load_session_names().get(sid) or session_label(sid)
+        status = ""
+        cwd = _first_transcript_cwd(transcript) if transcript else ""
+        version = ""
+        kind = ""
+        started_raw = 0
+
+    return SessionModel(
+        session_id=sid,
+        name=name,
+        status=status,
+        live=live,
+        cwd=cwd,
+        version=version,
+        kind=kind,
+        started_at=int(started_raw) if isinstance(started_raw, (int, float)) else 0,
+        transcript_path=transcript_path,
+        subagents=_load_subagents(sid, transcript, live),
+    )
+
+
+def load_session_model(sid: str) -> SessionModel:
+    """A `SessionModel` for `sid`, cached per-sid for SESSION_MODEL_CACHE_TTL
+    seconds so the modal can be rebuilt every frame while still reflecting live
+    running->done transitions. Resilient: unreadable files are skipped."""
+    now = time.monotonic()
+    cached = _session_model_cache.get(sid)
+    if cached is not None and now - cached[0] < SESSION_MODEL_CACHE_TTL:
+        return cached[1]
+    model = _build_session_model(sid)
+    _session_model_cache[sid] = (now, model)
+    return model
 
 
 # ==== Format / parse helpers ====

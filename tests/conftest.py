@@ -20,3 +20,6 @@ def _reset_module_caches():
     feed._session_color_cache_ts = 0.0
     feed._transcript_path_cache.clear()
     feed._transcript_positions.clear()
+    feed._agent_label_cache.clear()
+    feed._agent_label_cache_ts = 0.0
+    feed._session_model_cache.clear()
