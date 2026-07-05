@@ -1027,7 +1027,7 @@ def build_session_panel(
     return Panel(
         body,
         title=_panel_title("· session"),
-        subtitle=f"[dim]{model.transcript_path}[/dim]",
+        subtitle=Text(model.transcript_path, style="dim"),
         box=box.ROUNDED,
         padding=(1, 2),
         height=term_height,
@@ -1422,7 +1422,9 @@ def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
         # Open the session-detail modal for the selected row's session. Opening
         # it precludes the command modal (only one modal open at a time).
         entry = state.selected_entry()
-        state.session_detail = entry.get("session_id") if entry else None
+        # Treat an empty/missing session_id (hand-edited or legacy line) as no
+        # session so the modal stays closed instead of showing a blank identity.
+        state.session_detail = (entry.get("session_id") or None) if entry else None
     elif ch == "o":
         return Action.OPEN_SESSION
     elif ch == "f":

@@ -1633,6 +1633,15 @@ class TestSessionModal:
         assert state.session_detail is None
         assert state.modal_open() is False
 
+    def test_s_on_empty_session_id_leaves_modal_closed(self):
+        # a hand-edited/legacy line with an empty session_id must not open a
+        # blank modal ("" is falsy, so session_detail stays None)
+        state = feed.AppState(entries=[{"command": "c", "session_id": ""}], cursor=0)
+        result = feed.apply_key(state, "s", 10)
+        assert result is feed.Action.NONE
+        assert state.session_detail is None
+        assert state.modal_open() is False
+
     def test_session_modal_swallows_navigation(self):
         state = feed.AppState(entries=self._entries(3), cursor=1, session_detail="sid-0")
         result = feed.apply_key(state, "j", 10)
@@ -1726,6 +1735,14 @@ class TestSessionModal:
         out = self._text(feed.build_session_panel(self._model(subagents=capped),
                                                   term_height=30))
         assert "123+" in out
+
+    def test_panel_bracketed_transcript_path_not_swallowed_as_markup(self):
+        # a path with a bracketed segment must render literally in both the
+        # meta row and the subtitle border (the subtitle is a Text, not markup)
+        model = self._model(transcript_path="/proj[bar]/x.jsonl", subagents=())
+        out = self._text(feed.build_session_panel(model, term_height=30))
+        assert out.count("proj[bar]") == 2  # meta row + subtitle
+        assert "/proj/x.jsonl" not in out    # bracket segment not dropped
 
     def test_panel_folder_is_tilde_abbreviated(self):
         home = str(Path.home())
