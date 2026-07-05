@@ -161,7 +161,7 @@ class RenderCtx:
 
     name_map: dict[str, str] | None = None
     color_map: dict[str, str] | None = None
-    agent_map: dict | None = None
+    agent_map: dict[str, dict] | None = None
     agent_label: str | None = None
     run_first: bool = False
     run_last: bool = False
@@ -171,7 +171,7 @@ class RenderCtx:
 class Column:
     """One table column.
 
-    `key` is the stable digit (1..5) the toggle keys / status bar use. `style`
+    `key` is a stable digit the toggle keys / status bar use. `style`
     and `kwargs` are passed to `Table.add_column`. `render(entry, ctx)` produces
     that column's cell for a single log entry as a `str` or `rich.text.Text`.
     Adding a column is a single entry in the `COLUMNS` list below.
