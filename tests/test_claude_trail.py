@@ -1297,6 +1297,99 @@ class TestColumnRender:
         assert marker in out    # cell rendered
 
 
+class TestAgentTree:
+    """The Agent column (key 6): tree glyphs over consecutive
+    (session_id, agent_id) runs, label shown once, blank for the main agent."""
+
+    def _entry(self, sid, cmd, aid=None):
+        e = {"timestamp": "2025-01-01T12:00:00+00:00", "command": cmd,
+             "cwd": "/work", "session_id": sid}
+        if aid:
+            e["agent_id"] = aid
+            e["agent_type"] = "general-purpose"
+        return e
+
+    def _agent_col(self):
+        return next(c for c in feed.COLUMNS if c.key == 6)
+
+    def _text(self, table, width=140):
+        console = Console(width=width, record=True)
+        console.print(table)
+        return console.export_text()
+
+    def test_main_agent_row_renders_blank(self):
+        from rich.text import Text
+        ctx = feed.RenderCtx(agent_label=None, run_first=True, run_last=True)
+        cell = self._agent_col().render(self._entry("s1", "x"), ctx)
+        assert isinstance(cell, Text)
+        assert cell.plain == ""
+
+    def test_single_row_run_uses_dash_glyph_with_label(self):
+        ctx = feed.RenderCtx(agent_label="Solo", run_first=True, run_last=True)
+        cell = self._agent_col().render(self._entry("s1", "x", aid="a1"), ctx)
+        assert cell.plain == "─ Solo"
+
+    def test_run_glyphs_and_label_only_on_first_row(self):
+        col = self._agent_col()
+        top = col.render(self._entry("s1", "x", aid="a1"),
+                         feed.RenderCtx(agent_label="Run", run_first=True, run_last=False))
+        mid = col.render(self._entry("s1", "x", aid="a1"),
+                         feed.RenderCtx(agent_label="Run", run_first=False, run_last=False))
+        bot = col.render(self._entry("s1", "x", aid="a1"),
+                         feed.RenderCtx(agent_label="Run", run_first=False, run_last=True))
+        assert top.plain == "┌ Run"       # label on the first (newest) row only
+        assert mid.plain == "│ "          # continuation carries the connector alone
+        assert bot.plain == "└ "
+
+    def test_consecutive_run_shows_label_once_between_connectors(self):
+        # oldest-first; display reverses to [sub two, sub one, main]
+        entries = [
+            self._entry("s1", "main cmd"),
+            self._entry("s1", "sub one", aid="a1"),
+            self._entry("s1", "sub two", aid="a1"),
+        ]
+        amap = {"a1": {"type": "general-purpose", "description": "reviewer run"}}
+        cols = {c.key: True for c in feed.COLUMNS}
+        out = self._text(feed.build_table(entries, 10, cols, 0, agent_map=amap))
+        assert out.count("reviewer run") == 1  # label shown once per run
+        assert out.count("┌") == 1 and out.count("└") == 1  # a single top/bottom pair
+        assert "│" not in out  # a two-row run has no middle connector; main row blank
+
+    def test_different_agent_id_breaks_the_run(self):
+        # two same-session subagents with different ids must not merge into one run
+        entries = [
+            self._entry("s1", "one", aid="a1"),
+            self._entry("s1", "two", aid="a2"),
+        ]
+        amap = {"a1": {"type": "gp", "description": "first"},
+                "a2": {"type": "gp", "description": "second"}}
+        cols = {c.key: True for c in feed.COLUMNS}
+        out = self._text(feed.build_table(entries, 10, cols, 0, agent_map=amap))
+        assert out.count("─") >= 2  # each is its own single-row run
+        assert "first" in out and "second" in out
+
+    def test_toggle_six_hides_agent_column(self):
+        entries = [self._entry("s1", "cmd", aid="a1")]
+        amap = {"a1": {"type": "general-purpose", "description": "solo task"}}
+        cols = {c.key: True for c in feed.COLUMNS}
+        cols[6] = False
+        out = self._text(feed.build_table(entries, 10, cols, 0, agent_map=amap))
+        assert "Agent" not in out       # header gone
+        assert "solo task" not in out   # label not rendered
+
+    def test_apply_key_six_toggles_agent_column(self):
+        state = feed.AppState(entries=[])
+        assert state.visible_cols[6] is True
+        assert feed.apply_key(state, "6", 10) is feed.Action.NONE
+        assert state.visible_cols[6] is False
+
+    def test_last_visible_column_guard_holds_for_agent_column(self):
+        state = feed.AppState(entries=[], visible_cols={
+            1: False, 2: False, 3: False, 4: False, 5: False, 6: True})
+        state.toggle_col(6)
+        assert state.visible_cols[6] is True  # cannot hide the last visible column
+
+
 class TestVisibleRowCount:
     def test_subtracts_chrome_rows(self):
         assert feed.visible_row_count(40) == 40 - feed.CHROME_ROWS
