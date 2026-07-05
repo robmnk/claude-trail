@@ -60,7 +60,8 @@ python3 claude_trail.py   # if running from a clone
 | `j`/`k` or `↓`/`↑` | Move cursor down/up |
 | `g`/`G` | Jump to top/bottom |
 | `Enter` | Open the full-command detail view for the selected command |
-| `Esc` | Close the detail view (also `q` or `Enter` while it is open) |
+| `s` | Open the session-detail modal for the selected row's session (identity header + subagent list with live status) |
+| `Esc` | Close the open modal, command detail or session detail (also `q` or `Enter` while it is open) |
 | `o` | Open selected session's commands (filtered JSONL) in `$VISUAL` or the platform default launcher |
 | `f` | Open file manager on folder of files referenced in selected command |
 | `1`-`5` | Toggle columns: 1=Time, 2=Session, 3=Directory, 4=Files, 5=Command |
@@ -97,6 +98,7 @@ Adding a column is a single entry in the list.
 - Poll interval: 300ms
 - File paths extracted by `find_paths(cmd)` (regex matching absolute `/...`, home `~/...`, relative `./...`; order-preserving dedupe via `dict.fromkeys`). `extract_files()` is a thin basename formatter over it and `open_file_folder()` reuses it.
 - `Enter` opens an in-TUI detail view (`build_detail_panel()`) showing the selected command in full: untruncated, newlines preserved, with the danger `*` marker and a metadata header (time, session, directory, files). `Esc`/`q`/`Enter` close it. The view is modal: while open, navigation/column/clear keys are ignored (only `Ctrl-C` still quits).
+- `s` opens the session-detail modal (`build_session_panel()`) for the selected row's session: an identity header (id, name tinted by the session `/color` plus its live status, `~`-abbreviated folder, transcript path, version, start time) and a table of the session's subagents (status glyph `●` running / `✓` done / `✗` stopped, description, agent type, tool-call count shown as `N+` when byte-capped). It reads `load_session_model(sid)` (cached `SESSION_MODEL_CACHE_TTL` = 2s), which assembles the model from the live `sessions/<pid>.json`, the parent transcript's `<task-notification>` completion events, and each `subagents/**/agent-*.meta.json`; status is derived (completed task-id -> `done`, failed/killed -> `stopped`, else `running` when the session is live else `stopped`). Both modals are mutually exclusive: `AppState.modal_open()` is true while either is open, `apply_key` swallows everything but `Esc`/`q`/`Enter` (which clear both fields) and `Ctrl-C` (quit), and `render_panel` shows the session modal in precedence over the command modal.
 - Session JSONL written under `tempfile.gettempdir()` (default `/tmp`) as `claude-trail-session-{sanitized-id}.jsonl` on `o`. If `$VISUAL`/`$EDITOR` is set, `open_session_log()` suspends the `Live` display, restores the terminal, runs that editor in the foreground (so terminal editors like nvim get the tty), then resumes; otherwise it hands the file to the GUI launcher detached.
 - Arrow keys are read in both CSI (`ESC [ A`/`B`) and SS3 (`ESC O A`/`B`, application-cursor-keys mode) forms by `read_key()`, which parses one complete CSI sequence per call (parameter bytes, one final byte) so modified arrows (`ESC [ 1 ; 5 A`) and function keys never leak stray bytes into the key dispatch; a final byte of `A`/`B` navigates regardless of modifier parameters.
 - Panel title shows the installed version (`claude-trail vX.Y.Z`), read from package metadata via `importlib.metadata`; blank when run from a clone without an install.
