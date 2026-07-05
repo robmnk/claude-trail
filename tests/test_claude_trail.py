@@ -1609,3 +1609,145 @@ class TestApplyKey:
         assert state.entries == []
         assert state.cursor == 0
         assert state.scroll_offset == 0
+
+
+class TestSessionModal:
+    """The `s` session-detail modal: opening state, modal key handling, and the
+    build_session_panel rendering."""
+
+    def _entries(self, n):
+        return [{"command": f"c{i}", "session_id": f"sid-{i}"} for i in range(n)]
+
+    def test_s_opens_session_detail_for_selected_session(self):
+        state = feed.AppState(entries=self._entries(3), cursor=0)
+        result = feed.apply_key(state, "s", 10)
+        assert result is feed.Action.NONE
+        # cursor 0 = newest = last appended (sid-2)
+        assert state.session_detail == "sid-2"
+        assert state.modal_open() is True
+
+    def test_s_without_selectable_entry_leaves_modal_closed(self):
+        state = feed.AppState(entries=[])
+        result = feed.apply_key(state, "s", 10)
+        assert result is feed.Action.NONE
+        assert state.session_detail is None
+        assert state.modal_open() is False
+
+    def test_s_on_empty_session_id_leaves_modal_closed(self):
+        # a hand-edited/legacy line with an empty session_id must not open a
+        # blank modal ("" is falsy, so session_detail stays None)
+        state = feed.AppState(entries=[{"command": "c", "session_id": ""}], cursor=0)
+        result = feed.apply_key(state, "s", 10)
+        assert result is feed.Action.NONE
+        assert state.session_detail is None
+        assert state.modal_open() is False
+
+    def test_session_modal_swallows_navigation(self):
+        state = feed.AppState(entries=self._entries(3), cursor=1, session_detail="sid-0")
+        result = feed.apply_key(state, "j", 10)
+        assert result is feed.Action.NONE
+        assert state.cursor == 1              # navigation ignored while modal open
+        assert state.session_detail == "sid-0"  # still open
+
+    def test_session_modal_swallows_s(self):
+        # pressing s again while the modal is open must not re-trigger the opener
+        state = feed.AppState(entries=self._entries(3), cursor=0, session_detail="sid-0")
+        result = feed.apply_key(state, "s", 10)
+        assert result is feed.Action.NONE
+        assert state.session_detail == "sid-0"
+
+    def test_session_modal_esc_closes(self):
+        state = feed.AppState(entries=self._entries(3), session_detail="sid-0")
+        result = feed.apply_key(state, "\x1b", 10)
+        assert result is feed.Action.NONE
+        assert state.session_detail is None
+
+    def test_session_modal_q_closes_not_quits(self):
+        state = feed.AppState(entries=self._entries(3), session_detail="sid-0")
+        result = feed.apply_key(state, "q", 10)
+        assert result is feed.Action.NONE
+        assert state.session_detail is None
+
+    def test_session_modal_enter_closes(self):
+        state = feed.AppState(entries=self._entries(3), session_detail="sid-0")
+        result = feed.apply_key(state, "\r", 10)
+        assert result is feed.Action.NONE
+        assert state.session_detail is None
+
+    def test_session_modal_ctrl_c_still_quits(self):
+        state = feed.AppState(entries=self._entries(3), session_detail="sid-0")
+        assert feed.apply_key(state, "\x03", 10) is feed.Action.QUIT
+
+    def test_close_clears_both_modal_fields(self):
+        # if both were somehow set, esc clears both so they stay mutually exclusive
+        entries = self._entries(3)
+        state = feed.AppState(entries=entries, detail_entry=entries[0],
+                              session_detail="sid-0")
+        feed.apply_key(state, "\x1b", 10)
+        assert state.detail_entry is None
+        assert state.session_detail is None
+
+    def _model(self, **kw):
+        subagents = kw.pop("subagents", (
+            feed.SubagentInfo(
+                agent_id="run1", agent_type="Explore",
+                description="Search the tree", status="running", command_count=1),
+            feed.SubagentInfo(
+                agent_id="done1", agent_type="general-purpose",
+                description="Review Phase 4", status="done", command_count=3),
+        ))
+        base = dict(
+            session_id="4819367e-5b3d-4237-8ea5-67af6bca91de",
+            name="merge-phase-2-tests-cleanup",
+            status="busy", live=True,
+            cwd="/home/naka/Projects/personal/claude-trail",
+            version="2.1.200", kind="interactive",
+            started_at=1783058624928,
+            transcript_path="/home/naka/.claude/projects/-p/4819367e.jsonl",
+            subagents=subagents,
+        )
+        base.update(kw)
+        return feed.SessionModel(**base)
+
+    def _text(self, panel, width=100):
+        console = Console(width=width, record=True)
+        console.print(panel)
+        return console.export_text()
+
+    def test_panel_shows_id_transcript_and_subagent_states(self):
+        out = self._text(feed.build_session_panel(self._model(), term_height=30))
+        assert "4819367e-5b3d-4237-8ea5-67af6bca91de" in out  # session id
+        assert "4819367e.jsonl" in out                        # transcript path
+        assert "Search the tree" in out and "running" in out  # a running subagent
+        assert "Review Phase 4" in out and "done" in out       # a done subagent
+        assert "Subagents (2, 1 running)" in out
+
+    def test_panel_empty_subagents_shows_placeholder(self):
+        out = self._text(feed.build_session_panel(self._model(subagents=()),
+                                                  term_height=30))
+        assert "No subagents." in out
+        assert "Subagents (0, 0 running)" in out
+
+    def test_panel_capped_count_marked_with_plus(self):
+        capped = (feed.SubagentInfo(
+            agent_id="big", agent_type="general-purpose", description="big run",
+            status="done", command_count=123, command_count_capped=True),)
+        out = self._text(feed.build_session_panel(self._model(subagents=capped),
+                                                  term_height=30))
+        assert "123+" in out
+
+    def test_panel_bracketed_transcript_path_not_swallowed_as_markup(self):
+        # a path with a bracketed segment must render literally in both the
+        # meta row and the subtitle border (the subtitle is a Text, not markup)
+        model = self._model(transcript_path="/proj[bar]/x.jsonl", subagents=())
+        out = self._text(feed.build_session_panel(model, term_height=30))
+        assert out.count("proj[bar]") == 2  # meta row + subtitle
+        assert "/proj/x.jsonl" not in out    # bracket segment not dropped
+
+    def test_panel_folder_is_tilde_abbreviated(self):
+        home = str(Path.home())
+        model = self._model(cwd=home + "/Projects/x", live=False, status="",
+                            version="", started_at=0, subagents=())
+        out = self._text(feed.build_session_panel(model, term_height=30))
+        assert "~/Projects/x" in out
+        assert home + "/Projects/x" not in out  # absolute home prefix hidden
