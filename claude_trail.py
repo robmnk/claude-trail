@@ -29,7 +29,7 @@ import tempfile
 import termios
 import time
 import tty
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 from pathlib import Path
@@ -150,10 +150,21 @@ class RenderCtx:
     Bundles the session name/color maps so a column's `render` callable has one
     argument for everything table-wide. The module-level helper functions
     (`format_time`, `session_label`, `rich_color`, ...) are called directly.
+
+    The last four fields carry the per-row agent-tree state the Agent column
+    reads: `agent_map` resolves an agent_id to its label table-wide, while
+    `agent_label`/`run_first`/`run_last` are set fresh for each row by
+    `build_table` (via `dataclasses.replace`). `run_first`/`run_last` mark a
+    row's position in a consecutive `(session_id, agent_id)` run so the tree
+    gutter can draw its connectors and show the label just once.
     """
 
     name_map: dict[str, str] | None = None
     color_map: dict[str, str] | None = None
+    agent_map: dict | None = None
+    agent_label: str | None = None
+    run_first: bool = False
+    run_last: bool = False
 
 
 @dataclass(frozen=True, eq=False)
@@ -206,10 +217,30 @@ def _render_command(entry: LogEntry, ctx: RenderCtx):
     return _danger_prefixed(cmd, normalize_cmd(cmd))
 
 
+def _render_agent(entry: LogEntry, ctx: RenderCtx):
+    """The agent tree-gutter cell for one row.
+
+    Main-agent rows (`ctx.agent_label is None`) render blank. A subagent row
+    draws a connector glyph chosen by its position in the run: `─` for a
+    single-row run, `┌` at the top (newest), `└` at the bottom (oldest), `│`
+    for the rows between. The run's label is shown only on its first (`┌`/`─`)
+    row; continuation rows carry the connector alone.
+    """
+    label = ctx.agent_label
+    if label is None:
+        return Text("")
+    glyph = ("─ " if ctx.run_first and ctx.run_last else
+             "┌ " if ctx.run_first else
+             "└ " if ctx.run_last else "│ ")
+    return Text(glyph + (label if ctx.run_first else ""), style="cyan")
+
+
 COLUMNS = [
     Column(1, "Time", "cyan", {"width": 8, "no_wrap": True}, _render_time),
     Column(2, "Session", "magenta",
            {"width": 20, "no_wrap": True, "overflow": "ellipsis"}, _render_session),
+    Column(6, "Agent", "cyan",
+           {"width": 24, "no_wrap": True, "overflow": "ellipsis"}, _render_agent),
     Column(3, "Directory", "green", {"width": 14, "no_wrap": True}, _render_directory),
     Column(4, "Files", "yellow",
            {"width": 20, "no_wrap": True, "overflow": "ellipsis"}, _render_files),
@@ -745,6 +776,7 @@ def build_table(
     offset: int = 0,
     name_map: dict[str, str] | None = None,
     color_map: dict[str, str] | None = None,
+    agent_map: dict[str, dict] | None = None,
 ) -> Table:
     """Render up to `max_rows` entries as a Rich table, newest first.
 
@@ -753,6 +785,12 @@ def build_table(
     cursor is highlighted at `highlight_idx = cursor - offset` within the
     displayed slice; when the cursor is scrolled out of view that index falls
     outside the slice and no row is highlighted.
+
+    The Agent column reads a per-row `RenderCtx` (built with `replace`): runs of
+    adjacent rows sharing `(session_id, agent_id)` are detected in the displayed
+    (newest-first) order so the tree gutter connects them and labels each run
+    once. Runs never span sessions or agents; a `None` agent_id is the main
+    agent and renders a blank gutter.
     """
     table = Table(
         box=box.SIMPLE_HEAVY,
@@ -762,7 +800,7 @@ def build_table(
         row_styles=["", "dim"],
     )
 
-    ctx = RenderCtx(name_map=name_map, color_map=color_map)
+    base_ctx = RenderCtx(name_map=name_map, color_map=color_map, agent_map=agent_map)
     active = [col for col in COLUMNS if visible_cols.get(col.key)]
     for col in active:
         table.add_column(col.name, style=col.style, **col.kwargs)
@@ -770,9 +808,15 @@ def build_table(
     display = get_display_entries(entries, max_rows, offset)
     highlight_idx = cursor - offset
 
+    keys = [(e.get("session_id", ""), entry_agent_id(e)) for e in display]
+    labels = [agent_label(e, base_ctx.agent_map or {}) for e in display]
     for idx, entry in enumerate(display):
         row_style = "on grey23" if idx == highlight_idx else None
-        cells = [col.render(entry, ctx) for col in active]
+        run_first = idx == 0 or keys[idx] != keys[idx - 1]
+        run_last = idx == len(display) - 1 or keys[idx] != keys[idx + 1]
+        row_ctx = replace(base_ctx, agent_label=labels[idx],
+                          run_first=run_first, run_last=run_last)
+        cells = [col.render(entry, row_ctx) for col in active]
         table.add_row(*cells, style=row_style)
 
     return table
@@ -918,6 +962,7 @@ def build_panel(
     offset: int = 0,
     name_map: dict[str, str] | None = None,
     color_map: dict[str, str] | None = None,
+    agent_map: dict[str, dict] | None = None,
 ) -> Panel:
     """Wrap the table (or the empty-state hint) plus the status bar in a Panel.
 
@@ -933,7 +978,8 @@ def build_panel(
         content.append("Make sure the hook is configured in ~/.claude/settings.json\n", style="dim")
         content.append(f"Watching: {LOG_PATH}", style="dim")
     else:
-        content = build_table(entries, max_rows, visible_cols, cursor, offset, name_map, color_map)
+        content = build_table(entries, max_rows, visible_cols, cursor, offset,
+                              name_map, color_map, agent_map)
 
     active_count = count_active_sessions(entries, datetime.now().astimezone())
 
@@ -1286,6 +1332,7 @@ def main():
     state = AppState(entries=entries)
     name_map = load_session_names()
     color_map = load_session_colors({e.get("session_id", "") for e in state.entries})
+    agent_map = load_agent_labels({e.get("session_id", "") for e in state.entries})
 
     interactive = sys.stdin.isatty()
     if interactive:
@@ -1306,7 +1353,7 @@ def main():
             return build_detail_panel(state.detail_entry, console.height, name_map, color_map)
         return build_panel(
             state.entries, console.height, state.visible_cols,
-            state.cursor, state.scroll_offset, name_map, color_map,
+            state.cursor, state.scroll_offset, name_map, color_map, agent_map,
         )
 
     try:
@@ -1386,7 +1433,9 @@ def main():
                     state.clamp(max_rows)
 
                     name_map = load_session_names()
-                    color_map = load_session_colors({e.get("session_id", "") for e in state.entries})
+                    session_ids = {e.get("session_id", "") for e in state.entries}
+                    color_map = load_session_colors(session_ids)
+                    agent_map = load_agent_labels(session_ids)
 
                     # Redraw immediately on input or new log lines so cursor
                     # moves feel instant; let the auto-refresh thread handle the
