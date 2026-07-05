@@ -71,7 +71,8 @@ python3 claude_trail.py   # if running from a clone
 | `j` / `k` or `↓` / `↑` | Move cursor down / up |
 | `g` / `G` | Jump to top / bottom |
 | `Enter` | Open the full-command detail view for the selected command |
-| `Esc` | Close the detail view (also `q` or `Enter` while it is open) |
+| `s` | Open the session-detail modal for the selected row's session (identity header + subagent list with live status) |
+| `Esc` | Close the open modal, command detail or session detail (also `q` or `Enter` while it is open) |
 | `o` | Open the selected session's commands (filtered JSONL) in `$VISUAL` / `$EDITOR`, else the platform launcher (`xdg-open` on Linux, `open` on macOS) |
 | `f` | Open the file manager on the folder of files referenced in the selected command |
 | `1`-`5` | Toggle columns (1=Time, 2=Session, 3=Directory, 4=Files, 5=Command) |

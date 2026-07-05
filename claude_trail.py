@@ -928,6 +928,112 @@ def build_detail_panel(
     )
 
 
+# Status glyph + Rich style per derived subagent run state (see SubagentInfo).
+_SUBAGENT_GLYPHS = {
+    "running": ("●", "bold green"),  # ●
+    "done": ("✓", "green"),          # ✓
+    "stopped": ("✗", "red"),         # ✗
+}
+
+
+def _tilde(path: str) -> str:
+    """Abbreviate a leading home directory to `~` (folder display)."""
+    if not path:
+        return "(unknown)"
+    home = str(Path.home())
+    if path == home:
+        return "~"
+    if path.startswith(home + os.sep):
+        return "~" + path[len(home):]
+    return path
+
+
+def _session_started_line(model: "SessionModel") -> str:
+    """`HH:MM  ·  kind: <kind>` from a session's start time, or a fallback."""
+    when = "(unknown)"
+    if model.started_at:
+        try:
+            when = datetime.fromtimestamp(model.started_at / 1000).strftime("%H:%M")
+        except (ValueError, OSError, OverflowError):
+            when = "(unknown)"
+    if model.kind:
+        return f"{when}  ·  kind: {model.kind}"
+    return when
+
+
+def build_session_panel(
+    model: "SessionModel",
+    name_map: dict[str, str] | None = None,
+    color_map: dict[str, str] | None = None,
+    term_height: int = 40,
+) -> Panel:
+    """Full-screen session-detail view (opened with `s`).
+
+    A metadata header (id, name tinted by the session's `/color` plus its live
+    status, `~`-abbreviated folder, full transcript path, version, start time)
+    followed by a table of the session's subagents: status glyph
+    (`●` running / `✓` done / `✗` stopped), description, agent type, and the
+    tool-call count (`N+` when the count was byte-capped). Empty state reads
+    "No subagents." `load_session_model` is cached, so rebuilding this each
+    frame is cheap and still reflects live running->done transitions.
+    """
+    sid = model.session_id
+    color = rich_color(color_map.get(sid)) if color_map else None
+
+    meta = Table.grid(padding=(0, 2))
+    meta.add_column(style="dim", justify="right", no_wrap=True)
+    meta.add_column(ratio=1)
+
+    name = Text(model.name or session_label(sid, name_map), style=color or "")
+    if model.status:
+        name.append(f"  ({model.status})", style="bold green")
+    meta.add_row("Session", sid or "(none)")
+    meta.add_row("Name", name)
+    meta.add_row("Folder", _tilde(model.cwd))
+    meta.add_row("Transcript", Text(model.transcript_path or "(none)", style="dim"))
+    meta.add_row("Version", model.version or "(unknown)")
+    meta.add_row("Started", _session_started_line(model))
+
+    running = sum(1 for s in model.subagents if s.status == "running")
+    header = Text.from_markup(
+        f"[bold]Subagents[/bold] [dim]({len(model.subagents)}, {running} running)[/dim]"
+    )
+
+    if model.subagents:
+        subs = Table(box=None, pad_edge=False, header_style="dim", expand=True)
+        subs.add_column(" ", width=1)
+        subs.add_column("Subagent", ratio=1, no_wrap=True, overflow="ellipsis")
+        subs.add_column("Type", width=16, no_wrap=True, overflow="ellipsis")
+        subs.add_column("Status", width=8)
+        subs.add_column("Cmds", justify="right", width=5)
+        for s in model.subagents:
+            glyph, gstyle = _SUBAGENT_GLYPHS.get(s.status, ("?", "dim"))
+            count = f"{s.command_count}+" if s.command_count_capped else str(s.command_count)
+            count_cell = count if s.command_count else Text(count, style="dim")
+            subs.add_row(
+                Text(glyph, style=gstyle),
+                s.description or s.agent_id[:8],
+                s.agent_type,
+                Text(s.status, style=gstyle),
+                count_cell,
+            )
+        subagent_block = subs
+    else:
+        subagent_block = Text("No subagents.", style="dim italic")
+
+    hint = Text.from_markup("[dim italic]esc / q / ↵ : back[/dim italic]")
+    body = Group(meta, Text(""), header, subagent_block, Text(""), hint)
+
+    return Panel(
+        body,
+        title=_panel_title("· session"),
+        subtitle=Text(model.transcript_path, style="dim"),
+        box=box.ROUNDED,
+        padding=(1, 2),
+        height=term_height,
+    )
+
+
 def visible_row_count(term_height: int) -> int:
     """Rows available for the table body once the panel chrome is accounted for."""
     return max(term_height - CHROME_ROWS, MIN_VISIBLE_ROWS)
@@ -998,7 +1104,7 @@ def build_panel(
 
     status2 = Text.from_markup(
         f"  [dim italic]cols:[/dim italic] {col_toggles}"
-        "  [dim italic]\u00b7  j/k:nav  \u21b5:view  o:session  f:folder  q:quit  c:clear[/dim italic]"
+        "  [dim italic]\u00b7  j/k:nav  \u21b5:view  s:session  o:log  f:folder  q:quit  c:clear[/dim italic]"
     )
 
     body = Group(content, Text(""), status, status2)
@@ -1208,6 +1314,13 @@ class AppState:
         default_factory=lambda: {c.key: True for c in COLUMNS}
     )
     detail_entry: LogEntry | None = None
+    session_detail: str | None = None  # a session_id while the session modal is open
+
+    def modal_open(self) -> bool:
+        """True while either full-screen modal (command detail or session detail)
+        is open. Only one is ever open at a time; while open, navigation/column/
+        clear keys are ignored (only Ctrl-C still quits)."""
+        return self.detail_entry is not None or self.session_detail is not None
 
     def selected_entry(self) -> LogEntry | None:
         """The entry the cursor points at in the newest-first view, or None."""
@@ -1274,13 +1387,15 @@ def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
 
     Mutates `state` but spawns no processes and touches no terminal.
     """
-    if state.detail_entry is not None:
-        # Modal full-command view: esc / q / enter return to the table;
-        # Ctrl-C still quits.
+    if state.modal_open():
+        # Modal view (command detail or session detail): esc / q / enter return
+        # to the table; Ctrl-C still quits. Clearing both fields keeps the two
+        # modals mutually exclusive.
         if ch == "\x03":
             return Action.QUIT
         if ch in ("\x1b", "q", "\r", "\n"):
             state.detail_entry = None
+            state.session_detail = None
         return Action.NONE
     if ch in ("q", "\x03"):
         return Action.QUIT
@@ -1303,6 +1418,13 @@ def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
         state.toggle_col(int(ch))
     elif ch in ("\r", "\n"):
         state.detail_entry = state.selected_entry()
+    elif ch == "s":
+        # Open the session-detail modal for the selected row's session. Opening
+        # it precludes the command modal (only one modal open at a time).
+        entry = state.selected_entry()
+        # Treat an empty/missing session_id (hand-edited or legacy line) as no
+        # session so the modal stays closed instead of showing a blank identity.
+        state.session_detail = (entry.get("session_id") or None) if entry else None
     elif ch == "o":
         return Action.OPEN_SESSION
     elif ch == "f":
@@ -1349,6 +1471,11 @@ def main():
         tty.setcbreak(fd)
 
     def render_panel() -> Panel:
+        if state.session_detail is not None:
+            return build_session_panel(
+                load_session_model(state.session_detail),
+                name_map, color_map, console.height,
+            )
         if state.detail_entry is not None:
             return build_detail_panel(state.detail_entry, console.height, name_map, color_map)
         return build_panel(
