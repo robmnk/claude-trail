@@ -7,7 +7,7 @@ Observability tool for Claude Code: a real-time TUI dashboard that shows every B
 - **Live command trail** - watches all Claude Code Bash tool calls in real-time
 - **Multi-session aware** - tracks commands across concurrent sessions with color-coded IDs
 - **Dangerous command highlighting** - flags risky operations (`rm`, `sudo`, `git reset`, etc.) with red markers
-- **Subagent attribution** - tags each command with the subagent that ran it and draws an indented agent tree in the feed; `s` opens a per-session modal listing every subagent with live status
+- **Subagent attribution** - tags each command with the subagent that ran it and draws a tree gutter attributing rows to subagent runs; `s` opens a per-session modal listing every subagent with live status
 - **Active session indicator** - shows how many sessions have been active in the last 5 minutes
 - **Minimal footprint** - single Python file, one dependency (`rich`)
 - **Cross-platform** - works on Linux and macOS (uses `xdg-open` or `open` automatically)

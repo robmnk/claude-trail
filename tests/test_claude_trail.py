@@ -2143,3 +2143,19 @@ class TestSearchPanel:
         out = self._text(feed.build_search_panel(s, term_height=40))
         assert "m-0" in out and "m-1" in out and "m-2" in out
         assert "of 3" not in out  # no range indicator when everything fits
+
+
+class TestDocsConsistency:
+    """Guards the README's description of the agent feed against the misleading
+    "indented agent tree" wording (the Agent column is a fixed-width tree gutter
+    next to each row; rows and the Command column are never indented)."""
+
+    def _readme(self):
+        return (Path(__file__).resolve().parent.parent / "README.md").read_text(
+            encoding="utf-8"
+        )
+
+    def test_readme_uses_tree_gutter_not_indented(self):
+        readme = self._readme()
+        assert "indented agent tree" not in readme
+        assert "tree gutter" in readme
