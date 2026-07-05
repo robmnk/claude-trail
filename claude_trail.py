@@ -59,6 +59,10 @@ PROJECTS_DIR = CONFIG_DIR / "projects"
 MAX_ENTRIES = 1000
 POLL_INTERVAL = 0.3
 CHROME_ROWS = 10  # title, status, padding
+# Non-body lines around the search-results table (borders, padding, header/root
+# rows, table header, blank spacers, hint); the results window is sized so the
+# table body never overflows the panel and crops the cursor row out of view.
+SEARCH_CHROME_ROWS = 11
 MIN_VISIBLE_ROWS = 3
 SESSION_NAME_CACHE_TTL = 2.0  # seconds
 SESSION_COLOR_CACHE_TTL = 5.0  # seconds
@@ -814,7 +818,11 @@ def run_search(
         return [], False, None
 
     if shutil.which("rg"):
-        argv = ["rg", "-n", "--no-heading", "--color=never"]
+        # -H forces the filename prefix. rg (like grep) omits it when given a
+        # single explicit file, which is the common transcript-root case (one
+        # `<sid>.jsonl` with no `subagents/` dir); without -H the output is
+        # `line:text` and _parse_grep_line drops or mis-parses every hit.
+        argv = ["rg", "-H", "-n", "--no-heading", "--color=never"]
         if ignore_case is True:
             argv.append("-i")
         elif ignore_case is False:
@@ -823,7 +831,8 @@ def run_search(
             argv.append("-S")  # smart-case
         argv += ["-e", query, "--", *path_args]
     else:
-        argv = ["grep", "-rInE"]
+        # -H guards non-GNU greps that omit the filename for a single file.
+        argv = ["grep", "-rHInE"]
         if ignore_case:
             argv.append("-i")
         argv += ["-e", query, "--", *path_args]
@@ -1212,6 +1221,19 @@ def _rel_to(path: str, base: str) -> str:
         return path
 
 
+def _result_window(cursor: int, total: int, capacity: int) -> tuple[int, int]:
+    """`(start, end)` slice of results to render so `cursor` stays on screen.
+
+    Stateless (SearchState keeps no scroll offset): when the list is longer than
+    `capacity` the cursor is centered in the viewport, clamped so the window
+    never runs past either end. Returns the whole list when it already fits.
+    """
+    if capacity <= 0 or total <= capacity:
+        return 0, total
+    start = max(0, min(cursor - capacity // 2, total - capacity))
+    return start, start + capacity
+
+
 def build_search_panel(search: "SearchState", term_height: int = 40) -> Panel:
     """Full-screen per-session search view (opened with `/`).
 
@@ -1228,14 +1250,24 @@ def build_search_panel(search: "SearchState", term_height: int = 40) -> Panel:
     if search.mode == "INPUT":
         query.append("▊", style="cyan")  # cursor block
 
+    n = len(search.results)
+    # Window the results around the cursor so a hit past the first screenful is
+    # actually visible (the panel is height-cropped, so every row must fit).
+    capacity = max(
+        term_height - SEARCH_CHROME_ROWS - (1 if search.flash else 0),
+        MIN_VISIBLE_ROWS,
+    )
+    win_start, win_end = _result_window(search.cursor, n, capacity)
+
     tag = Text()
     if search.error:
         tag.append(search.error, style="red")
     elif search.mode == "RESULTS":
-        n = len(search.results)
         tag.append(f"{n} match{'es' if n != 1 else ''}", style="yellow")
         if search.capped:
             tag.append(f"  (capped {SEARCH_RESULT_LIMIT})", style="red")
+        if (win_start, win_end) != (0, n):
+            tag.append(f"  {win_start + 1}-{win_end} of {n}", style="dim")
     else:
         tag.append("[Tab] switch root", style="dim")
 
@@ -1260,7 +1292,8 @@ def build_search_panel(search: "SearchState", term_height: int = 40) -> Panel:
         tbl.add_column("Line", justify="right", width=6)
         tbl.add_column("Match", ratio=1, no_wrap=True, overflow="ellipsis")
         base = _search_root_base(search)
-        for i, (path, line, text) in enumerate(search.results):
+        for i in range(win_start, win_end):
+            path, line, text = search.results[i]
             tbl.add_row(
                 _rel_to(path, base), str(line), text.strip(),
                 style="on grey23" if i == search.cursor else None,
@@ -1683,11 +1716,19 @@ def _apply_search_key(state: AppState, search: SearchState, ch: str) -> Action:
     search.flash = None
     if search.mode == "INPUT":
         if ch in ("\r", "\n"):
+            # A blank query would no-op in run_search but still flip to RESULTS
+            # and show "no matches"; stay in INPUT instead.
+            if not search.query.strip():
+                return Action.NONE
             return Action.RUN_SEARCH
         if ch == "\x1b":
             state.search = None
         elif ch == "\t":
-            search.root = _other_root(search.root)
+            other = _other_root(search.root)
+            if other in search.roots:
+                search.root = other
+            else:
+                search.flash = f"{other} root unavailable"
         elif ch in ("\x7f", "\x08"):
             search.query = search.query[:-1]
         elif len(ch) == 1 and ch.isprintable():
@@ -1699,8 +1740,11 @@ def _apply_search_key(state: AppState, search: SearchState, ch: str) -> Action:
     elif ch == "/":
         search.mode = "INPUT"
     elif ch == "\t":
-        search.root = _other_root(search.root)
-        return Action.RUN_SEARCH
+        other = _other_root(search.root)
+        if other in search.roots:
+            search.root = other
+            return Action.RUN_SEARCH
+        search.flash = f"{other} root unavailable"
     elif ch in ("\r", "\n"):
         if search.results:
             return Action.OPEN_MATCH
@@ -1764,7 +1808,10 @@ def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
         state.session_detail = (entry.get("session_id") or None) if entry else None
     elif ch == "/":
         # Open the per-session search modal for the selected row's session,
-        # resolving its transcript-folder and cwd roots up front (S.1).
+        # resolving its transcript-folder and cwd roots up front (S.1). Unlike
+        # the `s` handler (which defers all disk reads to render time), this
+        # reads pid.json/meta here; the reads are small and cached (2s TTL via
+        # load_session_model), so the one-shot cost on the keypress is fine.
         entry = state.selected_entry()
         if entry is not None:
             sid = entry.get("session_id") or ""

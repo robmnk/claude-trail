@@ -1856,6 +1856,36 @@ class TestRunSearch:
         assert feed._parse_grep_line("no colons here") is None
         assert feed._parse_grep_line("/p:notanumber:x") is None
 
+    def test_single_file_target_with_grep(self, tmp_path):
+        # A transcript root with no subagents dir is one explicit file; -H must
+        # keep the filename so _parse_grep_line yields a real path, not a lineno.
+        f = tmp_path / "a.txt"
+        f.write_text("alpha\nbeta hello\ngamma\n", encoding="utf-8")
+        with patch.object(feed.shutil, "which", return_value=None):  # force grep
+            matches, capped, err = feed.run_search("hello", [f])
+        assert err is None and capped is False
+        assert len(matches) == 1
+        path, line, text = matches[0]
+        assert path == str(f)  # filename retained, not the line number "2"
+        assert line == 2
+        assert "hello" in text
+
+    def test_single_file_target_with_rg(self, tmp_path):
+        # Same single-file case but exercising the real rg branch (the one the
+        # bug lived in); skipped when rg is not installed.
+        if not feed.shutil.which("rg"):
+            import pytest
+            pytest.skip("rg not installed")
+        f = tmp_path / "a.txt"
+        f.write_text("alpha\nbeta hello\ngamma\n", encoding="utf-8")
+        matches, capped, err = feed.run_search("hello", [f])
+        assert err is None and capped is False
+        assert len(matches) == 1
+        path, line, text = matches[0]
+        assert path == str(f)  # -H keeps the filename even for one file arg
+        assert line == 2
+        assert "hello" in text
+
 
 class TestSearchApplyKey:
     """apply_key handling for the search modal: INPUT builds the query, RESULTS
@@ -1899,6 +1929,36 @@ class TestSearchApplyKey:
         s.query = "x"
         assert feed.apply_key(state, "\r", 10) is feed.Action.RUN_SEARCH
         assert s.mode == "INPUT"  # apply_key is pure; main() flips to RESULTS
+
+    def test_input_enter_blank_query_is_noop(self):
+        # Enter on an empty/whitespace query must not flip to RESULTS (which
+        # would render a misleading "no matches" for a search that never ran).
+        state, s = self._searching()
+        s.query = "   "
+        assert feed.apply_key(state, "\r", 10) is feed.Action.NONE
+        assert s.mode == "INPUT"
+        assert state.search is not None
+
+    def _one_root(self, root="transcript", mode="INPUT"):
+        # A SearchState whose "other" root is absent (e.g. ended session with a
+        # deleted cwd), so Tab has nowhere valid to switch to.
+        state = feed.AppState(entries=[{"command": "c", "session_id": "s1"}])
+        roots = {root: [Path("/only")]}
+        state.search = feed.SearchState(sid="s1", roots=roots, root=root, mode=mode)
+        return state, state.search
+
+    def test_input_tab_to_unavailable_root_is_noop_with_flash(self):
+        state, s = self._one_root(root="transcript", mode="INPUT")
+        assert feed.apply_key(state, "\t", 10) is feed.Action.NONE
+        assert s.root == "transcript"  # did not flip to the absent cwd root
+        assert s.flash and "cwd" in s.flash
+
+    def test_results_tab_to_unavailable_root_does_not_rerun(self):
+        state, s = self._one_root(root="cwd", mode="RESULTS")
+        # No RUN_SEARCH over an empty root (which would show a bogus "no matches").
+        assert feed.apply_key(state, "\t", 10) is feed.Action.NONE
+        assert s.root == "cwd"
+        assert s.flash and "transcript" in s.flash
 
     def test_input_esc_closes(self):
         state, s = self._searching()
@@ -2051,3 +2111,35 @@ class TestSearchPanel:
             sid="s1", roots={"cwd": [Path("/p")]}, root="cwd", mode="RESULTS",
             results=[("/p/a", 1, "x")], flash="opened folder: /p")
         assert "opened folder: /p" in self._text(feed.build_search_panel(s, 20))
+
+    def test_result_window_helper(self):
+        # Fits: whole list.
+        assert feed._result_window(0, 5, 10) == (0, 5)
+        assert feed._result_window(3, 5, 5) == (0, 5)
+        # Longer than capacity: cursor stays inside a capacity-sized window.
+        start, end = feed._result_window(90, 100, 10)
+        assert end - start == 10 and start <= 90 < end
+        # Clamped at the ends.
+        assert feed._result_window(0, 100, 10)[0] == 0
+        assert feed._result_window(99, 100, 10) == (90, 100)
+
+    def test_results_window_follows_cursor(self):
+        # 100 hits in a 20-row terminal: the cursor near the bottom must be on
+        # screen and the first rows must have scrolled off.
+        results = [(f"/p/f{i}.py", i + 1, f"match-{i}") for i in range(100)]
+        s = feed.SearchState(
+            sid="s1", roots={"cwd": [Path("/p")]}, root="cwd", mode="RESULTS",
+            results=results, cursor=90)
+        out = self._text(feed.build_search_panel(s, term_height=20))
+        assert "match-90" in out       # cursor row rendered
+        assert "match-0 " not in out   # top rows windowed out
+        assert "of 100" in out         # range indicator in the tag
+
+    def test_results_window_shows_all_when_fitting(self):
+        results = [(f"/p/f{i}.py", i + 1, f"m-{i}") for i in range(3)]
+        s = feed.SearchState(
+            sid="s1", roots={"cwd": [Path("/p")]}, root="cwd", mode="RESULTS",
+            results=results, cursor=0)
+        out = self._text(feed.build_search_panel(s, term_height=40))
+        assert "m-0" in out and "m-1" in out and "m-2" in out
+        assert "of 3" not in out  # no range indicator when everything fits
