@@ -7,6 +7,7 @@ Observability tool for Claude Code: a real-time TUI dashboard that shows every B
 - **Live command trail** - watches all Claude Code Bash tool calls in real-time
 - **Multi-session aware** - tracks commands across concurrent sessions with color-coded IDs
 - **Dangerous command highlighting** - flags risky operations (`rm`, `sudo`, `git reset`, etc.) with red markers
+- **Subagent attribution** - tags each command with the subagent that ran it and draws a tree gutter attributing rows to subagent runs; `s` opens a per-session modal listing every subagent with live status
 - **Active session indicator** - shows how many sessions have been active in the last 5 minutes
 - **Minimal footprint** - single Python file, one dependency (`rich`)
 - **Cross-platform** - works on Linux and macOS (uses `xdg-open` or `open` automatically)
@@ -76,7 +77,7 @@ python3 claude_trail.py   # if running from a clone
 | `o` | Open the selected session's commands (filtered JSONL) in `$VISUAL` / `$EDITOR`, else the platform launcher (`xdg-open` on Linux, `open` on macOS) |
 | `f` | Open the file manager on the folder of files referenced in the selected command |
 | `/` | Search the selected row's session recursively (`rg`, else `grep`). `Tab` toggles the root between the transcript folder and the session's cwd; `Enter` runs the query. In results: `j` / `k` browse, `Enter` opens a hit at its line, `f` opens the hit's folder, `/` edits the query, `Esc` / `q` close |
-| `1`-`5` | Toggle columns (1=Time, 2=Session, 3=Directory, 4=Files, 5=Command) |
+| `1`-`6` | Toggle columns (1=Time, 2=Session, 3=Directory, 4=Files, 5=Command, 6=Agent) |
 | `c` | Clear display |
 | `q` | Quit |
 
@@ -105,7 +106,7 @@ Each line in `~/.claude/command-log.jsonl`:
 }
 ```
 
-Timestamps are in the user's local timezone (ISO 8601 with offset).
+Timestamps are in the user's local timezone (ISO 8601 with offset). Commands run inside a subagent also carry optional `agent_id` and `agent_type` fields; their absence means the main agent.
 
 ## Notes
 
