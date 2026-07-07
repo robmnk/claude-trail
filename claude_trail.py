@@ -254,7 +254,7 @@ def _render_agent(entry: LogEntry, ctx: RenderCtx):
 COLUMNS = [
     Column(1, "Time", "cyan", {"width": 8, "no_wrap": True}, _render_time),
     Column(2, "Session", "magenta",
-           {"width": 20, "no_wrap": True, "overflow": "ellipsis"}, _render_session),
+           {"width": 14, "no_wrap": True, "overflow": "ellipsis"}, _render_session),
     Column(6, "Agent", "cyan",
            {"width": 24, "no_wrap": True, "overflow": "ellipsis"}, _render_agent),
     Column(3, "Directory", "green", {"width": DIR_LABEL_WIDTH, "no_wrap": True},
