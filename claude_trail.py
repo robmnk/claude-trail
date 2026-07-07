@@ -69,6 +69,10 @@ SESSION_COLOR_CACHE_TTL = 5.0  # seconds
 AGENT_LABEL_CACHE_TTL = 2.0  # seconds
 SESSION_MODEL_CACHE_TTL = 2.0  # seconds; keeps the modal's running->done live
 AGENT_TOOLUSE_BYTE_CAP = 512 * 1024  # cap per agent transcript when counting tool_use
+# Chars of the agent_id shown as an agent's distinct short identifier (feed +
+# session modal). Placed first in the label so it survives the Agent column's
+# ellipsis: two subagents sharing a description still read as distinct.
+AGENT_ID_LABEL_LEN = 4
 ACTIVE_WINDOW_SECONDS = 300  # a session counts as active if seen within this window
 SEARCH_RESULT_LIMIT = 500  # max hits kept per search; the rest are dropped (capped)
 SEARCH_TIMEOUT = 5.0  # seconds before rg/grep is killed so a huge tree can't hang the UI
@@ -560,13 +564,28 @@ def entry_agent_id(entry: dict) -> str | None:
     return entry.get("agent_id") or None
 
 
+def short_agent_id(agent_id: str) -> str:
+    """An agent's distinct short identifier: the first AGENT_ID_LABEL_LEN chars
+    of its id. Shown in the feed and session modal so two subagents that share a
+    description (e.g. the same subagent type spawned twice) still read apart."""
+    return agent_id[:AGENT_ID_LABEL_LEN]
+
+
 def agent_label(entry: dict, agent_map: dict[str, dict]) -> str | None:
-    """Human label for the agent that ran this command, or None for the main agent."""
+    """Feed label for the agent that ran this command, or None for the main agent.
+
+    Formatted `"<short-id> <name>"`, id first so it survives the Agent column's
+    ellipsis: two subagents sharing a description are still distinguishable by
+    their ids. `name` is the description, falling back to the agent type, and is
+    dropped when neither is known (leaving the short id alone). The full
+    description/type live on the session-detail modal (`s`)."""
     aid = entry_agent_id(entry)
     if not aid:
         return None
     info = agent_map.get(aid) or {}
-    return info.get("description") or info.get("type") or aid[:8]
+    name = info.get("description") or info.get("type") or ""
+    short = short_agent_id(aid)
+    return f"{short} {name}" if name else short
 
 
 def _find_session_pid_info(sid: str) -> dict | None:
@@ -1173,9 +1192,10 @@ def build_session_panel(
             glyph, gstyle = _SUBAGENT_GLYPHS.get(s.status, ("?", "dim"))
             count = f"{s.command_count}+" if s.command_count_capped else str(s.command_count)
             count_cell = count if s.command_count else Text(count, style="dim")
+            short = short_agent_id(s.agent_id)
             subs.add_row(
                 Text(glyph, style=gstyle),
-                s.description or s.agent_id[:8],
+                f"{short}  {s.description}" if s.description else short,
                 s.agent_type,
                 Text(s.status, style=gstyle),
                 count_cell,
