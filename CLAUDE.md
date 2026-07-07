@@ -88,7 +88,7 @@ Adding a column is a single entry in the list.
 | 1 | Time | HH:MM:SS timestamp (`format_time`) |
 | 2 | Session | Session name from `~/.claude/sessions/<pid>.json` if set, else first 8 chars of session_id, tinted with the color the user picked via Claude Code's `/color` command (parsed from the session transcript) |
 | 6 | Agent | Tree gutter attributing the row to a subagent run (blank for the main agent); glyphs `─`/`┌`/`│`/`└` connect a consecutive `(session_id, agent_id)` run with the label shown once, drawn right after Session (`_render_agent`). The label is `<short-id> <description>` (`short_agent_id` = first `AGENT_ID_LABEL_LEN` chars of the id, placed first so it survives the ellipsis), so two subagents sharing a description are still distinct; full description/type live on the `s` modal |
-| 3 | Directory | Abbreviated cwd (`short_path`) |
+| 3 | Directory | Tail of the cwd (`short_path`): the distinctive end of the path, left-truncated with a leading `…` to `DIR_LABEL_WIDTH`, kept at a component boundary when it fits (`…/claude-trail`) |
 | 4 | Files | File paths extracted from command (basenames, max 3 shown) |
 | 5 | Command | Full command text, dangerous commands prefixed with red `*` |
 
