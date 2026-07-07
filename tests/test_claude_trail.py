@@ -445,13 +445,24 @@ class TestAgentLabel:
 
     def test_resolves_description(self):
         amap = {"aid1": {"type": "general-purpose", "description": "Implement Phase 4"}}
-        assert feed.agent_label({"agent_id": "aid1"}, amap) == "Implement Phase 4"
+        # short id prefix, then the description
+        assert feed.agent_label({"agent_id": "aid1"}, amap) == "aid1 Implement Phase 4"
 
     def test_falls_back_to_type_then_id(self):
         amap = {"aid1": {"type": "Explore", "description": ""}}
-        assert feed.agent_label({"agent_id": "aid1"}, amap) == "Explore"
-        # unknown agent_id -> first 8 chars of the id
-        assert feed.agent_label({"agent_id": "abcdef1234"}, {}) == "abcdef12"
+        assert feed.agent_label({"agent_id": "aid1"}, amap) == "aid1 Explore"
+        # unknown agent_id -> the short id alone (no name to append)
+        assert feed.agent_label({"agent_id": "abcdef1234"}, {}) == "abcd"
+
+    def test_same_description_stays_distinct_by_id(self):
+        # two agents doing the same kind of work still read apart via the id
+        amap = {"a1b2c3": {"type": "general-purpose", "description": "Airflow statsd check"},
+                "d4e5f6": {"type": "general-purpose", "description": "Airflow statsd check"}}
+        one = feed.agent_label({"agent_id": "a1b2c3"}, amap)
+        two = feed.agent_label({"agent_id": "d4e5f6"}, amap)
+        assert one == "a1b2 Airflow statsd check"
+        assert two == "d4e5 Airflow statsd check"
+        assert one != two
 
 
 def _make_session(projects_root, sid, *, agents, completed=(),
@@ -1720,6 +1731,7 @@ class TestSessionModal:
         assert "4819367e.jsonl" in out                        # transcript path
         assert "Search the tree" in out and "running" in out  # a running subagent
         assert "Review Phase 4" in out and "done" in out       # a done subagent
+        assert "run1" in out  # short agent id, to correlate with the feed
         assert "Subagents (2, 1 running)" in out
 
     def test_panel_empty_subagents_shows_placeholder(self):
