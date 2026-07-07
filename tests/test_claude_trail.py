@@ -170,18 +170,28 @@ class TestFormatTime:
 
 
 class TestShortPath:
-    def test_short_cwd(self):
-        assert feed.short_path("/home/user/proj") == ".../proj"
+    def test_whole_path_when_it_fits(self):
+        # short enough to show in full (<= DIR_LABEL_WIDTH)
+        assert feed.short_path("/tmp/x") == "/tmp/x"
 
-    def test_long_cwd(self):
-        result = feed.short_path("/home/user/very-long-directory-name")
-        assert result.startswith(".../")
-        # Truncates the name portion to 10 chars
-        name_part = result[4:]
-        assert len(name_part) == 10
+    def test_keeps_trailing_dir_intact(self):
+        # the distinctive tail survives; leading `…/` marks the elided parents
+        assert (feed.short_path("/home/naka/Projects/personal/claude-trail")
+                == "…/claude-trail")
+
+    def test_grows_leftward_to_a_component_boundary(self):
+        # more than one trailing component when they fit, never a partial parent
+        result = feed.short_path("/home/user/proj", width=14)
+        assert result == "…/user/proj"
+
+    def test_long_single_component_keeps_its_end(self):
+        result = feed.short_path("/home/user/very-long-directory-name", width=14)
+        assert result.startswith("…")
+        assert len(result) == 14
+        assert result.endswith("name")  # the distinctive end, not the start
 
     def test_empty(self):
-        assert feed.short_path("") == ".../"
+        assert feed.short_path("") == ""
 
 
 class TestSessionLabel:
@@ -1078,7 +1088,7 @@ class TestRendering:
 
     def test_empty_shows_waiting(self):
         out = self._text(feed.build_panel([], 40, self.ALL, 0))
-        assert "Waiting for commands..." in out
+        assert "Waiting for commands…" in out
 
     def test_dangerous_entry_has_marker(self):
         out = self._text(feed.build_panel([self._entry(command="rm -rf /tmp/x")], 40, self.ALL, 0))

@@ -73,6 +73,9 @@ AGENT_TOOLUSE_BYTE_CAP = 512 * 1024  # cap per agent transcript when counting to
 # session modal). Placed first in the label so it survives the Agent column's
 # ellipsis: two subagents sharing a description still read as distinct.
 AGENT_ID_LABEL_LEN = 4
+# Directory column width; short_path left-truncates the cwd to this, keeping the
+# distinctive tail (the actual dir) visible. Kept in sync with the Column below.
+DIR_LABEL_WIDTH = 14
 ACTIVE_WINDOW_SECONDS = 300  # a session counts as active if seen within this window
 SEARCH_RESULT_LIMIT = 500  # max hits kept per search; the rest are dropped (capped)
 SEARCH_TIMEOUT = 5.0  # seconds before rg/grep is killed so a huge tree can't hang the UI
@@ -254,7 +257,8 @@ COLUMNS = [
            {"width": 20, "no_wrap": True, "overflow": "ellipsis"}, _render_session),
     Column(6, "Agent", "cyan",
            {"width": 24, "no_wrap": True, "overflow": "ellipsis"}, _render_agent),
-    Column(3, "Directory", "green", {"width": 14, "no_wrap": True}, _render_directory),
+    Column(3, "Directory", "green", {"width": DIR_LABEL_WIDTH, "no_wrap": True},
+           _render_directory),
     Column(4, "Files", "yellow",
            {"width": 20, "no_wrap": True, "overflow": "ellipsis"}, _render_files),
     Column(5, "Command", "white",
@@ -317,12 +321,29 @@ def extract_files(cmd: str) -> str:
     return result
 
 
-def short_path(cwd: str) -> str:
-    """Show .../last_dir, truncated to 10 chars."""
-    name = os.path.basename(cwd) or cwd
-    if len(name) > 10:
-        return ".../" + name[:10]
-    return ".../" + name
+def short_path(cwd: str, width: int = DIR_LABEL_WIDTH) -> str:
+    """The tail of `cwd`, so the distinctive end of the path stays visible.
+
+    Returns the whole path when it fits `width`; otherwise as many trailing
+    components as fit after a leading `…`, e.g.
+    `/home/naka/Projects/personal/claude-trail` -> `…/claude-trail`. A single
+    trailing component too long on its own is left-truncated so its end (the
+    part that tells dirs apart) survives: `…ng-directory-name`."""
+    path = (cwd or "").rstrip("/")
+    if not path:
+        return cwd or ""
+    if len(path) <= width:
+        return path
+    parts = [p for p in path.split("/") if p]
+    tail = parts[-1] if parts else path
+    if len(tail) + 2 > width:  # 2 = leading `…/`; the component alone overflows
+        return "…" + tail[-(width - 1):]
+    for part in reversed(parts[:-1]):  # grow leftward while `…/<tail>` still fits
+        candidate = part + "/" + tail
+        if len(candidate) + 2 > width:
+            break
+        tail = candidate
+    return "…/" + tail
 
 
 # ==== Session names ====
@@ -1395,7 +1416,7 @@ def build_panel(
     max_rows = visible_row_count(term_height)
 
     if not entries:
-        content = Text("Waiting for commands...\n\n", style="dim italic")
+        content = Text("Waiting for commands…\n\n", style="dim italic")
         content.append("Make sure the hook is configured in ~/.claude/settings.json\n", style="dim")
         content.append(f"Watching: {LOG_PATH}", style="dim")
     else:
