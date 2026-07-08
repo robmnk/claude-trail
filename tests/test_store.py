@@ -3,9 +3,11 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pytest
+
 import claude_trail_store as store
 
-# The 12 objects the schema bootstrap must create: 8 tables + 4 views. Both show
+# The 13 objects the schema bootstrap must create: 9 tables + 4 views. Both show
 # up in information_schema.tables (views included), so one membership check
 # covers the whole schema.
 EXPECTED_OBJECTS = {
@@ -14,6 +16,7 @@ EXPECTED_OBJECTS = {
     "blobs",
     "command_tokens",
     "events",
+    "file_history",
     "file_versions",
     "ingest_state",
     "raw_events",
@@ -22,6 +25,15 @@ EXPECTED_OBJECTS = {
     "session_tokens",
     "sessions",
 }
+
+
+@pytest.fixture(autouse=True)
+def _isolate_file_history(tmp_path, monkeypatch):
+    """Point FILE_HISTORY_DIR at a nonexistent dir by default so any ingest_all in
+    the suite stays hermetic (the file-history pass returns early on a missing dir)
+    and never reads the developer's real ~/.claude/file-history. The Phase 8 tests
+    that exercise the backfill override this with their own populated tmp dir."""
+    monkeypatch.setattr(store, "FILE_HISTORY_DIR", tmp_path / "no-file-history")
 
 
 def test_schema_bootstraps_and_reopens_read_only(tmp_path, monkeypatch):
@@ -1058,3 +1070,390 @@ def test_cmd_diff_without_pytz(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert sid[:8] in out                                # header rendered
     assert "line two CHANGED" in out                     # the Edit's structuredPatch
+
+
+# --- File-history backfill (Task 8) -------------------------------------------
+#
+# Hermetic: PROJECTS_DIR, FILE_HISTORY_DIR, and STORE_PATH are all monkeypatched to
+# tmp_path (the autouse _isolate_file_history fixture already stubs FILE_HISTORY_DIR;
+# these tests override it with a populated dir). Fixtures mirror the real shapes
+# confirmed in Step 8.1: a file-history-snapshot transcript line carries NO top-level
+# sessionId and NO top-level timestamp (the session_id comes from the transcript
+# filename, the timestamp from trackedFileBackups.backupTime), and the on-disk file
+# is <pathhash>@vN where <pathhash> = sha256(abs_path)[:16].
+
+
+def _pathhash(p):
+    return store._sha(p)[:16]
+
+
+def _fh_snapshot_event(message_id, backups, ts="2026-07-01T10:00:00.000Z"):
+    """A file-history-snapshot transcript line as they REALLY appear (Step 8.1): no
+    top-level sessionId and no top-level timestamp. `backups` maps a file key ->
+    {backupFileName '<pathhash>@vN' | None, version, backupTime}."""
+    return {"type": "file-history-snapshot", "messageId": message_id,
+            "snapshot": {"messageId": message_id, "trackedFileBackups": backups,
+                         "timestamp": ts},
+            "isSnapshotUpdate": False}
+
+
+def _read_tool_use(uuid, sid, abspath, ts):
+    """An assistant Read tool_use line: snake_case file_path in tool_input, no
+    toolUseResult (so it yields NO file_versions row), used to seed the reverse
+    path index without an edit."""
+    return {"type": "assistant", "uuid": uuid, "requestId": "req-" + uuid,
+            "sessionId": sid, "timestamp": ts,
+            "message": {"role": "assistant", "model": "claude-opus-4-8", "id": "msg-" + uuid,
+                        "content": [{"type": "tool_use", "id": "toolu-" + uuid, "name": "Read",
+                                     "input": {"file_path": abspath}}],
+                        "usage": {"input_tokens": 1, "output_tokens": 1,
+                                  "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}}
+
+
+def _setup_fh(tmp_path, monkeypatch):
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "FILE_HISTORY_DIR", tmp_path / "file-history")
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    return projects, tmp_path / "file-history"
+
+
+def _write_fh_files(fh_dir, sid, files):
+    """Write on-disk snapshot files {backupFileName: str-or-bytes} under <sid>/."""
+    d = fh_dir / sid
+    d.mkdir(parents=True, exist_ok=True)
+    for name, content in files.items():
+        p = d / name
+        p.write_bytes(content) if isinstance(content, bytes) else p.write_text(content, encoding="utf-8")
+
+
+def test_file_history_core_lift(tmp_path, monkeypatch, capsys):
+    """The point of the phase: a path that is patch-only in transcripts (an Edit
+    with originalFile null) becomes cat-able to its snapshot content. After
+    ingest_all the two snapshots are blobs, file_history has 2 rows, file_versions
+    has source='file-history' rows with post_sha, and cat returns the v2 content
+    (previously exited 1 = no stored version)."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    sid = "sess-fh-core-0001"
+    path = "/home/naka/proj/core.py"
+    ph = _pathhash(path)
+    v1, v2 = "line1\nline2\n", "line1\nline2 CHANGED\nline3\n"
+    _write_fh_files(fh_dir, sid, {f"{ph}@v1": v1, f"{ph}@v2": v2})
+    events = [
+        _fh_snapshot_event("m1", {path: {"backupFileName": f"{ph}@v1", "version": 1,
+                                         "backupTime": "2026-07-01T10:00:01.000Z"}}),
+        _fh_snapshot_event("m2", {path: {"backupFileName": f"{ph}@v2", "version": 2,
+                                         "backupTime": "2026-07-01T10:00:02.000Z"}}),
+        _edit_result_null_original_event(sid, "fh-core-edit", path),  # patch-only Edit, same path
+    ]
+    _write_jsonl(projects / "-proj" / f"{sid}.jsonl", events)
+
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        def count(sql):
+            return con.execute(sql).fetchone()[0]
+        assert count("SELECT count(*) FROM file_history") == 2
+        assert count("SELECT count(*) FROM blobs") == 2                 # v1 + v2 preserved
+        assert count("SELECT count(*) FROM file_versions "
+                     "WHERE source='file-history' AND post_sha IS NOT NULL") == 2
+        # the transcript Edit is still there, patch-only (null post_sha), source stamped
+        assert con.execute("SELECT count(*) FROM file_versions WHERE source='transcript' "
+                           "AND post_sha IS NULL AND path=?", [path]).fetchone()[0] == 1
+    finally:
+        con.close()
+
+    capsys.readouterr()                                                # drop the ingest progress line
+    assert store.cmd_cat(["cat", path]) == 0
+    assert capsys.readouterr().out == v2                               # newest cat-able version
+
+
+def test_file_history_b1_pre_sha_and_gap_chaining(tmp_path, monkeypatch):
+    """B1: a group whose first present version is @v2 gets pre_sha NULL / no patch;
+    a @v2 + @v4 group (interior gap) chains v4.pre_sha to v2's blob with a difflib
+    patch. Never assumes v-1 exists."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    sid = "sess-fh-b1-0001"
+    pa, pb = "/home/naka/proj/only_v2.py", "/home/naka/proj/gap.py"
+    pha, phb = _pathhash(pa), _pathhash(pb)
+    a2, b2, b4 = "only v2\n", "b line\n", "b line\nb line 4\n"
+    _write_fh_files(fh_dir, sid, {f"{pha}@v2": a2, f"{phb}@v2": b2, f"{phb}@v4": b4})
+    events = [
+        _fh_snapshot_event("mA", {pa: {"backupFileName": f"{pha}@v2", "version": 2,
+                                       "backupTime": "2026-07-01T11:00:02.000Z"}}),
+        _fh_snapshot_event("mB2", {pb: {"backupFileName": f"{phb}@v2", "version": 2,
+                                        "backupTime": "2026-07-01T11:00:02.000Z"}}),
+        _fh_snapshot_event("mB4", {pb: {"backupFileName": f"{phb}@v4", "version": 4,
+                                        "backupTime": "2026-07-01T11:00:04.000Z"}}),
+    ]
+    _write_jsonl(projects / "-proj" / f"{sid}.jsonl", events)
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        a = con.execute("SELECT pre_sha, patch FROM file_versions "
+                        "WHERE source='file-history' AND path=?", [pa]).fetchall()
+        assert len(a) == 1 and a[0][0] is None and a[0][1] is None      # @v2-only: no predecessor
+        b = con.execute("SELECT pre_sha, post_sha, patch FROM file_versions "
+                        "WHERE source='file-history' AND path=? ORDER BY ts", [pb]).fetchall()
+        assert len(b) == 2
+        (v2_pre, v2_post, v2_patch), (v4_pre, v4_post, v4_patch) = b
+        assert v2_pre is None and v2_patch is None                      # v2 first present in group
+        assert v4_pre == v2_post                                        # B1 across the gap
+        assert v4_patch is not None and "b line 4" in v4_patch          # difflib patch present
+    finally:
+        con.close()
+
+
+def test_file_history_b2_both_source_values(tmp_path, monkeypatch):
+    """B2: after a mixed ingest a transcript row is source='transcript' and a
+    file-history row is source='file-history' (the phase's own coverage stat relies
+    on the transcript rows NOT landing source=NULL)."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    sid = "sess-fh-b2-0001"
+    fh_path, edit_path = "/home/naka/proj/snap.py", "/tmp/b2_edit.py"
+    ph = _pathhash(fh_path)
+    _write_fh_files(fh_dir, sid, {f"{ph}@v1": "snap v1\n"})
+    events = [
+        _fh_snapshot_event("mS", {fh_path: {"backupFileName": f"{ph}@v1", "version": 1,
+                                            "backupTime": "2026-07-01T12:00:01.000Z"}}),
+        _edit_result_event(sid, "b2-edit", edit_path),                  # transcript Edit (real pre/post)
+    ]
+    _write_jsonl(projects / "-proj" / f"{sid}.jsonl", events)
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        assert con.execute("SELECT source FROM file_versions WHERE path=?",
+                           [edit_path]).fetchone()[0] == "transcript"
+        assert con.execute("SELECT source FROM file_versions WHERE path=?",
+                           [fh_path]).fetchone()[0] == "file-history"
+    finally:
+        con.close()
+
+
+def test_file_history_m3_resolves_via_read_tool_input(tmp_path, monkeypatch):
+    """M3: a snapshot referenced by a RELATIVE key, whose path appears ONLY in a Read
+    tool_use.tool_input (snake_case file_path, no file_versions row), still resolves
+    via the pathhash reverse-index."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    sid = "sess-fh-m3-0001"
+    abspath = "/home/naka/proj/read_only.py"
+    ph = _pathhash(abspath)
+    _write_fh_files(fh_dir, sid, {f"{ph}@v1": "readonly v1\n"})
+    events = [
+        _read_tool_use("m3read", sid, abspath, "2026-07-01T13:00:00.000Z"),
+        _fh_snapshot_event("mR", {"read_only.py": {"backupFileName": f"{ph}@v1", "version": 1,
+                                                   "backupTime": "2026-07-01T13:00:01.000Z"}}),
+    ]
+    _write_jsonl(projects / "-proj" / f"{sid}.jsonl", events)
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        assert con.execute("SELECT count(*) FROM file_versions WHERE source='transcript' "
+                           "AND path=?", [abspath]).fetchone()[0] == 0     # Read is not an edit
+        assert con.execute("SELECT path FROM file_history WHERE pathhash=?",
+                           [ph]).fetchone()[0] == abspath                  # resolved anyway
+        assert con.execute("SELECT count(*) FROM file_versions WHERE source='file-history' "
+                           "AND path=?", [abspath]).fetchone()[0] == 1
+    finally:
+        con.close()
+
+
+def test_file_history_deferred_resolution(tmp_path, monkeypatch):
+    """Deferred resolution: an unresolved snapshot is still preserved (blob stored,
+    file_history.path NULL, no file_versions row); a later sweep that reveals the
+    path fills it and emits the file-history file_versions row."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    sid = "sess-fh-defer-0001"
+    abspath = "/home/naka/proj/deferred.py"
+    ph = _pathhash(abspath)
+    _write_fh_files(fh_dir, sid, {f"{ph}@v1": "deferred v1\n"})
+    transcript = projects / "-proj" / f"{sid}.jsonl"
+    _write_jsonl(transcript, [                                            # relative key, path unknown
+        _fh_snapshot_event("mD", {"deferred.py": {"backupFileName": f"{ph}@v1", "version": 1,
+                                                  "backupTime": "2026-07-01T14:00:01.000Z"}})])
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        assert con.execute("SELECT count(*) FROM blobs").fetchone()[0] == 1              # preserved
+        assert con.execute("SELECT path FROM file_history WHERE pathhash=?", [ph]).fetchone()[0] is None
+        assert con.execute("SELECT count(*) FROM file_versions "
+                           "WHERE source='file-history'").fetchone()[0] == 0
+
+        with open(transcript, "a", encoding="utf-8") as f:               # reveal the path (a Read)
+            f.write(json.dumps(_read_tool_use("mDr", sid, abspath, "2026-07-01T14:05:00.000Z")) + "\n")
+        store.ingest_all(con)
+        assert con.execute("SELECT path FROM file_history WHERE pathhash=?",
+                           [ph]).fetchone()[0] == abspath
+        assert con.execute("SELECT count(*) FROM file_versions WHERE source='file-history' "
+                           "AND path=?", [abspath]).fetchone()[0] == 1
+    finally:
+        con.close()
+
+
+def test_file_history_idempotent(tmp_path, monkeypatch):
+    """Re-running leaves file_history, file_versions, and blobs counts all unchanged
+    (immutable-PK skip + anti-join dedup), including a direct ingest_file_history
+    call that does not touch ingest_state."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    sid = "sess-fh-idem-0001"
+    path = "/home/naka/proj/idem.py"
+    ph = _pathhash(path)
+    _write_fh_files(fh_dir, sid, {f"{ph}@v1": "v1\n", f"{ph}@v2": "v1\nv2\n"})
+    events = [
+        _fh_snapshot_event("mi1", {path: {"backupFileName": f"{ph}@v1", "version": 1,
+                                          "backupTime": "2026-07-01T15:00:01.000Z"}}),
+        _fh_snapshot_event("mi2", {path: {"backupFileName": f"{ph}@v2", "version": 2,
+                                          "backupTime": "2026-07-01T15:00:02.000Z"}}),
+    ]
+    _write_jsonl(projects / "-proj" / f"{sid}.jsonl", events)
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        def snap():
+            return (con.execute("SELECT count(*) FROM file_history").fetchone()[0],
+                    con.execute("SELECT count(*) FROM file_versions").fetchone()[0],
+                    con.execute("SELECT count(*) FROM blobs").fetchone()[0])
+        first = snap()
+        assert first[0] == 2 and first[2] == 2
+        store.ingest_all(con)
+        assert snap() == first                                           # full re-sweep: unchanged
+        store.ingest_file_history(con)                                   # direct pass: unchanged
+        assert snap() == first
+    finally:
+        con.close()
+
+
+def test_file_history_schema1_migration(tmp_path, monkeypatch):
+    """A schema-1 (0.6.0) DB upgrades in place on reopen: the source column is added
+    and backfills existing rows with 'transcript', file_history exists, and the
+    stored schema version becomes '2' (the ON CONFLICT DO UPDATE fix)."""
+    import duckdb
+    db = tmp_path / "trail.duckdb"
+    monkeypatch.setattr(store, "STORE_PATH", db)
+    raw = duckdb.connect(str(db))
+    raw.execute("CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT)")
+    raw.execute("INSERT INTO schema_meta VALUES ('version', '1')")
+    raw.execute("CREATE TABLE file_versions(event_id TEXT, session_id TEXT, ts TIMESTAMPTZ, "
+                "path TEXT, pre_sha TEXT, post_sha TEXT, patch TEXT)")   # no `source` column
+    raw.execute("INSERT INTO file_versions VALUES ('e1','s1', NULL, '/p/a.py', NULL, 'abc', NULL)")
+    raw.close()
+
+    con = store.connect()                                               # runs the migration
+    try:
+        assert con.execute("SELECT source FROM file_versions WHERE event_id='e1'").fetchone()[0] == "transcript"
+        assert con.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()[0] == "2"
+        assert con.execute("SELECT count(*) FROM information_schema.tables "
+                           "WHERE table_name='file_history'").fetchone()[0] == 1
+    finally:
+        con.close()
+
+
+def test_file_history_cross_session_cat_newest_ts(tmp_path, monkeypatch, capsys):
+    """The same path snapshotted under two session dirs: cat picks the newest
+    backupTime across them."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    path = "/home/naka/proj/shared.py"
+    ph = _pathhash(path)
+    sid1, sid2 = "sess-fh-x-0001", "sess-fh-x-0002"
+    old, new = "old session content\n", "new session content\n"
+    _write_fh_files(fh_dir, sid1, {f"{ph}@v1": old})
+    _write_fh_files(fh_dir, sid2, {f"{ph}@v1": new})
+    _write_jsonl(projects / "-proj" / f"{sid1}.jsonl",
+                 [_fh_snapshot_event("mx1", {path: {"backupFileName": f"{ph}@v1", "version": 1,
+                                                    "backupTime": "2026-07-01T09:00:00.000Z"}})])
+    _write_jsonl(projects / "-proj" / f"{sid2}.jsonl",
+                 [_fh_snapshot_event("mx2", {path: {"backupFileName": f"{ph}@v1", "version": 1,
+                                                    "backupTime": "2026-07-02T09:00:00.000Z"}})])
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        assert con.execute("SELECT count(*) FROM file_history WHERE pathhash=?",
+                           [ph]).fetchone()[0] == 2                      # distinct (session, ...) PKs
+    finally:
+        con.close()
+    capsys.readouterr()
+    assert store.cmd_cat(["cat", path]) == 0
+    assert capsys.readouterr().out == new                               # newer backupTime wins
+
+
+def test_file_history_empty_snapshot_and_null_backupfilename(tmp_path, monkeypatch):
+    """An empty snapshot is a real blob (sha of "") with a resolved row; a
+    trackedFileBackups entry whose backupFileName is null is skipped entirely."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    sid = "sess-fh-empty-0001"
+    empty_path, null_path = "/home/naka/proj/empty.py", "/home/naka/proj/not_backed.py"
+    phe = _pathhash(empty_path)
+    _write_fh_files(fh_dir, sid, {f"{phe}@v1": ""})
+    events = [_fh_snapshot_event("me", {
+        empty_path: {"backupFileName": f"{phe}@v1", "version": 1, "backupTime": "2026-07-01T16:00:01.000Z"},
+        null_path:  {"backupFileName": None, "version": 1, "backupTime": "2026-07-01T16:00:02.000Z"},
+    })]
+    _write_jsonl(projects / "-proj" / f"{sid}.jsonl", events)
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        empty_sha = store._sha("")
+        assert con.execute("SELECT count(*) FROM blobs WHERE sha=?", [empty_sha]).fetchone()[0] == 1
+        assert con.execute("SELECT sha FROM file_history WHERE pathhash=?", [phe]).fetchone()[0] == empty_sha
+        assert con.execute("SELECT count(*) FROM file_history WHERE pathhash=?",
+                           [_pathhash(null_path)]).fetchone()[0] == 0    # null backupFileName skipped
+        assert con.execute("SELECT count(*) FROM file_history").fetchone()[0] == 1
+    finally:
+        con.close()
+
+
+def test_file_history_binary_snapshot_skipped(tmp_path, monkeypatch):
+    """A non-UTF-8 snapshot (0 today) is recorded as a file_history row with sha NULL
+    and note='binary-skipped', with no blob and no file_versions row (lossy
+    errors='replace' would betray the preservation framing)."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    sid = "sess-fh-bin-0001"
+    path = "/home/naka/proj/blob.bin"
+    ph = _pathhash(path)
+    _write_fh_files(fh_dir, sid, {f"{ph}@v1": b"\xff\xfe\x00\x01binary"})
+    events = [_fh_snapshot_event("mbin", {path: {"backupFileName": f"{ph}@v1", "version": 1,
+                                                 "backupTime": "2026-07-01T17:00:01.000Z"}})]
+    _write_jsonl(projects / "-proj" / f"{sid}.jsonl", events)
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        assert con.execute("SELECT sha, note FROM file_history WHERE pathhash=?",
+                           [ph]).fetchone() == (None, "binary-skipped")
+        assert con.execute("SELECT count(*) FROM blobs").fetchone()[0] == 0
+        assert con.execute("SELECT count(*) FROM file_versions "
+                           "WHERE source='file-history'").fetchone()[0] == 0
+    finally:
+        con.close()
+
+
+def test_file_history_diff_default_hides_all_sources_shows(tmp_path, monkeypatch, capsys):
+    """diff hides file-history rows by default; --all-sources shows them, printing
+    only rows whose patch is non-null (the headless first snapshot is skipped)."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    sid = "sess-fh-diff-0001"
+    path = "/home/naka/proj/diffme.py"
+    ph = _pathhash(path)
+    v2, v3 = "a\nb\n", "a\nb\nc ADDED\n"
+    _write_fh_files(fh_dir, sid, {f"{ph}@v2": v2, f"{ph}@v3": v3})
+    events = [
+        _fh_snapshot_event("md2", {path: {"backupFileName": f"{ph}@v2", "version": 2,
+                                          "backupTime": "2026-07-01T18:00:02.000Z"}}),
+        _fh_snapshot_event("md3", {path: {"backupFileName": f"{ph}@v3", "version": 3,
+                                          "backupTime": "2026-07-01T18:00:03.000Z"}}),
+    ]
+    _write_jsonl(projects / "-proj" / f"{sid}.jsonl", events)
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+    finally:
+        con.close()
+
+    capsys.readouterr()
+    assert store.cmd_diff(["diff", path]) == 0                          # default: file-history hidden
+    default_out = capsys.readouterr().out
+    assert "c ADDED" not in default_out and sid[:8] not in default_out
+
+    assert store.cmd_diff(["diff", path, "--all-sources"]) == 0
+    all_out = capsys.readouterr().out
+    assert "c ADDED" in all_out                                         # v3's difflib patch shows
+    assert all_out.count(sid[:8]) == 1                                  # v2 (null patch) skipped
