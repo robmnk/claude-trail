@@ -784,19 +784,50 @@ def cmd_stats(argv):
     return 0
 
 
+# --- Reconstruction CLI: cat / diff (Task 6) ----------------------------------
+
+
 def cmd_cat(argv):
-    # Stub until Phase 6 (file reconstruction over file_versions/blobs). Kept here
-    # only so cli_main's dispatch dict resolves; Phase 6 replaces it with the real
-    # `cat <path>` reconstruction command.
-    print("cat: file reconstruction is not available until phase 6")
+    # usage: cat <path> [--session S] [--at ISO]  -> latest content at/before --at.
+    # The JOIN on post_sha naturally skips patch-only versions (null post_sha), so
+    # this returns the latest version that actually has reconstructable bytes.
+    args = argv[1:]
+    path = args[0]
+    def opt(n):
+        return args[args.index(n) + 1] if n in args and args.index(n) + 1 < len(args) else None
+    where, params = ["fv.path = ?"], [path]
+    if opt("--session"): where.append("fv.session_id LIKE ?"); params.append(opt("--session") + "%")
+    if opt("--at"):      where.append("fv.ts <= ?");           params.append(opt("--at"))
+    sql = (f"SELECT b.content FROM file_versions fv JOIN blobs b ON b.sha = fv.post_sha "
+           f"WHERE {' AND '.join(where)} ORDER BY fv.ts DESC LIMIT 1")
+    con = connect(read_only=True)
+    try:
+        row = con.execute(sql, params).fetchone()
+    finally:
+        con.close()
+    if not row:
+        print("no stored version for that path/time")
+        return 1
+    print(row[0], end="")
     return 0
 
 
 def cmd_diff(argv):
-    # Stub until Phase 6 (file reconstruction over file_versions/blobs). Kept here
-    # only so cli_main's dispatch dict resolves; Phase 6 replaces it with the real
-    # `diff <path>` reconstruction command.
-    print("diff: file reconstruction is not available until phase 6")
+    # usage: diff <path> [--session S]  -> chronological list of edits with patches
+    args = argv[1:]
+    path = args[0]
+    def opt(n):
+        return args[args.index(n) + 1] if n in args and args.index(n) + 1 < len(args) else None
+    where, params = ["path = ?"], [path]
+    if opt("--session"): where.append("session_id LIKE ?"); params.append(opt("--session") + "%")
+    sql = (f"SELECT ts, substr(session_id,1,8), patch FROM file_versions "
+           f"WHERE {' AND '.join(where)} ORDER BY ts")
+    con = connect(read_only=True)
+    try:
+        for ts, sid, patch in con.execute(sql, params).fetchall():
+            print(f"=== {ts}  {sid} ===\n{patch or '(no patch)'}\n")
+    finally:
+        con.close()
     return 0
 
 
