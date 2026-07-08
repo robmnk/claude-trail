@@ -755,6 +755,33 @@ def _read_snapshot(path):
         return (None, "binary-skipped")
 
 
+def _mtime_ts(path):
+    """On-disk mtime as a tz-aware UTC datetime, or None if the file is gone. The
+    timestamp fallback when trackedFileBackups.backupTime is missing or unparseable."""
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        return None
+
+
+def _parse_snapshot_ts(btime):
+    """Validate a trackedFileBackups.backupTime and return a value bindable into the
+    snapshot_ts TIMESTAMPTZ column (the original ISO string when well-formed), or
+    None when it is missing / not a string / unparseable. A bad backupTime must
+    NEVER abort the sweep: the entry lives permanently in raw_events, so letting the
+    ConversionException fire at the bind would wedge every future ingest with no
+    self-heal (violating the plan's skip-and-continue contract). A NULL snapshot_ts
+    flows safely through epoch_ms / cat, and the snapshot bytes are still preserved
+    as a blob + file_history row."""
+    if not isinstance(btime, str):
+        return None
+    try:
+        datetime.fromisoformat(btime.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return btime
+
+
 def _fh_row(sid, pathhash, version, sha, ts, note):
     return {"session_id": sid, "pathhash": pathhash, "version": version,
             "path": None, "sha": sha, "snapshot_ts": ts, "note": note}
@@ -819,59 +846,70 @@ def ingest_file_history(con):
     snapshots this sweep) or unresolved (path IS NULL) rows remain; the residual
     per-sweep cost is a directory walk plus a raw_events scan, which is acceptable.
     """
-    if not FILE_HISTORY_DIR.exists():
-        return (0, 0)
-
     existing = set(con.execute(
         "SELECT session_id, pathhash, version FROM file_history").fetchall())
 
     # Authoritative driver first (trackedFileBackups), deduped by PK: the same
     # (session, file, version) recurs across many snapshot events with an identical
-    # backupTime, so first-seen wins.
+    # backupTime, so first-seen wins. This scans raw_events, NOT the on-disk dir, so
+    # it runs even after file-history has been pruned: its keys still drive deferred
+    # path resolution for the snapshots already preserved in file_history.
     records = {}
     for sid, ph, ver, bfn, btime, key in _snapshot_records(con):
         records.setdefault((sid, ph, ver), (bfn, btime, key))
 
     new_rows, new_count = [], 0
-    for (sid, ph, ver), (bfn, btime, key) in records.items():
-        if (sid, ph, ver) in existing:
-            continue                       # immutable: never re-read
-        got = _read_snapshot(FILE_HISTORY_DIR / sid / bfn)
-        if got is None:
-            continue                       # referenced file gone (rare); skip
-        content, note = got
-        sha = _put_blob(con, content) if content is not None else None
-        new_rows.append(_fh_row(sid, ph, ver, sha, btime, note))
-        new_count += 1
+    # Disk-reading passes only when the file-history dir still exists. When it has
+    # been pruned (the loss scenario this phase insures against), the snapshots are
+    # already preserved as blobs, so we skip straight to promotion + emit below so
+    # deferred resolution of the stored rows keeps working.
+    if FILE_HISTORY_DIR.exists():
+        for (sid, ph, ver), (bfn, btime, key) in records.items():
+            if (sid, ph, ver) in existing:
+                continue                   # immutable: never re-read
+            snap_path = FILE_HISTORY_DIR / sid / bfn
+            got = _read_snapshot(snap_path)
+            if got is None:
+                continue                   # referenced file gone (rare); skip
+            content, note = got
+            sha = _put_blob(con, content) if content is not None else None
+            ts = _parse_snapshot_ts(btime)
+            if ts is None:                 # bad/absent backupTime: fall back to mtime
+                ts = _mtime_ts(snap_path)
+            new_rows.append(_fh_row(sid, ph, ver, sha, ts, note))
+            new_count += 1
 
-    # Fallback for on-disk files with no trackedFileBackups entry (transcript gone;
-    # 0 today). Uses mtime (UTC-normalized) since backupTime is unavailable.
-    for f in FILE_HISTORY_DIR.glob("*/*"):
-        m = _FH_NAME_RE.match(f.name)
-        if not m:
-            continue
-        pk = (f.parent.name, m.group(1), int(m.group(2)))
-        if pk in existing or pk in records:
-            continue
-        got = _read_snapshot(f)
-        if got is None:
-            continue
-        content, note = got
-        try:
-            ts = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
-        except OSError:
-            continue
-        sha = _put_blob(con, content) if content is not None else None
-        new_rows.append(_fh_row(pk[0], pk[1], pk[2], sha, ts, note))
-        new_count += 1
+        # Fallback for on-disk files with no trackedFileBackups entry (transcript
+        # gone; 0 today). Uses mtime (UTC-normalized) since backupTime is unavailable.
+        for f in FILE_HISTORY_DIR.glob("*/*"):
+            m = _FH_NAME_RE.match(f.name)
+            if not m:
+                continue
+            pk = (f.parent.name, m.group(1), int(m.group(2)))
+            if pk in existing or pk in records:
+                continue
+            got = _read_snapshot(f)
+            if got is None:
+                continue
+            content, note = got
+            ts = _mtime_ts(f)
+            if ts is None:
+                continue
+            sha = _put_blob(con, content) if content is not None else None
+            new_rows.append(_fh_row(pk[0], pk[1], pk[2], sha, ts, note))
+            new_count += 1
 
-    if new_rows:
-        _insert_file_history(con, new_rows)
+        if new_rows:
+            _insert_file_history(con, new_rows)
 
-    # Promotion (deferred resolution) + emit. Only when there is new work or
-    # unresolved rows remain, so an idle --watch sweep does nothing here.
+    # Promotion (deferred resolution) + emit. Runs regardless of the dir's presence
+    # (so pruned-dir rows still resolve), gated on new work or any unresolved row so
+    # an idle --watch sweep does nothing here. Count every path-less row, not just
+    # the ones with a blob: a binary-skipped row (sha NULL) still needs its path
+    # backfilled, and dropping the sha condition keeps the promotion pass alive until
+    # it is learned (the emit query below still filters sha IS NOT NULL).
     unresolved = con.execute(
-        "SELECT count(*) FROM file_history WHERE path IS NULL AND sha IS NOT NULL").fetchone()[0]
+        "SELECT count(*) FROM file_history WHERE path IS NULL").fetchone()[0]
     resolved = 0
     if new_rows or unresolved:
         known = _known_paths(con)
@@ -1167,15 +1205,23 @@ def cmd_diff(argv):
         return args[args.index(n) + 1] if n in args and args.index(n) + 1 < len(args) else None
     where, params = ["path = ?"], [path]
     if opt("--session"): where.append("session_id LIKE ?"); params.append(opt("--session") + "%")
-    if not all_sources:
-        where.append("source IS DISTINCT FROM 'file-history'")
-    # strftime(ts) instead of raw ts: DuckDB needs the optional `pytz` package to
-    # materialize a TIMESTAMPTZ into a Python datetime, so fetching the raw column
-    # crashes on a clean install without pytz. The header only needs the string.
-    sql = (f"SELECT strftime(ts,'%Y-%m-%d %H:%M:%S'), substr(session_id,1,8), patch "
-           f"FROM file_versions WHERE {' AND '.join(where)} ORDER BY ts")
     con = connect(read_only=True)
     try:
+        # Guard the source filter behind the same information_schema check cmd_stats
+        # uses: a not-yet-migrated 0.6.0 DB opened read-only has no `source` column,
+        # and referencing it would raise a binder error (readers never run DDL, so
+        # the column stays absent until a writable ingest). A pre-migration DB holds
+        # only transcript rows, so skipping the filter is semantically identical.
+        has_source = "source" in {r[0] for r in con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name='file_versions'").fetchall()}
+        if has_source and not all_sources:
+            where.append("source IS DISTINCT FROM 'file-history'")
+        # strftime(ts) instead of raw ts: DuckDB needs the optional `pytz` package to
+        # materialize a TIMESTAMPTZ into a Python datetime, so fetching the raw column
+        # crashes on a clean install without pytz. The header only needs the string.
+        sql = (f"SELECT strftime(ts,'%Y-%m-%d %H:%M:%S'), substr(session_id,1,8), patch "
+               f"FROM file_versions WHERE {' AND '.join(where)} ORDER BY ts")
         for ts, sid, patch in con.execute(sql, params).fetchall():
             if all_sources and patch is None:
                 continue                     # skip headless/NULL-patch file-history rows

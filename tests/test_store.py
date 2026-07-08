@@ -1457,3 +1457,132 @@ def test_file_history_diff_default_hides_all_sources_shows(tmp_path, monkeypatch
     all_out = capsys.readouterr().out
     assert "c ADDED" in all_out                                         # v3's difflib patch shows
     assert all_out.count(sid[:8]) == 1                                  # v2 (null patch) skipped
+
+
+def test_file_history_bad_backup_time_does_not_poison(tmp_path, monkeypatch):
+    """Major 2 regression: a non-string or unparseable trackedFileBackups.backupTime
+    must not abort ingest_all. The bad entry lives permanently in raw_events and is
+    re-read every sweep, so letting the TIMESTAMPTZ ConversionException fire at the
+    bind would wedge every future ingest with no self-heal. Instead the snapshot is
+    still preserved (blob + file_history row, timestamp fell back to on-disk mtime)
+    and a second sweep completes too."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    sid = "sess-fh-badts-0001"
+    p_dict, p_str = "/home/naka/proj/bad_dict.py", "/home/naka/proj/bad_str.py"
+    ph_dict, ph_str = _pathhash(p_dict), _pathhash(p_str)
+    _write_fh_files(fh_dir, sid, {f"{ph_dict}@v1": "dict ts\n", f"{ph_str}@v1": "str ts\n"})
+    # Absolute keys so both paths self-resolve; backupTime is garbage in two shapes:
+    # a non-string (dict) and a string that does not parse as ISO.
+    events = [_fh_snapshot_event("mbad", {
+        p_dict: {"backupFileName": f"{ph_dict}@v1", "version": 1, "backupTime": {"weird": "dict"}},
+        p_str:  {"backupFileName": f"{ph_str}@v1", "version": 1, "backupTime": "not-a-timestamp"},
+    })]
+    _write_jsonl(projects / "-proj" / f"{sid}.jsonl", events)
+    con = store.connect()
+    try:
+        store.ingest_all(con)                                            # must NOT raise
+        assert con.execute("SELECT count(*) FROM file_history").fetchone()[0] == 2
+        assert con.execute("SELECT count(*) FROM blobs").fetchone()[0] == 2   # bytes preserved
+        # snapshot_ts fell back to the on-disk mtime (non-null), and both rows emit a
+        # file-history file_versions row (the ts flowed through epoch_ms cleanly).
+        assert con.execute("SELECT count(*) FROM file_history "
+                           "WHERE snapshot_ts IS NOT NULL").fetchone()[0] == 2
+        assert con.execute("SELECT count(*) FROM file_versions WHERE source='file-history' "
+                           "AND post_sha IS NOT NULL").fetchone()[0] == 2
+        store.ingest_all(con)                                            # second sweep: no poison
+        assert con.execute("SELECT count(*) FROM file_history").fetchone()[0] == 2
+    finally:
+        con.close()
+
+
+def test_file_history_reader_guards_pre_migration(tmp_path, monkeypatch):
+    """Minor 3 (the regression that would have caught Major 1): a schema-1 (0.6.0)
+    store opened READ-ONLY, before any post-upgrade ingest, must not raise from
+    cmd_stats or cmd_diff. file_versions has no `source` column and there is no
+    file_history table (readers run no DDL, so neither appears until a writable
+    ingest), so both readers must guard their new queries via information_schema; the
+    diff crash was a BinderException on the unguarded `source IS DISTINCT FROM` clause."""
+    import duckdb
+    db = tmp_path / "trail.duckdb"
+    monkeypatch.setattr(store, "STORE_PATH", db)
+    raw = duckdb.connect(str(db))
+    raw.execute("CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT)")
+    raw.execute("INSERT INTO schema_meta VALUES ('version', '1')")
+    raw.execute("CREATE TABLE sessions(session_id TEXT)")            # base tables cmd_stats reads
+    raw.execute("CREATE TABLE events(tool_name TEXT)")
+    raw.execute("CREATE TABLE blobs(sha TEXT, size INTEGER)")
+    raw.execute("CREATE TABLE api_requests(output_tokens INTEGER)")
+    raw.execute("CREATE TABLE file_versions(event_id TEXT, session_id TEXT, ts TIMESTAMPTZ, "
+                "path TEXT, pre_sha TEXT, post_sha TEXT, patch TEXT)")   # no `source`, no file_history
+    raw.execute("INSERT INTO file_versions VALUES ('e1','s1', NULL, '/p/a.py', NULL, 'abc', NULL)")
+    raw.close()
+
+    assert store.cmd_stats(["stats"]) == 0                              # information_schema guards hold
+    assert store.cmd_diff(["diff", "/p/a.py"]) == 0                     # was BinderException on `source`
+
+
+def test_file_history_binary_skipped_path_promotes(tmp_path, monkeypatch):
+    """Minor 1: a binary-skipped snapshot (sha NULL) whose path is not yet known must
+    still have its path backfilled on a later sweep. The promotion trigger counts
+    every path-less row, not only those carrying a blob, so a binary row is not stuck
+    'unresolved' forever once its path becomes known (it emits no file_versions row
+    either way, but stats must stop reporting it unresolved)."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    sid = "sess-fh-binprom-0001"
+    abspath = "/home/naka/proj/binprom.bin"
+    ph = _pathhash(abspath)
+    _write_fh_files(fh_dir, sid, {f"{ph}@v1": b"\xff\xfe\x00bin"})       # non-UTF-8: binary-skipped
+    transcript = projects / "-proj" / f"{sid}.jsonl"
+    _write_jsonl(transcript, [                                           # relative key: path unknown
+        _fh_snapshot_event("mbp", {"binprom.bin": {"backupFileName": f"{ph}@v1", "version": 1,
+                                                   "backupTime": "2026-07-01T19:00:01.000Z"}})])
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        assert con.execute("SELECT sha, path FROM file_history WHERE pathhash=?",
+                           [ph]).fetchone() == (None, None)             # binary-skipped, path unknown
+
+        with open(transcript, "a", encoding="utf-8") as f:              # reveal the path (a Read)
+            f.write(json.dumps(_read_tool_use("mbpr", sid, abspath, "2026-07-01T19:05:00.000Z")) + "\n")
+        store.ingest_all(con)
+        assert con.execute("SELECT path FROM file_history WHERE pathhash=?",
+                           [ph]).fetchone()[0] == abspath               # promoted despite sha NULL
+        assert con.execute("SELECT count(*) FROM file_versions "
+                           "WHERE source='file-history'").fetchone()[0] == 0   # no emit for a null-sha row
+    finally:
+        con.close()
+
+
+def test_file_history_promotes_after_dir_pruned(tmp_path, monkeypatch):
+    """Minor 2: once a snapshot's bytes are preserved, deferred path resolution keeps
+    working even after ~/.claude/file-history is pruned (the exact loss scenario this
+    phase insures against). The disk-reading passes are gated on the dir, but
+    promotion + emit run regardless, so a later sweep that learns the path still
+    resolves the stored row and emits its file_versions row from the preserved blob."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    sid = "sess-fh-pruned-0001"
+    abspath = "/home/naka/proj/pruned.py"
+    ph = _pathhash(abspath)
+    _write_fh_files(fh_dir, sid, {f"{ph}@v1": "pruned v1\n"})
+    transcript = projects / "-proj" / f"{sid}.jsonl"
+    _write_jsonl(transcript, [                                          # relative key: path unknown
+        _fh_snapshot_event("mpr", {"pruned.py": {"backupFileName": f"{ph}@v1", "version": 1,
+                                                 "backupTime": "2026-07-01T20:00:01.000Z"}})])
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        assert con.execute("SELECT count(*) FROM blobs").fetchone()[0] == 1             # preserved
+        assert con.execute("SELECT path FROM file_history WHERE pathhash=?",
+                           [ph]).fetchone()[0] is None
+
+        # Prune file-history (point at a nonexistent dir) and reveal the path.
+        monkeypatch.setattr(store, "FILE_HISTORY_DIR", tmp_path / "pruned-away")
+        with open(transcript, "a", encoding="utf-8") as f:
+            f.write(json.dumps(_read_tool_use("mprr", sid, abspath, "2026-07-01T20:05:00.000Z")) + "\n")
+        store.ingest_all(con)
+        assert con.execute("SELECT path FROM file_history WHERE pathhash=?",
+                           [ph]).fetchone()[0] == abspath              # resolved despite the pruned dir
+        assert con.execute("SELECT count(*) FROM file_versions WHERE source='file-history' "
+                           "AND path=?", [abspath]).fetchone()[0] == 1  # emitted from the stored blob
+    finally:
+        con.close()
