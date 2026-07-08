@@ -4,8 +4,10 @@ Ingests transcripts (~/.claude/projects/**/*.jsonl) and file snapshots into a
 single local DuckDB file; provides substring/regex search and file
 reconstruction. Single-writer ingester, read-only readers.
 """
+import hashlib
 import json
 import os
+import time
 from pathlib import Path
 
 STORE_PATH = Path(os.environ.get("CLAUDE_TRAIL_DB", Path.home() / ".claude" / "trail.duckdb"))
@@ -269,3 +271,173 @@ def parse_usage(ev, agent_id=None):
         "cache_creation_tokens": u.get("cache_creation_input_tokens") or 0,
         "service_tier": u.get("service_tier"),
     }
+
+
+# --- Incremental ingester (Task 3) --------------------------------------------
+
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
+
+
+def _decode_project(transcript_path):
+    # dir names encode cwd: "-home-naka-Projects-personal" -> project label.
+    # Use the first component under PROJECTS_DIR: subagent transcripts live two
+    # levels deeper (<project>/<sid>/subagents/*.jsonl), so parent.name is wrong there.
+    try:
+        name = transcript_path.relative_to(PROJECTS_DIR).parts[0]
+    except ValueError:
+        name = transcript_path.parent.name
+    return name.replace("-", "/", 1).replace("-", "/") if name.startswith("-") else name
+
+
+def _sha(text: str) -> str:            # also reused for blobs in Task 5
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+
+
+def _insert_raw(con, raw_rows):
+    """Persist original transcript lines verbatim, idempotent on uuid."""
+    raw_rows = list({r[0]: r for r in raw_rows}.values())  # ON CONFLICT skips existing rows, not dups within one insert
+    con.execute("CREATE TEMP TABLE IF NOT EXISTS _raw_stage AS SELECT * FROM raw_events WHERE 0=1")
+    con.execute("DELETE FROM _raw_stage")
+    con.executemany(
+        "INSERT INTO _raw_stage(uuid, session_id, ts, type, transcript_path, raw) VALUES (?,?,?,?,?,?)",
+        raw_rows)
+    con.execute("INSERT INTO raw_events SELECT * FROM _raw_stage ON CONFLICT (uuid) DO NOTHING")
+    con.execute("DELETE FROM _raw_stage")
+
+
+def ingest_transcript(con, path):
+    """Read new lines from `path` since last_offset; insert events; advance offset.
+    Returns number of events inserted."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return 0
+    row = con.execute("SELECT last_offset FROM ingest_state WHERE transcript_path=?",
+                      [str(path)]).fetchone()
+    last = row[0] if row else 0
+    if size < last:            # truncated/rewritten -> rescan
+        last = 0
+    if size == last:
+        return 0
+    with open(path, "rb") as f:
+        f.seek(last)
+        data = f.read(size - last)
+    nl = data.rfind(b"\n")
+    if nl < 0:
+        return 0               # no complete line yet
+    complete, new_off = data[:nl + 1], last + nl + 1
+    # subagent transcripts: <project>/<sid>/subagents/agent-<id>.jsonl
+    agent_id = path.stem.removeprefix("agent-") if path.parent.name == "subagents" else None
+    raw_rows, rows, ureqs = [], [], []
+    for line in complete.decode("utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            ev = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            # persist the raw line anyway (lossless); key by content hash
+            raw_rows.append((_sha(line), None, None, None, str(path), line))
+            continue
+        uid = ev.get("uuid") or _sha(line)
+        raw_rows.append((uid, ev.get("sessionId", ""), ev.get("timestamp"),
+                         ev.get("type"), str(path), line))
+        rows.extend(parse_event(ev, agent_id))  # derived events; may be empty for a line
+        u = parse_usage(ev, agent_id)           # one api_requests row per assistant line
+        if u:
+            ureqs.append(u)
+    if raw_rows:
+        _insert_raw(con, raw_rows)            # verbatim, always
+        _upsert_session(con, path, raw_rows)
+    if rows:
+        _insert_events(con, rows)
+    if ureqs:
+        _insert_requests(con, ureqs)
+    con.execute(
+        "INSERT INTO ingest_state VALUES (?,?,?) "
+        "ON CONFLICT (transcript_path) DO UPDATE SET last_offset=excluded.last_offset, last_mtime=excluded.last_mtime",
+        [str(path), new_off, size])
+    return len(raw_rows)                       # count of transcript lines ingested
+
+
+_EVENT_COLS = ["event_id","session_id","parent_uuid","ts","type","role",
+               "tool_name","tool_use_id","request_id","agent_id",
+               "text","tool_input","stdout","stderr","is_error"]
+
+
+def _insert_events(con, rows):
+    con.execute("CREATE TEMP TABLE IF NOT EXISTS _stage AS SELECT * FROM events WHERE 0=1")
+    con.execute("DELETE FROM _stage")
+    # executemany into a staging temp table, then INSERT..ON CONFLICT (Appender if too slow)
+    con.executemany(
+        f"INSERT INTO _stage ({','.join(_EVENT_COLS)}) VALUES ({','.join(['?']*len(_EVENT_COLS))})",
+        [[r[c] for c in _EVENT_COLS] for r in rows])
+    con.execute("INSERT INTO events SELECT * FROM _stage ON CONFLICT (event_id) DO NOTHING")
+    con.execute("DELETE FROM _stage")
+
+
+_REQ_COLS = ["request_id","message_id","session_id","agent_id","ts","model",
+             "input_tokens","output_tokens","cache_read_tokens",
+             "cache_creation_tokens","service_tier"]
+
+
+def _insert_requests(con, rows):
+    # one request arrives as several content-block lines with identical usage:
+    # collapse within the batch here; ON CONFLICT handles cross-batch repeats
+    rows = list({r["request_id"]: r for r in rows}.values())
+    con.execute("CREATE TEMP TABLE IF NOT EXISTS _req_stage AS SELECT * FROM api_requests WHERE 0=1")
+    con.execute("DELETE FROM _req_stage")
+    con.executemany(
+        f"INSERT INTO _req_stage ({','.join(_REQ_COLS)}) VALUES ({','.join(['?']*len(_REQ_COLS))})",
+        [[r[c] for c in _REQ_COLS] for r in rows])
+    con.execute("INSERT INTO api_requests SELECT * FROM _req_stage ON CONFLICT (request_id) DO NOTHING")
+    con.execute("DELETE FROM _req_stage")
+
+
+def _upsert_session(con, path, raw_rows):
+    # raw_rows are tuples: (uuid, session_id, ts, type, transcript_path, raw)
+    sid = next((r[1] for r in raw_rows if r[1]), None)
+    if not sid:
+        return
+    ts_vals = [r[2] for r in raw_rows if r[2]]
+    con.execute(
+        "INSERT INTO sessions(session_id, project, first_ts, last_ts, event_count) "
+        "VALUES (?,?,?,?,?) ON CONFLICT (session_id) DO UPDATE SET "
+        "last_ts=greatest(sessions.last_ts, excluded.last_ts), "
+        "event_count=sessions.event_count + excluded.event_count",
+        [sid, _decode_project(path), min(ts_vals, default=None),
+         max(ts_vals, default=None), len(raw_rows)])  # event_count = transcript lines
+
+
+def ingest_all(con):
+    total = 0
+    paths = sorted(PROJECTS_DIR.glob("*/*.jsonl")) + sorted(PROJECTS_DIR.glob("*/*/subagents/*.jsonl"))
+    for path in paths:
+        total += ingest_transcript(con, path)
+    return total
+
+
+def cmd_ingest(argv):
+    watch = "--watch" in argv
+    interval = 5.0
+    con = connect()
+    try:
+        while True:
+            n = ingest_all(con)
+            print(f"ingested {n} events")
+            if not watch:
+                break
+            time.sleep(interval)
+    finally:
+        con.close()
+    return 0
+
+
+def cli_main(argv):
+    # Task 3 dispatch: only `ingest` exists yet. search/stats/tokens/cat/diff
+    # land in later phases; this keeps `claude-trail ingest` runnable without
+    # referencing functions that do not exist yet.
+    cmd = argv[0]
+    if cmd == "ingest":
+        return cmd_ingest(argv)
+    print(f"claude-trail: subcommand '{cmd}' is not available yet")
+    return 2

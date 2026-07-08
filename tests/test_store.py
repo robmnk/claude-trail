@@ -267,3 +267,176 @@ def test_attribution_parse_usage_sets_agent_id():
     row = store.parse_usage(_assistant_text_and_bash(), agent_id="abc")
     assert row["agent_id"] == "abc"
     assert store.parse_usage(_assistant_text_and_bash())["agent_id"] is None
+
+
+# --- Incremental ingester (Task 3) --------------------------------------------
+#
+# These are hermetic: a tiny synthetic transcript is written under a fake
+# ~/.claude/projects layout in tmp_path, and both PROJECTS_DIR and STORE_PATH are
+# monkeypatched so nothing touches the live corpus or the real DB.
+
+
+def _write_jsonl(path, events):
+    """Write one JSON object per line, creating parent dirs as needed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(e) + "\n" for e in events), encoding="utf-8")
+
+
+def _main_transcript_events(sid):
+    """Five transcript lines: two assistant content-block lines sharing ONE
+    requestId + identical usage (the second carries a Bash tool_use), a user
+    tool_result line, a plain user prompt, and one <synthetic> assistant line."""
+    usage = {"input_tokens": 100, "output_tokens": 50,
+             "cache_read_input_tokens": 200, "cache_creation_input_tokens": 30,
+             "service_tier": "standard"}
+    return [
+        {  # assistant text block, request R1
+            "type": "assistant", "uuid": "m-a-text", "requestId": "req-R1",
+            "sessionId": sid, "timestamp": "2026-06-30T02:00:00.000Z",
+            "message": {"role": "assistant", "model": "claude-opus-4-8",
+                        "id": "msg-R1",
+                        "content": [{"type": "text", "text": "Checking things."}],
+                        "usage": usage}},
+        {  # assistant Bash tool_use block, same request R1 + identical usage
+            "type": "assistant", "uuid": "m-a-bash", "requestId": "req-R1",
+            "sessionId": sid, "timestamp": "2026-06-30T02:00:01.000Z",
+            "message": {"role": "assistant", "model": "claude-opus-4-8",
+                        "id": "msg-R1",
+                        "content": [{"type": "tool_use", "id": "toolu-bash-1",
+                                     "name": "Bash",
+                                     "input": {"command": "echo hi",
+                                               "description": "say hi"}}],
+                        "usage": usage}},
+        {  # user tool_result with top-level toolUseResult
+            "type": "user", "uuid": "m-u-result", "sessionId": sid,
+            "timestamp": "2026-06-30T02:00:02.000Z",
+            "message": {"role": "user",
+                        "content": [{"type": "tool_result",
+                                     "tool_use_id": "toolu-bash-1",
+                                     "content": "hi", "is_error": False}]},
+            "toolUseResult": {"stdout": "hi", "stderr": "",
+                              "interrupted": False, "isImage": False}},
+        {  # plain user prompt (string content)
+            "type": "user", "uuid": "m-u-prompt", "sessionId": sid,
+            "timestamp": "2026-06-30T02:00:03.000Z",
+            "message": {"role": "user", "content": "please continue"}},
+        {  # synthetic assistant line: parse_usage skips it, api_requests excludes it
+            "type": "assistant", "uuid": "m-a-synth", "requestId": "req-synth",
+            "sessionId": sid, "timestamp": "2026-06-30T02:00:04.000Z",
+            "message": {"role": "assistant", "model": "<synthetic>",
+                        "id": "msg-synth",
+                        "content": [{"type": "text", "text": "(no api call)"}],
+                        "usage": {"input_tokens": 0, "output_tokens": 0,
+                                  "cache_read_input_tokens": 0,
+                                  "cache_creation_input_tokens": 0}}},
+    ]
+
+
+def test_ingest_all_main_transcript(tmp_path, monkeypatch):
+    """Full sweep over one synthetic main transcript, then idempotent re-run."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+
+    sid = "sess-main-0001"
+    events = _main_transcript_events(sid)
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", events)
+
+    con = store.connect()
+    try:
+        total = store.ingest_all(con)
+        assert total == len(events)  # every transcript line ingested
+
+        def count(sql):
+            return con.execute(sql).fetchone()[0]
+
+        assert count("SELECT count(*) FROM raw_events") == len(events)   # 5, one per line
+        assert count("SELECT count(*) FROM events") == 5
+        by_type = dict(con.execute(
+            "SELECT type, count(*) FROM events GROUP BY 1").fetchall())
+        assert by_type == {"assistant": 2, "tool_use": 1,
+                           "tool_result": 1, "user": 1}
+        assert count("SELECT count(*) FROM events WHERE tool_name='Bash'") == 1
+        # two content-block lines collapse to 1 request; synthetic excluded
+        assert count("SELECT count(*) FROM api_requests") == 1
+        assert con.execute("SELECT request_id FROM api_requests").fetchone()[0] == "req-R1"
+        assert count("SELECT count(*) FROM sessions") == 1
+        assert con.execute(
+            "SELECT event_count FROM sessions").fetchone()[0] == len(events)
+
+        # idempotent: re-running ingests nothing and leaves every table unchanged
+        assert store.ingest_all(con) == 0
+        assert count("SELECT count(*) FROM raw_events") == len(events)
+        assert count("SELECT count(*) FROM events") == 5
+        assert count("SELECT count(*) FROM api_requests") == 1
+        assert con.execute(
+            "SELECT event_count FROM sessions").fetchone()[0] == len(events)
+    finally:
+        con.close()
+
+
+def test_ingest_all_subagent_attribution(tmp_path, monkeypatch):
+    """Subagent transcript is swept in and its rows carry agent_id from the
+    agent-<id>.jsonl filename; main-thread rows stay agent_id NULL."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+
+    sid = "sess-sub-0001"
+    main_line = {
+        "type": "assistant", "uuid": "main-a-bash", "requestId": "req-main",
+        "sessionId": sid, "timestamp": "2026-06-30T02:59:00.000Z",
+        "message": {"role": "assistant", "model": "claude-opus-4-8", "id": "msg-main",
+                    "content": [{"type": "tool_use", "id": "toolu-main-1",
+                                 "name": "Bash",
+                                 "input": {"command": "pwd", "description": "pwd"}}],
+                    "usage": {"input_tokens": 20, "output_tokens": 10,
+                              "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0,
+                              "service_tier": "standard"}}}
+    sub_line = {
+        "type": "assistant", "uuid": "s-a-bash", "requestId": "req-sub",
+        "sessionId": sid, "timestamp": "2026-06-30T03:00:00.000Z",
+        "message": {"role": "assistant", "model": "claude-opus-4-8", "id": "msg-sub",
+                    "content": [{"type": "tool_use", "id": "toolu-sub-1",
+                                 "name": "Bash",
+                                 "input": {"command": "ls", "description": "list"}}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5,
+                              "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0,
+                              "service_tier": "standard"}}}
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", [main_line])
+    _write_jsonl(projects / "-fake-proj" / sid / "subagents" / "agent-XYZ.jsonl",
+                 [sub_line])
+
+    con = store.connect()
+    try:
+        assert store.ingest_all(con) == 2  # both files, one line each
+
+        def count(sql):
+            return con.execute(sql).fetchone()[0]
+
+        # subagent rows are attributed to XYZ; main-thread rows stay NULL
+        assert count("SELECT count(*) FROM events WHERE agent_id='XYZ'") == 1
+        assert con.execute(
+            "SELECT tool_name FROM events WHERE agent_id='XYZ'").fetchone()[0] == "Bash"
+        assert count("SELECT count(*) FROM events WHERE agent_id IS NULL "
+                     "AND tool_name='Bash'") == 1
+        # api_requests carry the agent_id too
+        assert count("SELECT count(*) FROM api_requests") == 2
+        assert count("SELECT count(*) FROM api_requests WHERE agent_id='XYZ'") == 1
+        assert con.execute(
+            "SELECT request_id FROM api_requests WHERE agent_id='XYZ'").fetchone()[0] == "req-sub"
+        assert count("SELECT count(*) FROM api_requests WHERE agent_id IS NULL") == 1
+        # both files share the parent sessionId -> one session, two lines
+        assert count("SELECT count(*) FROM sessions") == 1
+        assert con.execute("SELECT event_count FROM sessions").fetchone()[0] == 2
+    finally:
+        con.close()
+
+
+def test_decode_project_maps_encoded_dir_name(tmp_path, monkeypatch):
+    """A leading '-' cwd-encoded dir name decodes to a slash path label."""
+    monkeypatch.setattr(store, "PROJECTS_DIR", tmp_path)
+    path = tmp_path / "-home-naka-Projects-personal" / "abc.jsonl"
+    assert store._decode_project(path) == "/home/naka/Projects/personal"
