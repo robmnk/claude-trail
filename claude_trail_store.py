@@ -497,12 +497,131 @@ def cmd_ingest(argv):
     return 0
 
 
+# --- Search, stats, tokens CLI (Task 4) ---------------------------------------
+
+
+def _print_rows(rows, headers):
+    from rich.console import Console
+    from rich.table import Table
+    t = Table(*headers, box=None, pad_edge=False)
+    for r in rows:
+        t.add_row(*[("" if v is None else str(v)) for v in r])
+    Console().print(t)
+
+
+def cmd_search(argv):
+    # usage: search <regex> [--project P] [--tool T] [--session S] [--since ISO] [--limit N] [-i]
+    args = argv[1:]
+    pat = args[0] if args and not args[0].startswith("-") else None
+    if not pat:
+        print("usage: claude-trail search <regex> [--tool T --project P --since ISO --limit N -i]")
+        return 2
+    def opt(name, default=None):
+        return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else default
+    flags = "(?i)" if "-i" in args else ""
+    where, params = ["(regexp_matches(coalesce(text,''), ?) OR regexp_matches(coalesce(stdout,''), ?) OR regexp_matches(coalesce(stderr,''), ?))"], [flags+pat]*3
+    if opt("--tool"):    where.append("tool_name = ?");                 params.append(opt("--tool"))
+    if opt("--session"): where.append("session_id LIKE ?");            params.append(opt("--session")+"%")
+    if opt("--since"):   where.append("ts >= ?");                      params.append(opt("--since"))
+    if opt("--project"): where.append("session_id IN (SELECT session_id FROM sessions WHERE project LIKE ?)"); params.append("%"+opt("--project")+"%")
+    limit = int(opt("--limit", "1000"))
+    sql = (f"SELECT strftime(ts,'%Y-%m-%d %H:%M'), substr(session_id,1,8), tool_name, "
+           f"regexp_replace(coalesce(text, coalesce(stdout,'')), '\\s+', ' ', 'g') "
+           f"FROM events WHERE {' AND '.join(where)} ORDER BY ts DESC LIMIT {limit}")
+    con = connect(read_only=True)
+    try:
+        rows = [(a, b, c, (d or '')[:120]) for a, b, c, d in con.execute(sql, params).fetchall()]
+    finally:
+        con.close()
+    _print_rows(rows, ["time", "sess", "tool", "match"])
+    return 0
+
+
+def cmd_tokens(argv):
+    # usage: tokens [--session S] [--by session|command|tool|day|model] [--since ISO] [--limit N]
+    # default: per-session totals; with --session: per-command breakdown for it
+    args = argv[1:]
+    def opt(name, default=None):
+        return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else default
+    sess, since = opt("--session"), opt("--since")
+    by = opt("--by", "command" if sess else "session")
+    limit = int(opt("--limit", "30"))
+    where, params = [], []
+    if sess:  where.append("session_id LIKE ?"); params.append(sess + "%")
+    if since: where.append("ts >= ?");           params.append(since)
+    w = ("WHERE " + " AND ".join(where)) if where else ""
+    sql = {
+        "session": f"""SELECT substr(session_id,1,8), count(*), sum(output_tokens),
+                              sum(cache_creation_tokens), sum(cache_read_tokens),
+                              strftime(min(ts),'%Y-%m-%d %H:%M'), strftime(max(ts),'%Y-%m-%d %H:%M')
+                       FROM api_requests {w} GROUP BY session_id
+                       ORDER BY 3 DESC LIMIT {limit}""",
+        "command": f"""SELECT strftime(ts,'%m-%d %H:%M'), tool_name,
+                              substr(regexp_replace(coalesce(command,''),'\\s+',' ','g'),1,60),
+                              output_tokens, calls_in_request
+                       FROM command_tokens {w}
+                       ORDER BY output_tokens DESC LIMIT {limit}""",
+        "tool":    f"""SELECT tool_name, count(*), sum(output_tokens_share)::BIGINT
+                       FROM command_tokens {w} GROUP BY 1 ORDER BY 3 DESC LIMIT {limit}""",
+        "day":     f"""SELECT strftime(ts,'%Y-%m-%d'), count(*), sum(output_tokens),
+                              sum(cache_creation_tokens)
+                       FROM api_requests {w} GROUP BY 1 ORDER BY 1 DESC LIMIT {limit}""",
+        "model":   f"""SELECT model, count(*), sum(output_tokens), sum(input_tokens)
+                       FROM api_requests {w} GROUP BY 1 ORDER BY 3 DESC LIMIT {limit}""",
+    }.get(by)
+    if sql is None:
+        print("usage: claude-trail tokens [--session S] [--by session|command|tool|day|model] [--since ISO] [--limit N]")
+        return 2
+    headers = {"session": ["sess","reqs","out","cache_new","cache_read","first","last"],
+               "command": ["time","tool","command","out_tokens","calls_in_req"],
+               "tool":    ["tool","calls","out_tokens"],
+               "day":     ["day","reqs","out","cache_new"],
+               "model":   ["model","reqs","out","in"]}[by]
+    con = connect(read_only=True)
+    try:
+        rows = con.execute(sql, params).fetchall()
+    finally:
+        con.close()
+    _print_rows(rows, headers)
+    return 0
+
+
+def cmd_stats(argv):
+    con = connect(read_only=True)
+    try:
+        for label, q in [
+            ("sessions", "SELECT count(*) FROM sessions"),
+            ("events",   "SELECT count(*) FROM events"),
+            ("by tool",  "SELECT tool_name, count(*) c FROM events WHERE tool_name IS NOT NULL GROUP BY 1 ORDER BY c DESC LIMIT 10"),
+            ("file versions", "SELECT count(*) FROM file_versions"),
+            ("blobs / bytes", "SELECT count(*), coalesce(sum(size),0) FROM blobs"),
+            ("api requests / output tokens", "SELECT count(*), coalesce(sum(output_tokens),0) FROM api_requests"),
+        ]:
+            print(f"== {label} ==")
+            for r in con.execute(q).fetchall():
+                print("  ", *r)
+    finally:
+        con.close()
+    return 0
+
+
+def cmd_cat(argv):
+    # Stub until Phase 6 (file reconstruction over file_versions/blobs). Kept here
+    # only so cli_main's dispatch dict resolves; Phase 6 replaces it with the real
+    # `cat <path>` reconstruction command.
+    print("cat: file reconstruction is not available until phase 6")
+    return 0
+
+
+def cmd_diff(argv):
+    # Stub until Phase 6 (file reconstruction over file_versions/blobs). Kept here
+    # only so cli_main's dispatch dict resolves; Phase 6 replaces it with the real
+    # `diff <path>` reconstruction command.
+    print("diff: file reconstruction is not available until phase 6")
+    return 0
+
+
 def cli_main(argv):
-    # Task 3 dispatch: only `ingest` exists yet. search/stats/tokens/cat/diff
-    # land in later phases; this keeps `claude-trail ingest` runnable without
-    # referencing functions that do not exist yet.
     cmd = argv[0]
-    if cmd == "ingest":
-        return cmd_ingest(argv)
-    print(f"claude-trail: subcommand '{cmd}' is not available yet")
-    return 2
+    return {"ingest": cmd_ingest, "search": cmd_search, "stats": cmd_stats,
+            "tokens": cmd_tokens, "cat": cmd_cat, "diff": cmd_diff}[cmd](argv)
