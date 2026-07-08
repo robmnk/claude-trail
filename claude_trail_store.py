@@ -4,6 +4,7 @@ Ingests transcripts (~/.claude/projects/**/*.jsonl) and file snapshots into a
 single local DuckDB file; provides substring/regex search and file
 reconstruction. Single-writer ingester, read-only readers.
 """
+import json
 import os
 from pathlib import Path
 
@@ -141,3 +142,130 @@ def connect(read_only: bool = False):
             [SCHEMA_VERSION],
         )
     return con
+
+
+_COMMAND_FIELD = {  # representative `text` per tool when there is no command
+    "Bash": "command",
+    "Read": "file_path", "Edit": "file_path", "Write": "file_path",
+    "NotebookEdit": "notebook_path", "Glob": "pattern", "Grep": "pattern",
+}
+
+
+def _repr_text(tool_name, tool_input):
+    if not isinstance(tool_input, dict):
+        return None
+    field = _COMMAND_FIELD.get(tool_name)
+    return tool_input.get(field) if field else None
+
+
+def _row(event_id, session_id, parent, ts, etype, role, tool_name=None,
+         tool_use_id=None, text=None, tool_input=None,
+         stdout=None, stderr=None, is_error=None, request_id=None, agent_id=None):
+    return {
+        "event_id": event_id, "session_id": session_id, "parent_uuid": parent,
+        "ts": ts, "type": etype, "role": role, "tool_name": tool_name,
+        "tool_use_id": tool_use_id, "request_id": request_id, "agent_id": agent_id,
+        "text": text,
+        "tool_input": json.dumps(tool_input) if tool_input is not None else None,
+        "stdout": stdout, "stderr": stderr, "is_error": is_error,
+    }
+
+
+def _result_fields(tur, block):
+    """Pull stdout/stderr/is_error from toolUseResult (dict) and/or the
+    tool_result content block, tolerating both Bash and file-tool shapes."""
+    stdout = stderr = None
+    is_error = bool(block.get("is_error")) if isinstance(block, dict) else None
+    if isinstance(tur, dict):
+        stdout = tur.get("stdout")
+        stderr = tur.get("stderr")
+        if tur.get("interrupted"):
+            is_error = True
+    if stdout is None and isinstance(block, dict):
+        c = block.get("content")
+        stdout = c if isinstance(c, str) else (json.dumps(c) if c is not None else None)
+    return stdout, stderr, is_error
+
+
+def _text_from_blocks(content):
+    parts = [b.get("text", "") for b in content
+             if isinstance(b, dict) and b.get("type") == "text"]
+    return "\n".join(p for p in parts if p) or None
+
+
+def parse_event(ev, agent_id=None):
+    """Transcript event dict -> list of `events` row dicts. Never raises.
+
+    agent_id comes from the transcript path (subagents/agent-<id>.jsonl), not
+    the event itself, so the caller passes it in; every row is stamped with it.
+    """
+    if not isinstance(ev, dict):
+        return []
+    rows, etype = [], ev.get("type")
+    sid = ev.get("sessionId", "")
+    ts = ev.get("timestamp")
+    uuid = ev.get("uuid") or ""
+    parent = ev.get("parentUuid")
+    msg = ev.get("message") or {}
+    if etype == "assistant":
+        rid = ev.get("requestId")
+        for i, b in enumerate(msg.get("content") or []):
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text":
+                rows.append(_row(f"{uuid}:t{i}", sid, parent, ts, "assistant",
+                                 "assistant", text=b.get("text"), request_id=rid))
+            elif b.get("type") == "tool_use":
+                tid = b.get("id")
+                rows.append(_row(tid or f"{uuid}:u{i}", sid, parent, ts, "tool_use",
+                                 "assistant", tool_name=b.get("name"), tool_use_id=tid,
+                                 text=_repr_text(b.get("name"), b.get("input")),
+                                 tool_input=b.get("input"), request_id=rid))
+    elif etype == "user":
+        content = msg.get("content")
+        tur = ev.get("toolUseResult")
+        if isinstance(content, list):
+            results = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"]
+            for b in results:
+                tid = b.get("tool_use_id")
+                out, err, ierr = _result_fields(tur, b)
+                rows.append(_row(f"{uuid}:r:{tid}", sid, parent, ts, "tool_result",
+                                 "tool", tool_use_id=tid, stdout=out, stderr=err, is_error=ierr))
+            if not results:
+                txt = _text_from_blocks(content)
+                if txt:
+                    rows.append(_row(uuid, sid, parent, ts, "user", "user", text=txt))
+        elif isinstance(content, str) and content.strip():
+            rows.append(_row(uuid, sid, parent, ts, "user", "user", text=content))
+    for r in rows:
+        r["agent_id"] = agent_id
+    return rows
+
+
+def parse_usage(ev, agent_id=None):
+    """Assistant event -> one `api_requests` row dict, or None. Never raises.
+
+    One API request is written as several JSONL lines (one per content block),
+    each repeating the same requestId with identical usage; the insert dedupes
+    on request_id. Synthetic messages (model == "<synthetic>") carry all-zero
+    usage for a request that never hit the API, so they are skipped.
+    """
+    if not isinstance(ev, dict) or ev.get("type") != "assistant":
+        return None
+    msg = ev.get("message") or {}
+    u = msg.get("usage")
+    if not isinstance(u, dict) or msg.get("model") == "<synthetic>":
+        return None
+    return {
+        "request_id": ev.get("requestId") or msg.get("id") or ev.get("uuid"),
+        "message_id": msg.get("id"),
+        "session_id": ev.get("sessionId", ""),
+        "agent_id": agent_id,
+        "ts": ev.get("timestamp"),
+        "model": msg.get("model"),
+        "input_tokens": u.get("input_tokens") or 0,
+        "output_tokens": u.get("output_tokens") or 0,
+        "cache_read_tokens": u.get("cache_read_input_tokens") or 0,
+        "cache_creation_tokens": u.get("cache_creation_input_tokens") or 0,
+        "service_tier": u.get("service_tier"),
+    }
