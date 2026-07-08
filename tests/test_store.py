@@ -540,3 +540,118 @@ def test_compact_db_reclaims_free_blocks_and_preserves_rows(tmp_path, monkeypatc
         con_ro.close()
     assert after == before   # no data loss across the rewrite
     assert free_blocks == 0  # fully compacted, no interspersed free blocks left
+
+
+# --- Search / stats / tokens CLI (Task 4) -------------------------------------
+#
+# Hermetic: a tiny synthetic store is built by ingest_all from the shared
+# _main_transcript_events fixture (a Bash 'echo hi' command emitted by request R1
+# with 50 output tokens, model claude-opus-4-8, dated 2026-06-30, plus a plain
+# user prompt and a skipped <synthetic> line) under a fake ~/.claude/projects
+# layout in tmp_path. PROJECTS_DIR and STORE_PATH are monkeypatched so the CLI
+# commands, which open their OWN read-only connection, hit that store and never
+# the live corpus or the real DB. The writer is closed before the commands run so
+# the file is unlocked for the read-only reopen. stdout is captured via capsys.
+
+
+def _build_cli_store(tmp_path, monkeypatch, sid="sess-cli-0001"):
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", _main_transcript_events(sid))
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+    finally:
+        con.close()  # release the write lock so the cmd_* read-only reopen works
+    return sid
+
+
+def test_cmd_search_matches_known_bash_command(tmp_path, monkeypatch, capsys):
+    """A pattern hitting a known Bash command returns that row (the command text
+    and the 8-char session prefix render)."""
+    sid = _build_cli_store(tmp_path, monkeypatch)
+    assert store.cmd_search(["search", "echo hi", "--tool", "Bash"]) == 0
+    out = capsys.readouterr().out
+    assert "echo hi" in out
+    assert sid[:8] in out           # substr(session_id,1,8)
+    assert "Bash" in out
+
+
+def test_cmd_search_non_matching_pattern_returns_no_rows(tmp_path, monkeypatch, capsys):
+    """A pattern that matches nothing yields no data row (no session prefix, no
+    command text) even though the header still prints."""
+    sid = _build_cli_store(tmp_path, monkeypatch)
+    assert store.cmd_search(["search", "no_such_token_zzz"]) == 0
+    out = capsys.readouterr().out
+    assert sid[:8] not in out
+    assert "echo hi" not in out
+
+
+def test_cmd_search_tool_filter_excludes_non_matching_tool(tmp_path, monkeypatch, capsys):
+    """--tool Bash restricts to Bash rows: the plain user prompt (tool_name NULL)
+    matches without the filter but is excluded with it."""
+    _build_cli_store(tmp_path, monkeypatch)
+    assert store.cmd_search(["search", "please continue"]) == 0
+    assert "please continue" in capsys.readouterr().out
+    assert store.cmd_search(["search", "please continue", "--tool", "Bash"]) == 0
+    assert "please continue" not in capsys.readouterr().out
+
+
+def test_cmd_tokens_default_per_session(tmp_path, monkeypatch, capsys):
+    """Default (no --session) is per-session totals: the session prints with its
+    50-token output total."""
+    sid = _build_cli_store(tmp_path, monkeypatch)
+    assert store.cmd_tokens(["tokens"]) == 0
+    out = capsys.readouterr().out
+    assert sid[:8] in out
+    assert "50" in out              # sum(output_tokens) for the session
+
+
+def test_cmd_tokens_session_per_command(tmp_path, monkeypatch, capsys):
+    """--session <sid> switches the default --by to command: the Bash tool_use row
+    prints with its generation-cost output tokens."""
+    sid = _build_cli_store(tmp_path, monkeypatch)
+    assert store.cmd_tokens(["tokens", "--session", sid]) == 0
+    out = capsys.readouterr().out
+    assert "Bash" in out
+    assert "echo hi" in out
+    assert "50" in out
+
+
+def test_cmd_tokens_by_day_and_by_model_run(tmp_path, monkeypatch, capsys):
+    """--by day and --by model both run and print their expected columns."""
+    _build_cli_store(tmp_path, monkeypatch)
+    assert store.cmd_tokens(["tokens", "--by", "day"]) == 0
+    out_day = capsys.readouterr().out
+    assert "day" in out_day             # header
+    # strftime on a TIMESTAMPTZ renders in the session's local tz, so the UTC
+    # 02:00 fixture lands on 2026-06-29 or -30 depending on the machine: assert
+    # the tz-stable year-month rather than an exact day.
+    assert "2026-06" in out_day         # the grouped day
+
+    assert store.cmd_tokens(["tokens", "--by", "model"]) == 0
+    out_model = capsys.readouterr().out
+    assert "model" in out_model         # header
+    assert "claude-opus-4-8" in out_model
+
+
+def test_cmd_stats_prints_counts_including_output_tokens(tmp_path, monkeypatch, capsys):
+    """stats prints each labelled count block, including the api-requests /
+    output-tokens line the spec pins."""
+    _build_cli_store(tmp_path, monkeypatch)
+    assert store.cmd_stats(["stats"]) == 0
+    out = capsys.readouterr().out
+    assert "== sessions ==" in out
+    assert "== events ==" in out
+    assert "== api requests / output tokens ==" in out
+    assert "Bash" in out                # by-tool block
+    assert "50" in out                  # sum(output_tokens) on the api-requests line
+
+
+def test_cmd_cat_and_cmd_diff_are_phase6_stubs(tmp_path, monkeypatch, capsys):
+    """cat/diff are stubs until Phase 6: they note the deferral and return 0."""
+    assert store.cmd_cat(["cat", "/some/path"]) == 0
+    assert "phase 6" in capsys.readouterr().out
+    assert store.cmd_diff(["diff", "/some/path"]) == 0
+    assert "phase 6" in capsys.readouterr().out
