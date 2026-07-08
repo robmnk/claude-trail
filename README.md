@@ -115,15 +115,22 @@ Alongside the live TUI, `claude-trail` ships a DuckDB-backed audit store that in
 A single `ingest` process is the only writer; every other subcommand opens the file read-only:
 
 ```bash
-claude-trail ingest [--watch] [--compact]        # tail transcripts into the store (single writer)
+claude-trail ingest [--watch] [--compact] [--file-history-only]  # tail transcripts + file-history into the store (single writer)
 claude-trail search <regex> [--tool T --session S --project P --since ISO --limit N -i]
-claude-trail stats                               # session / event / token counts
+claude-trail stats                               # session / event / token / reconstruction-coverage counts
 claude-trail tokens [--session S] [--by session|command|tool|day|model] [--since ISO] [--limit N]
 claude-trail cat <path> [--session S] [--at ISO] # reconstruct a file's bytes (rewind with --at)
-claude-trail diff <path> [--session S]           # list a path's edits oldest-first
+claude-trail diff <path> [--session S] [--all-sources]  # list a path's edits oldest-first
 ```
 
-Run `ingest` from cron or leave one `--watch` process polling; it is idempotent (byte-offset tailing), and `--compact` reclaims free blocks with a full rewrite. `tokens` reports exact per-session and per-command spend; `cat` / `diff` reconstruct edited files from content-addressed blobs plus `structuredPatch` diffs. Full-content reconstruction currently covers the edits whose original content is in the transcript (~39%); the rest are patch-only (`diff` works, `cat` cannot rebuild their bytes).
+Run `ingest` from cron or leave one `--watch` process polling; it is idempotent (byte-offset tailing), and `--compact` reclaims free blocks with a full rewrite. `tokens` reports exact per-session and per-command spend; `cat` / `diff` reconstruct edited files from content-addressed blobs plus `structuredPatch` diffs.
+
+**Two content sources.** Transcripts alone carry full edit content for only ~39% of edits (the ones whose `originalFile`/`content` is present); the rest are patch-only. The `ingest` sweep also backfills `~/.claude/file-history/<session_id>/<pathhash>@vN` snapshots as a second content source, which lifts full-content `cat` coverage to ~96% of patch-only paths. Details:
+
+- Snapshot bytes are preserved as content-addressed blobs **even when the path is not yet resolvable** (file-history is the one store input not rebuildable from `raw_events`; deferred resolution fills the path as more edits are seen).
+- `cat` reads all sources, so a formerly patch-only file reconstructs. `diff` stays transcript-only by default (a snapshot spans a whole user turn, so including it would double-list every edit); `--all-sources` opts the file-history deltas in.
+- `--file-history-only` runs just the backfill pass (does not touch the transcript offsets).
+- **`cat` staleness caveat:** snapshots are per-user-turn checkpoints of the pre-message state, so a file last edited in a session's final turn has no snapshot of its final bytes; `cat` can be one turn stale. (Applying the last transcript `structuredPatch` on top of the newest snapshot for exactness is deliberate future work.)
 
 ## Notes
 

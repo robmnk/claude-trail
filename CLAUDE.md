@@ -124,15 +124,15 @@ Adding a column is a single entry in the list.
 Invoked as `claude-trail <cmd>` (installed) or `python3 claude_trail.py <cmd>` (from a clone):
 
 ```
-ingest [--watch] [--compact]
+ingest [--watch] [--compact] [--file-history-only]
 search <regex> [--tool T] [--session S] [--project P] [--since ISO] [--limit N] [-i]
 stats
 tokens [--session S] [--by session|command|tool|day|model] [--since ISO] [--limit N]
 cat <path> [--session S] [--at ISO]
-diff <path> [--session S]
+diff <path> [--session S] [--all-sources]
 ```
 
-- `ingest` is the **single writer**: it holds DuckDB's one read-write connection, tails each transcript from its last byte offset, and is idempotent (re-ingest inserts nothing). Run it from cron or leave one `--watch` process polling every 5s. Every other subcommand (and any ad-hoc reader) opens the file **read-only**; the hook never writes DuckDB (many short-lived hook processes would contend on the write lock). `--compact` runs once after the sweep (ignored under `--watch`) and reclaims DuckDB's interspersed free blocks by rewriting the store into a fresh file (a plain `CHECKPOINT` never coalesces them, so a bulk ingest otherwise leaves the file ~2x its packed size).
+- `ingest` is the **single writer**: it holds DuckDB's one read-write connection, tails each transcript from its last byte offset, and is idempotent (re-ingest inserts nothing). It sweeps transcripts first, then backfills file-history (see below). Run it from cron or leave one `--watch` process polling every 5s. Every other subcommand (and any ad-hoc reader) opens the file **read-only**; the hook never writes DuckDB (many short-lived hook processes would contend on the write lock). `--compact` runs once after the sweep (ignored under `--watch`) and reclaims DuckDB's interspersed free blocks by rewriting the store into a fresh file (a plain `CHECKPOINT` never coalesces them, so a bulk ingest otherwise leaves the file ~2x its packed size). `--file-history-only` runs just the file-history backfill pass (does not touch `ingest_state`; composes with `--compact`).
 - `search` is a regex/substring full scan over `events.text`/`stdout`/`stderr` (no FTS index); `-i` is case-insensitive.
 - `tokens` defaults to per-session totals; passing `--session` switches the default `--by` to `command`.
 
@@ -152,6 +152,11 @@ The API bills per request, not per tool call, so the store is explicit about exa
 
 ### File reconstruction
 
-- Edits are captured as content-addressed **blobs** (full file content, deduped by `sha256`) plus the `structuredPatch` diff, in `file_versions` (`pre_sha`/`post_sha`/`patch`).
+- Edits are captured as content-addressed **blobs** (full file content, deduped by `sha256`) plus the `structuredPatch` diff, in `file_versions` (`pre_sha`/`post_sha`/`patch`). Each row carries a `source` (`'transcript'` | `'file-history'`) provenance marker.
 - `cat <path> [--at ISO]` **rewinds** a file: it reconstructs the file's exact bytes as of `--at` (or latest), so you can recover or roll back to an earlier version. `diff <path>` lists that path's edits oldest-first with their patches.
-- **Limitation:** full-content reconstruction currently covers only ~39% of edits, those whose `originalFile`/`content` is present in the transcript. The rest are **patch-only**: `diff` works, but `cat` cannot rebuild their bytes (null `post_sha`). Closing that gap is the planned **file-history backfill** follow-up (ingest `~/.claude/file-history/<session_id>/<pathhash>@vN` snapshots to give the patch-only rows real PRE/POST content).
+- **Two content sources.** Transcripts alone give full content for only ~39% of edits (those whose `originalFile`/`content` is present); the rest are patch-only. The ingest sweep also backfills `~/.claude/file-history/<session_id>/<pathhash>@vN` snapshots (Phase 8), which lifts full-content coverage to ~96% of the patch-only paths (measured: 123/129 patch-only paths gain reconstructable content).
+  - The authoritative `(path, version, timestamp)` mapping comes from the `file-history-snapshot` events' `snapshot.trackedFileBackups` (already in `raw_events`); the `sha256(abs_path)[:16]` reverse-index only absolutizes relative keys and handles orphaned dirs. Snapshot events carry **no** top-level `sessionId`/timestamp, so the session id is derived from the transcript filename and the timestamp from `backupTime`.
+  - The new **`file_history`** table (`session_id, pathhash, version, path, sha, snapshot_ts, note`, PK `(session_id, pathhash, version)`) records every snapshot. Snapshot **bytes are preserved as blobs even when the path is not yet resolvable** (file-history is the one store input not rebuildable from `raw_events`, so this is irreversible-loss insurance); deferred resolution fills `path` on later sweeps as more edits are seen. Resolved rows also emit synthetic `source='file-history'` `file_versions` rows (`event_id = 'fh:<sid>:<pathhash>@v<N>'`) so `cat` sees them. `pre_sha` is the highest **present** lower version's blob (chains are non-contiguous; never `v-1`). Non-UTF-8 snapshots (0 today) are recorded with `sha=NULL, note='binary-skipped'`, no blob.
+  - `cat` reads all sources; `diff` stays transcript-only by default (a snapshot spans a whole user turn, so including it would double-list every edit and spam `(no patch)` for headless first snapshots), `--all-sources` opts the file-history deltas in. `stats` adds a reconstruction-coverage block (cat-able paths, split by source, plus file_history row/byte counts), guarded via `information_schema` so a not-yet-migrated 0.6.0 DB opened read-only does not raise.
+  - **`cat` staleness caveat:** snapshots are per-user-turn checkpoints of the pre-message state, so a file last edited in a session's final turn has no snapshot of its final bytes; `cat` can be one turn stale. Applying the last transcript `structuredPatch` on top of the newest snapshot for exactness is deliberate future work.
+- **Migration:** `SCHEMA_VERSION` is `"2"`. `connect()` (writable path only) runs `ALTER TABLE file_versions ADD COLUMN IF NOT EXISTS source ...`, creates `file_history`, and seeds the version with `ON CONFLICT (key) DO UPDATE` (the old `DO NOTHING` would have pinned an existing 0.6.0 DB at `'1'`), so a 0.6.0 store upgrades in place on the next `ingest`.

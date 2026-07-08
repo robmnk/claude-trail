@@ -8,14 +8,16 @@ import difflib
 import hashlib
 import json
 import os
+import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 STORE_PATH = Path(os.environ.get("CLAUDE_TRAIL_DB", Path.home() / ".claude" / "trail.duckdb"))
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"   # 1 -> 2: file_versions.source column + file_history table (Phase 8)
 
 SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value TEXT);  -- {'version':'1'}
+CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value TEXT);  -- {'version':'2'}
 
 -- Lossless source of truth: one row per transcript line, every event type, verbatim.
 -- events / file_versions / sessions below are all derived projections of this.
@@ -83,7 +85,8 @@ CREATE TABLE IF NOT EXISTS file_versions(
   path       TEXT,
   pre_sha    TEXT,
   post_sha   TEXT,
-  patch      TEXT               -- unified diff (from structuredPatch or difflib)
+  patch      TEXT,              -- unified diff (from structuredPatch or difflib)
+  source     TEXT DEFAULT 'transcript'  -- provenance: 'transcript' | 'file-history' (B2; must be stamped, see _FV_COLS)
 );
 CREATE INDEX IF NOT EXISTS fv_path ON file_versions(path, ts);
 
@@ -92,6 +95,23 @@ CREATE TABLE IF NOT EXISTS blobs(
   size    BIGINT,
   content TEXT                  -- full file content; DuckDB compresses on disk
 );
+
+-- One row per ~/.claude/file-history/<session_id>/<pathhash>@vN snapshot (Phase 8).
+-- The bytes are the store's one irreversible-loss input (unlike every raw_events
+-- projection, file-history is cache-like and may be pruned), so they are preserved
+-- as blobs here even when `path` is not yet resolvable; resolved rows also surface
+-- through cat via synthetic source='file-history' file_versions rows.
+CREATE TABLE IF NOT EXISTS file_history(
+  session_id  TEXT,
+  pathhash    TEXT,            -- sha256(abs_path)[:16], the on-disk dir key
+  version     INTEGER,         -- N from @vN / trackedFileBackups.version
+  path        TEXT,            -- resolved absolute path, or NULL if not yet known
+  sha         TEXT,            -- blob sha of the snapshot content (NULL if binary-skipped)
+  snapshot_ts TIMESTAMPTZ,     -- trackedFileBackups.backupTime (ISO); mtime fallback for orphans
+  note        TEXT,            -- e.g. 'binary-skipped'; NULL normally
+  PRIMARY KEY (session_id, pathhash, version)   -- idempotent re-ingest
+);
+CREATE INDEX IF NOT EXISTS fh_pathhash ON file_history(pathhash);
 
 CREATE TABLE IF NOT EXISTS ingest_state(
   transcript_path TEXT PRIMARY KEY,
@@ -140,8 +160,17 @@ def connect(read_only: bool = False):
     con = duckdb.connect(str(STORE_PATH), read_only=read_only)
     if not read_only:
         con.execute(SCHEMA_SQL)
+        # Migrate a 0.6.0 (schema 1) DB in place. SCHEMA_SQL's CREATE ... IF NOT
+        # EXISTS above adds file_history, but leaves a pre-existing file_versions
+        # untouched, so the new `source` column is added by ADD COLUMN IF NOT
+        # EXISTS (idempotent; backfills every existing row with the DEFAULT,
+        # correctly labelling all pre-phase-8 rows 'transcript'). The version seed
+        # must DO UPDATE, not DO NOTHING: an existing ('version','1') row would
+        # otherwise pin the DB at '1' forever.
+        con.execute("ALTER TABLE file_versions ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'transcript'")
         con.execute(
-            "INSERT INTO schema_meta VALUES ('version', ?) ON CONFLICT DO NOTHING",
+            "INSERT INTO schema_meta VALUES ('version', ?) "
+            "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
             [SCHEMA_VERSION],
         )
     return con
@@ -421,6 +450,11 @@ def ingest_all(con):
     paths = sorted(PROJECTS_DIR.glob("*/*.jsonl")) + sorted(PROJECTS_DIR.glob("*/*/subagents/*.jsonl"))
     for path in paths:
         total += ingest_transcript(con, path)
+    # M6: the file-history pass runs AFTER the transcript sweep, so a path first
+    # revealed by this run's transcripts resolves its snapshots this run (within the
+    # pass the promotion UPDATE runs after the index build, before emitting rows).
+    # It prints its own progress line; `total` stays the transcript-line count.
+    ingest_file_history(con)
     return total
 
 
@@ -562,10 +596,11 @@ def file_version_from_event(con, ev):
         "pre_sha": _put_blob(con, pre),
         "post_sha": _put_blob(con, post),
         "patch": _render_patch(tur.get("structuredPatch"), pre, post, path),
-    }
+        "source": "transcript",   # B2: stamped explicitly; the staging INSERT..SELECT
+    }                             # bypasses the column DEFAULT, so a NULL would ship otherwise
 
 
-_FV_COLS = ["event_id", "session_id", "ts", "path", "pre_sha", "post_sha", "patch"]
+_FV_COLS = ["event_id", "session_id", "ts", "path", "pre_sha", "post_sha", "patch", "source"]
 
 
 def _insert_file_versions(con, rows):
@@ -594,6 +629,307 @@ def _insert_file_versions(con, rows):
     con.execute("INSERT INTO file_versions SELECT * FROM _fv_stage s "
                 "WHERE NOT EXISTS (SELECT 1 FROM file_versions f WHERE f.event_id = s.event_id)")
     con.execute("DELETE FROM _fv_stage")
+
+
+# --- File-history backfill (Task 8) -------------------------------------------
+#
+# Step 8.1 investigation, re-confirmed read-only against the live corpus before
+# coding (findings; some ADAPT the plan):
+#
+#   Layout ~/.claude/file-history/<session_id>/<pathhash>@vN: 78 session dirs (all
+#   UUIDs matching a transcript), 1557 files (all matching ^[0-9a-f]{16}@v\d+$),
+#   96MB, 13 empty snapshots (valid), 0 non-UTF-8. <pathhash> = sha256(abs_path)[:16]:
+#   494/494 on-disk hashes resolve from paths seen in transcripts (100%).
+#
+#   Authoritative mapping (M1): file-history-snapshot events carry
+#   snapshot.trackedFileBackups {key -> {backupFileName:"<pathhash>@vN"|null,
+#   version, backupTime}}. 16748 non-null entries name a real on-disk file (8 name a
+#   since-pruned file, skipped on read); 4255 have backupFileName=null (tracked, not
+#   yet backed up) and are skipped. Keys are relative ~half the time (8812 rel vs
+#   7944 abs); a relative key is absolutized via the pathhash reverse-index, not the
+#   key (all 8812 resolve). backupTime is the authoritative snapshot timestamp
+#   (survives an rsync/copy of ~/.claude that mtime does not).
+#
+#   ADAPTATIONS found in 8.1 (differ from the plan's implicit assumptions):
+#     * file-history-snapshot events carry NO top-level sessionId (0/2102) and no
+#       top-level timestamp, so raw_events.session_id is empty for them. The
+#       session_id (= the on-disk dir name) is derived from the transcript filename
+#       (raw_events.transcript_path); the timestamp comes from backupTime only.
+#     * a TIMESTAMPTZ cannot be fetched into Python without the optional pytz
+#       package, so snapshot_ts is read back as epoch_ms (a plain int) when emitting
+#       file_versions (the same footgun cmd_diff / cmd_tokens dodge).
+#
+#   Version chains are NON-contiguous (B1): 369/643 (session,pathhash) groups start
+#   at v2+, 1 has an interior gap; pre_sha is the highest PRESENT lower version's
+#   blob, never a naive v-1.
+#
+# Every snapshot's bytes become a blob unconditionally (irreversible-loss
+# insurance). Non-UTF-8 snapshots (0 today) are recorded as a file_history row with
+# sha=NULL, note='binary-skipped' and no blob / no file_versions row: a lossy
+# errors="replace" decode would contradict the preservation framing.
+
+FILE_HISTORY_DIR = Path.home() / ".claude" / "file-history"
+_FH_NAME_RE = re.compile(r"^([0-9a-f]{16})@v(\d+)$")   # <pathhash>@vN
+
+
+def _fh_session_id(transcript_path):
+    """session_id (= the on-disk file-history dir name) for a file-history-snapshot
+    raw_event, derived from the transcript filename because the event itself carries
+    no sessionId. Mirrors the ingester's subagent-path handling, though these events
+    only ever appear in main transcripts."""
+    p = Path(transcript_path)
+    return p.parent.parent.name if p.parent.name == "subagents" else p.stem
+
+
+def _snapshot_records(con):
+    """Authoritative driver: yield (session_id, pathhash, version, backup_file_name,
+    backup_time, key) for every non-null trackedFileBackups entry across every
+    file-history-snapshot raw_event. version + timestamp come from the transcript,
+    not the filesystem. Never raises on a malformed line."""
+    for tp, raw in con.execute(
+            "SELECT transcript_path, raw FROM raw_events "
+            "WHERE type='file-history-snapshot'").fetchall():
+        try:
+            ev = json.loads(raw)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
+        tfb = (ev.get("snapshot") or {}).get("trackedFileBackups")
+        if not isinstance(tfb, dict):
+            continue
+        sid = _fh_session_id(tp)
+        for key, meta in tfb.items():
+            if not isinstance(meta, dict):
+                continue
+            bfn = meta.get("backupFileName")
+            if not isinstance(bfn, str):        # null = tracked but not yet backed up
+                continue
+            m = _FH_NAME_RE.match(bfn)
+            if not m:
+                continue
+            yield (sid, m.group(1), int(m.group(2)), bfn, meta.get("backupTime"), key)
+
+
+def _known_paths(con):
+    """Reverse index { sha256(abs_path)[:16] : abs_path } over every absolute path
+    the store has seen: resolved file_versions paths, plus Read/Edit/Write/... tool
+    inputs. NOTE tool_input uses snake_case file_path / notebook_path (M3), NOT
+    camelCase filePath (which lives only in toolUseResult, already covered by
+    file_versions.path). _sha here hashes the PATH STRING, not file content."""
+    paths = {p for (p,) in con.execute(
+        "SELECT DISTINCT path FROM file_versions WHERE path IS NOT NULL").fetchall()}
+    for jpath in ("$.file_path", "$.notebook_path"):
+        for (p,) in con.execute(
+                f"SELECT DISTINCT json_extract_string(tool_input, '{jpath}') FROM events").fetchall():
+            if p:
+                paths.add(p)
+    return {_sha(p)[:16]: p for p in paths}
+
+
+_FH_COLS = ["session_id", "pathhash", "version", "path", "sha", "snapshot_ts", "note"]
+
+
+def _insert_file_history(con, rows):
+    """Upsert file_history rows, idempotent on (session_id, pathhash, version).
+    Snapshots are immutable, so an existing PK is left untouched (DO NOTHING)."""
+    con.execute("CREATE TEMP TABLE IF NOT EXISTS _fh_stage AS SELECT * FROM file_history WHERE 0=1")
+    con.execute("DELETE FROM _fh_stage")
+    con.executemany(
+        f"INSERT INTO _fh_stage ({','.join(_FH_COLS)}) VALUES ({','.join(['?'] * len(_FH_COLS))})",
+        [[r[c] for c in _FH_COLS] for r in rows])
+    con.execute("INSERT INTO file_history SELECT * FROM _fh_stage "
+                "ON CONFLICT (session_id, pathhash, version) DO NOTHING")
+    con.execute("DELETE FROM _fh_stage")
+
+
+def _read_snapshot(path):
+    """(content, note) for an on-disk snapshot file: the decoded text and note=None,
+    or (None, 'binary-skipped') on a non-UTF-8 file (0 today; preservation forbids a
+    lossy replace), or None if the file is unreadable/gone (caller skips it)."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    try:
+        return (data.decode("utf-8"), None)
+    except UnicodeDecodeError:
+        return (None, "binary-skipped")
+
+
+def _mtime_ts(path):
+    """On-disk mtime as a tz-aware UTC datetime, or None if the file is gone. The
+    timestamp fallback when trackedFileBackups.backupTime is missing or unparseable."""
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        return None
+
+
+def _parse_snapshot_ts(btime):
+    """Validate a trackedFileBackups.backupTime and return a value bindable into the
+    snapshot_ts TIMESTAMPTZ column (the original ISO string when well-formed), or
+    None when it is missing / not a string / unparseable. A bad backupTime must
+    NEVER abort the sweep: the entry lives permanently in raw_events, so letting the
+    ConversionException fire at the bind would wedge every future ingest with no
+    self-heal (violating the plan's skip-and-continue contract). A NULL snapshot_ts
+    flows safely through epoch_ms / cat, and the snapshot bytes are still preserved
+    as a blob + file_history row."""
+    if not isinstance(btime, str):
+        return None
+    try:
+        datetime.fromisoformat(btime.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return btime
+
+
+def _fh_row(sid, pathhash, version, sha, ts, note):
+    return {"session_id": sid, "pathhash": pathhash, "version": version,
+            "path": None, "sha": sha, "snapshot_ts": ts, "note": note}
+
+
+def _emit_file_history_versions(con):
+    """Emit a source='file-history' file_versions row for every resolved (path +
+    sha) file_history row, so cat sees snapshot content. pre_sha is the blob of the
+    highest PRESENT lower version in the same (session_id, pathhash) group (B1:
+    never a naive v-1); patch is a difflib unified diff when a predecessor exists.
+    Idempotent via the _insert_file_versions anti-join on the synthetic 'fh:'
+    event_id; already-emitted rows are skipped so a re-run does no difflib work.
+    Returns the number of NEW file_versions rows."""
+    before = con.execute(
+        "SELECT count(*) FROM file_versions WHERE source='file-history'").fetchone()[0]
+    done = {r[0] for r in con.execute(
+        "SELECT event_id FROM file_versions WHERE source='file-history'").fetchall()}
+    # epoch_ms(): read the TIMESTAMPTZ as a plain int (no pytz), re-boxed as a
+    # tz-aware UTC datetime for the insert (binding a datetime needs no pytz).
+    rows = con.execute(
+        "SELECT session_id, pathhash, version, path, sha, epoch_ms(snapshot_ts) "
+        "FROM file_history WHERE path IS NOT NULL AND sha IS NOT NULL "
+        "ORDER BY session_id, pathhash, version").fetchall()
+    fvs, prev = [], {}     # prev[(session_id, pathhash)] = highest present lower version's sha
+    for sid, ph, ver, path, sha, ms in rows:
+        gk = (sid, ph)
+        pre_sha = prev.get(gk)
+        prev[gk] = sha                     # advance for the next present version, even if skipped
+        eid = f"fh:{sid}:{ph}@v{ver}"
+        if eid in done:                    # already emitted; skip the difflib recompute
+            continue
+        patch = None
+        if pre_sha is not None and pre_sha != sha:
+            pre = con.execute("SELECT content FROM blobs WHERE sha=?", [pre_sha]).fetchone()
+            post = con.execute("SELECT content FROM blobs WHERE sha=?", [sha]).fetchone()
+            if pre and post and pre[0] is not None and post[0] is not None:
+                patch = "".join(difflib.unified_diff(
+                    pre[0].splitlines(True), post[0].splitlines(True),
+                    fromfile=path, tofile=path)) or None
+        fvs.append({
+            "event_id": eid, "session_id": sid,
+            "ts": datetime.fromtimestamp(ms / 1000, tz=timezone.utc) if ms is not None else None,
+            "path": path, "pre_sha": pre_sha, "post_sha": sha,
+            "patch": patch, "source": "file-history",
+        })
+    if fvs:
+        _insert_file_versions(con, fvs)
+    after = con.execute(
+        "SELECT count(*) FROM file_versions WHERE source='file-history'").fetchone()[0]
+    return after - before
+
+
+def ingest_file_history(con):
+    """Backfill ~/.claude/file-history snapshots into blobs + file_history, and emit
+    resolved snapshots as source='file-history' file_versions rows so cat can
+    reconstruct the ~61% of edits that are patch-only in transcripts. Returns
+    (new_snapshots, resolved). Never raises on a bad file: skip and continue.
+
+    M4 (--watch cost): snapshots are immutable, so an already-present PK is skipped
+    BEFORE any byte is read/hashed (a steady sweep reads no snapshot bytes). The
+    reverse-index rebuild + promotion + emit run only when there is new work (new
+    snapshots this sweep) or unresolved (path IS NULL) rows remain; the residual
+    per-sweep cost is a directory walk plus a raw_events scan, which is acceptable.
+    """
+    existing = set(con.execute(
+        "SELECT session_id, pathhash, version FROM file_history").fetchall())
+
+    # Authoritative driver first (trackedFileBackups), deduped by PK: the same
+    # (session, file, version) recurs across many snapshot events with an identical
+    # backupTime, so first-seen wins. This scans raw_events, NOT the on-disk dir, so
+    # it runs even after file-history has been pruned: its keys still drive deferred
+    # path resolution for the snapshots already preserved in file_history.
+    records = {}
+    for sid, ph, ver, bfn, btime, key in _snapshot_records(con):
+        records.setdefault((sid, ph, ver), (bfn, btime, key))
+
+    new_rows, new_count = [], 0
+    # Disk-reading passes only when the file-history dir still exists. When it has
+    # been pruned (the loss scenario this phase insures against), the snapshots are
+    # already preserved as blobs, so we skip straight to promotion + emit below so
+    # deferred resolution of the stored rows keeps working.
+    if FILE_HISTORY_DIR.exists():
+        for (sid, ph, ver), (bfn, btime, key) in records.items():
+            if (sid, ph, ver) in existing:
+                continue                   # immutable: never re-read
+            snap_path = FILE_HISTORY_DIR / sid / bfn
+            got = _read_snapshot(snap_path)
+            if got is None:
+                continue                   # referenced file gone (rare); skip
+            content, note = got
+            sha = _put_blob(con, content) if content is not None else None
+            ts = _parse_snapshot_ts(btime)
+            if ts is None:                 # bad/absent backupTime: fall back to mtime
+                ts = _mtime_ts(snap_path)
+            new_rows.append(_fh_row(sid, ph, ver, sha, ts, note))
+            new_count += 1
+
+        # Fallback for on-disk files with no trackedFileBackups entry (transcript
+        # gone; 0 today). Uses mtime (UTC-normalized) since backupTime is unavailable.
+        for f in FILE_HISTORY_DIR.glob("*/*"):
+            m = _FH_NAME_RE.match(f.name)
+            if not m:
+                continue
+            pk = (f.parent.name, m.group(1), int(m.group(2)))
+            if pk in existing or pk in records:
+                continue
+            got = _read_snapshot(f)
+            if got is None:
+                continue
+            content, note = got
+            ts = _mtime_ts(f)
+            if ts is None:
+                continue
+            sha = _put_blob(con, content) if content is not None else None
+            new_rows.append(_fh_row(pk[0], pk[1], pk[2], sha, ts, note))
+            new_count += 1
+
+        if new_rows:
+            _insert_file_history(con, new_rows)
+
+    # Promotion (deferred resolution) + emit. Runs regardless of the dir's presence
+    # (so pruned-dir rows still resolve), gated on new work or any unresolved row so
+    # an idle --watch sweep does nothing here. Count every path-less row, not just
+    # the ones with a blob: a binary-skipped row (sha NULL) still needs its path
+    # backfilled, and dropping the sha condition keeps the promotion pass alive until
+    # it is learned (the emit query below still filters sha IS NOT NULL).
+    unresolved = con.execute(
+        "SELECT count(*) FROM file_history WHERE path IS NULL").fetchone()[0]
+    resolved = 0
+    if new_rows or unresolved:
+        known = _known_paths(con)
+        # Augment the reverse index with self-describing absolute keys, so an
+        # absolute-key path that was never seen in an event still resolves.
+        for (sid, ph, ver), (bfn, btime, key) in records.items():
+            if ph not in known and isinstance(key, str) and os.path.isabs(key) \
+                    and _sha(key)[:16] == ph:
+                known[ph] = key
+        for (ph,) in con.execute(
+                "SELECT DISTINCT pathhash FROM file_history WHERE path IS NULL").fetchall():
+            p = known.get(ph)
+            if p is not None:
+                con.execute("UPDATE file_history SET path=? WHERE pathhash=? AND path IS NULL",
+                            [p, ph])
+        resolved = _emit_file_history_versions(con)
+
+    if new_count or resolved:
+        print(f"file-history: {new_count} new snapshots, {resolved} resolved")
+    return (new_count, resolved)
 
 
 def compact_db(store_path=None):
@@ -648,6 +984,10 @@ def compact_db(store_path=None):
 
 def cmd_ingest(argv):
     watch = "--watch" in argv
+    # --file-history-only runs just the file-history backfill pass (Phase 8): it does
+    # NOT sweep transcripts and does NOT touch ingest_state, but uses the same
+    # connect() writer and end-of-run CHECKPOINT, so --compact still composes.
+    fh_only = "--file-history-only" in argv
     # --compact rewrites the store to reclaim free blocks after the sweep; it is a
     # one-shot maintenance step, so it is meaningless (and skipped) under --watch.
     compact = "--compact" in argv and not watch
@@ -657,8 +997,13 @@ def cmd_ingest(argv):
     con = connect()
     try:
         while True:
-            n = ingest_all(con)
-            print(f"ingested {n} events")
+            if fh_only:
+                new, resolved = ingest_file_history(con)
+                if not (new or resolved):     # ingest_file_history prints only when nonzero
+                    print("file-history: 0 new snapshots, 0 resolved")
+            else:
+                n = ingest_all(con)
+                print(f"ingested {n} events")
             if not watch:
                 break
             time.sleep(interval)
@@ -779,6 +1124,39 @@ def cmd_stats(argv):
             print(f"== {label} ==")
             for r in con.execute(q).fetchall():
                 print("  ", *r)
+        # Reconstruction coverage (Phase 8). Guarded via information_schema so a
+        # not-yet-migrated 0.6.0 DB opened read-only (no `source` column / no
+        # file_history table) does not raise a binder error: readers never run DDL.
+        fv_cols = {r[0] for r in con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name='file_versions'").fetchall()}
+        has_fh = con.execute(
+            "SELECT count(*) FROM information_schema.tables "
+            "WHERE table_name='file_history'").fetchone()[0] > 0
+        if "source" in fv_cols:
+            print("== reconstruction coverage (cat-able paths) ==")
+            total, catable = con.execute(
+                "SELECT count(DISTINCT path), "
+                "count(DISTINCT path) FILTER (WHERE post_sha IS NOT NULL) "
+                "FROM file_versions WHERE path IS NOT NULL").fetchone()
+            print("   cat-able / edited paths ", catable, "/", total)
+            for src, c in con.execute(
+                    "SELECT coalesce(source,'transcript'), count(DISTINCT path) "
+                    "FROM file_versions WHERE post_sha IS NOT NULL AND path IS NOT NULL "
+                    "GROUP BY 1 ORDER BY 1").fetchall():
+                print(f"     via {src} ", c)
+        if has_fh:
+            print("== file history ==")
+            rows, hashes, resolved, unresolved = con.execute(
+                "SELECT count(*), count(DISTINCT pathhash), "
+                "count(*) FILTER (WHERE path IS NOT NULL), "
+                "count(*) FILTER (WHERE path IS NULL) FROM file_history").fetchone()
+            fh_bytes = con.execute(
+                "SELECT coalesce(sum(b.size),0) FROM file_history fh "
+                "JOIN blobs b ON b.sha=fh.sha").fetchone()[0]
+            print("   snapshots / distinct paths ", rows, "/", hashes)
+            print("   resolved / unresolved rows ", resolved, "/", unresolved)
+            print("   snapshot bytes ", fh_bytes)
     finally:
         con.close()
     return 0
@@ -813,21 +1191,40 @@ def cmd_cat(argv):
 
 
 def cmd_diff(argv):
-    # usage: diff <path> [--session S]  -> chronological list of edits with patches
+    # usage: diff <path> [--session S] [--all-sources]
+    # Defaults to transcript-derived rows only (source IS DISTINCT FROM
+    # 'file-history', which also keeps pre-migration NULL-source rows). File-history
+    # snapshot deltas are hidden by default because a snapshot spans a whole user
+    # turn, so including them double-lists every edit and, for the headless first
+    # snapshot of a group (B1), spams '(no patch)'. --all-sources opts them in, and
+    # then rows with a NULL patch are skipped to keep the output readable.
     args = argv[1:]
     path = args[0]
+    all_sources = "--all-sources" in args
     def opt(n):
         return args[args.index(n) + 1] if n in args and args.index(n) + 1 < len(args) else None
     where, params = ["path = ?"], [path]
     if opt("--session"): where.append("session_id LIKE ?"); params.append(opt("--session") + "%")
-    # strftime(ts) instead of raw ts: DuckDB needs the optional `pytz` package to
-    # materialize a TIMESTAMPTZ into a Python datetime, so fetching the raw column
-    # crashes on a clean install without pytz. The header only needs the string.
-    sql = (f"SELECT strftime(ts,'%Y-%m-%d %H:%M:%S'), substr(session_id,1,8), patch "
-           f"FROM file_versions WHERE {' AND '.join(where)} ORDER BY ts")
     con = connect(read_only=True)
     try:
+        # Guard the source filter behind the same information_schema check cmd_stats
+        # uses: a not-yet-migrated 0.6.0 DB opened read-only has no `source` column,
+        # and referencing it would raise a binder error (readers never run DDL, so
+        # the column stays absent until a writable ingest). A pre-migration DB holds
+        # only transcript rows, so skipping the filter is semantically identical.
+        has_source = "source" in {r[0] for r in con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name='file_versions'").fetchall()}
+        if has_source and not all_sources:
+            where.append("source IS DISTINCT FROM 'file-history'")
+        # strftime(ts) instead of raw ts: DuckDB needs the optional `pytz` package to
+        # materialize a TIMESTAMPTZ into a Python datetime, so fetching the raw column
+        # crashes on a clean install without pytz. The header only needs the string.
+        sql = (f"SELECT strftime(ts,'%Y-%m-%d %H:%M:%S'), substr(session_id,1,8), patch "
+               f"FROM file_versions WHERE {' AND '.join(where)} ORDER BY ts")
         for ts, sid, patch in con.execute(sql, params).fetchall():
+            if all_sources and patch is None:
+                continue                     # skip headless/NULL-patch file-history rows
             print(f"=== {ts}  {sid} ===\n{patch or '(no patch)'}\n")
     finally:
         con.close()
