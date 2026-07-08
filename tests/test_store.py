@@ -267,3 +267,276 @@ def test_attribution_parse_usage_sets_agent_id():
     row = store.parse_usage(_assistant_text_and_bash(), agent_id="abc")
     assert row["agent_id"] == "abc"
     assert store.parse_usage(_assistant_text_and_bash())["agent_id"] is None
+
+
+# --- Incremental ingester (Task 3) --------------------------------------------
+#
+# These are hermetic: a tiny synthetic transcript is written under a fake
+# ~/.claude/projects layout in tmp_path, and both PROJECTS_DIR and STORE_PATH are
+# monkeypatched so nothing touches the live corpus or the real DB.
+
+
+def _write_jsonl(path, events):
+    """Write one JSON object per line, creating parent dirs as needed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(e) + "\n" for e in events), encoding="utf-8")
+
+
+def _main_transcript_events(sid):
+    """Five transcript lines: two assistant content-block lines sharing ONE
+    requestId + identical usage (the second carries a Bash tool_use), a user
+    tool_result line, a plain user prompt, and one <synthetic> assistant line."""
+    usage = {"input_tokens": 100, "output_tokens": 50,
+             "cache_read_input_tokens": 200, "cache_creation_input_tokens": 30,
+             "service_tier": "standard"}
+    return [
+        {  # assistant text block, request R1
+            "type": "assistant", "uuid": "m-a-text", "requestId": "req-R1",
+            "sessionId": sid, "timestamp": "2026-06-30T02:00:00.000Z",
+            "message": {"role": "assistant", "model": "claude-opus-4-8",
+                        "id": "msg-R1",
+                        "content": [{"type": "text", "text": "Checking things."}],
+                        "usage": usage}},
+        {  # assistant Bash tool_use block, same request R1 + identical usage
+            "type": "assistant", "uuid": "m-a-bash", "requestId": "req-R1",
+            "sessionId": sid, "timestamp": "2026-06-30T02:00:01.000Z",
+            "message": {"role": "assistant", "model": "claude-opus-4-8",
+                        "id": "msg-R1",
+                        "content": [{"type": "tool_use", "id": "toolu-bash-1",
+                                     "name": "Bash",
+                                     "input": {"command": "echo hi",
+                                               "description": "say hi"}}],
+                        "usage": usage}},
+        {  # user tool_result with top-level toolUseResult
+            "type": "user", "uuid": "m-u-result", "sessionId": sid,
+            "timestamp": "2026-06-30T02:00:02.000Z",
+            "message": {"role": "user",
+                        "content": [{"type": "tool_result",
+                                     "tool_use_id": "toolu-bash-1",
+                                     "content": "hi", "is_error": False}]},
+            "toolUseResult": {"stdout": "hi", "stderr": "",
+                              "interrupted": False, "isImage": False}},
+        {  # plain user prompt (string content)
+            "type": "user", "uuid": "m-u-prompt", "sessionId": sid,
+            "timestamp": "2026-06-30T02:00:03.000Z",
+            "message": {"role": "user", "content": "please continue"}},
+        {  # synthetic assistant line: parse_usage skips it, api_requests excludes it
+            "type": "assistant", "uuid": "m-a-synth", "requestId": "req-synth",
+            "sessionId": sid, "timestamp": "2026-06-30T02:00:04.000Z",
+            "message": {"role": "assistant", "model": "<synthetic>",
+                        "id": "msg-synth",
+                        "content": [{"type": "text", "text": "(no api call)"}],
+                        "usage": {"input_tokens": 0, "output_tokens": 0,
+                                  "cache_read_input_tokens": 0,
+                                  "cache_creation_input_tokens": 0}}},
+    ]
+
+
+def test_ingest_all_main_transcript(tmp_path, monkeypatch):
+    """Full sweep over one synthetic main transcript, then idempotent re-run."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+
+    sid = "sess-main-0001"
+    events = _main_transcript_events(sid)
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", events)
+
+    con = store.connect()
+    try:
+        total = store.ingest_all(con)
+        assert total == len(events)  # every transcript line ingested
+
+        def count(sql):
+            return con.execute(sql).fetchone()[0]
+
+        assert count("SELECT count(*) FROM raw_events") == len(events)   # 5, one per line
+        assert count("SELECT count(*) FROM events") == 5
+        by_type = dict(con.execute(
+            "SELECT type, count(*) FROM events GROUP BY 1").fetchall())
+        assert by_type == {"assistant": 2, "tool_use": 1,
+                           "tool_result": 1, "user": 1}
+        assert count("SELECT count(*) FROM events WHERE tool_name='Bash'") == 1
+        # two content-block lines collapse to 1 request; synthetic excluded
+        assert count("SELECT count(*) FROM api_requests") == 1
+        assert con.execute("SELECT request_id FROM api_requests").fetchone()[0] == "req-R1"
+        assert count("SELECT count(*) FROM sessions") == 1
+        assert con.execute(
+            "SELECT event_count FROM sessions").fetchone()[0] == len(events)
+
+        # idempotent: re-running ingests nothing and leaves every table unchanged
+        assert store.ingest_all(con) == 0
+        assert count("SELECT count(*) FROM raw_events") == len(events)
+        assert count("SELECT count(*) FROM events") == 5
+        assert count("SELECT count(*) FROM api_requests") == 1
+        assert con.execute(
+            "SELECT event_count FROM sessions").fetchone()[0] == len(events)
+    finally:
+        con.close()
+
+
+def test_ingest_all_subagent_attribution(tmp_path, monkeypatch):
+    """Subagent transcript is swept in and its rows carry agent_id from the
+    agent-<id>.jsonl filename; main-thread rows stay agent_id NULL."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+
+    sid = "sess-sub-0001"
+    main_line = {
+        "type": "assistant", "uuid": "main-a-bash", "requestId": "req-main",
+        "sessionId": sid, "timestamp": "2026-06-30T02:59:00.000Z",
+        "message": {"role": "assistant", "model": "claude-opus-4-8", "id": "msg-main",
+                    "content": [{"type": "tool_use", "id": "toolu-main-1",
+                                 "name": "Bash",
+                                 "input": {"command": "pwd", "description": "pwd"}}],
+                    "usage": {"input_tokens": 20, "output_tokens": 10,
+                              "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0,
+                              "service_tier": "standard"}}}
+    sub_line = {
+        "type": "assistant", "uuid": "s-a-bash", "requestId": "req-sub",
+        "sessionId": sid, "timestamp": "2026-06-30T03:00:00.000Z",
+        "message": {"role": "assistant", "model": "claude-opus-4-8", "id": "msg-sub",
+                    "content": [{"type": "tool_use", "id": "toolu-sub-1",
+                                 "name": "Bash",
+                                 "input": {"command": "ls", "description": "list"}}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5,
+                              "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0,
+                              "service_tier": "standard"}}}
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", [main_line])
+    _write_jsonl(projects / "-fake-proj" / sid / "subagents" / "agent-XYZ.jsonl",
+                 [sub_line])
+
+    con = store.connect()
+    try:
+        assert store.ingest_all(con) == 2  # both files, one line each
+
+        def count(sql):
+            return con.execute(sql).fetchone()[0]
+
+        # subagent rows are attributed to XYZ; main-thread rows stay NULL
+        assert count("SELECT count(*) FROM events WHERE agent_id='XYZ'") == 1
+        assert con.execute(
+            "SELECT tool_name FROM events WHERE agent_id='XYZ'").fetchone()[0] == "Bash"
+        assert count("SELECT count(*) FROM events WHERE agent_id IS NULL "
+                     "AND tool_name='Bash'") == 1
+        # api_requests carry the agent_id too
+        assert count("SELECT count(*) FROM api_requests") == 2
+        assert count("SELECT count(*) FROM api_requests WHERE agent_id='XYZ'") == 1
+        assert con.execute(
+            "SELECT request_id FROM api_requests WHERE agent_id='XYZ'").fetchone()[0] == "req-sub"
+        assert count("SELECT count(*) FROM api_requests WHERE agent_id IS NULL") == 1
+        # both files share the parent sessionId -> one session, two lines
+        assert count("SELECT count(*) FROM sessions") == 1
+        assert con.execute("SELECT event_count FROM sessions").fetchone()[0] == 2
+    finally:
+        con.close()
+
+
+def _user_prompt(uuid, sid, text, ts):
+    """One plain user-prompt transcript line (string content -> exactly one
+    `events` row), so line counts and event counts move in lockstep."""
+    return {"type": "user", "uuid": uuid, "sessionId": sid, "timestamp": ts,
+            "message": {"role": "user", "content": text}}
+
+
+def test_ingest_incremental_append_and_partial_line(tmp_path, monkeypatch):
+    """Tailing: appended complete lines ingest exactly once and never re-count
+    the seed, and a trailing partial line (no newline yet) is withheld until its
+    terminating newline arrives. Exercises the offset math in ingest_transcript.
+    """
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+
+    sid = "sess-append-0001"
+    path = projects / "-fake-proj" / f"{sid}.jsonl"
+    seed = [_user_prompt("u-seed-1", sid, "first", "2026-06-30T02:00:00.000Z"),
+            _user_prompt("u-seed-2", sid, "second", "2026-06-30T02:00:01.000Z")]
+    _write_jsonl(path, seed)
+
+    con = store.connect()
+    try:
+        def count(sql):
+            return con.execute(sql).fetchone()[0]
+
+        assert store.ingest_all(con) == len(seed)               # 2 seed lines
+        assert count("SELECT count(*) FROM raw_events") == 2
+        assert count("SELECT count(*) FROM events") == 2
+
+        # append 2 complete lines PLUS a trailing partial line with NO newline
+        complete = "".join(json.dumps(e) + "\n" for e in [
+            _user_prompt("u-app-1", sid, "third", "2026-06-30T02:00:02.000Z"),
+            _user_prompt("u-app-2", sid, "fourth", "2026-06-30T02:00:03.000Z")])
+        partial = json.dumps(
+            _user_prompt("u-app-3", sid, "fifth-partial", "2026-06-30T02:00:04.000Z"))
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(complete + partial)                          # partial: no '\n'
+
+        # only the 2 completed lines land; the seed is not re-counted and the
+        # partial trailing line is withheld
+        assert store.ingest_all(con) == 2
+        assert count("SELECT count(*) FROM raw_events") == 4
+        assert count("SELECT count(*) FROM events") == 4
+        assert count("SELECT count(*) FROM raw_events WHERE uuid='u-app-3'") == 0
+
+        # re-running while the line is still partial changes nothing
+        assert store.ingest_all(con) == 0
+        assert count("SELECT count(*) FROM raw_events") == 4
+
+        # terminate the partial line -> it now ingests, exactly once
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n")
+        assert store.ingest_all(con) == 1
+        assert count("SELECT count(*) FROM raw_events") == 5
+        assert count("SELECT count(*) FROM events") == 5
+        assert count("SELECT count(*) FROM raw_events WHERE uuid='u-app-3'") == 1
+    finally:
+        con.close()
+
+
+def test_decode_project_maps_encoded_dir_name(tmp_path, monkeypatch):
+    """A leading '-' cwd-encoded dir name decodes to a slash path label."""
+    monkeypatch.setattr(store, "PROJECTS_DIR", tmp_path)
+    path = tmp_path / "-home-naka-Projects-personal" / "abc.jsonl"
+    assert store._decode_project(path) == "/home/naka/Projects/personal"
+
+
+def test_compact_db_reclaims_free_blocks_and_preserves_rows(tmp_path, monkeypatch):
+    """compact_db rewrites the store into a fresh file: every row survives, the
+    file is no larger, PRAGMA reports zero free blocks, and the temp is cleaned
+    up. This is the opt-in remedy for the ~2x free-block bloat a bulk ingest
+    leaves (CHECKPOINT alone never coalesces those blocks). Hermetic:
+    monkeypatched PROJECTS_DIR/STORE_PATH, no live corpus."""
+    projects = tmp_path / "projects"
+    store_path = tmp_path / "trail.duckdb"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", store_path)
+
+    sid = "sess-compact-0001"
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", _main_transcript_events(sid))
+
+    tables = ("raw_events", "events", "api_requests", "sessions")
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        before = {t: con.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in tables}
+    finally:
+        con.close()  # release the write lock before compacting (compact_db's contract)
+    assert all(v > 0 for v in before.values())  # the fixture actually populated every table
+
+    old_size, new_size = store.compact_db(store_path)
+    assert new_size <= old_size
+    assert not (store_path.with_suffix(store_path.suffix + ".compact-tmp")).exists()
+
+    con_ro = store.connect(read_only=True)
+    try:
+        after = {t: con_ro.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in tables}
+        # PRAGMA database_size columns: ...,used_blocks, free_blocks(=idx 5),...
+        free_blocks = con_ro.execute("PRAGMA database_size").fetchone()[5]
+    finally:
+        con_ro.close()
+    assert after == before   # no data loss across the rewrite
+    assert free_blocks == 0  # fully compacted, no interspersed free blocks left
