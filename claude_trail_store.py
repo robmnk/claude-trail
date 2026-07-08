@@ -820,8 +820,11 @@ def cmd_diff(argv):
         return args[args.index(n) + 1] if n in args and args.index(n) + 1 < len(args) else None
     where, params = ["path = ?"], [path]
     if opt("--session"): where.append("session_id LIKE ?"); params.append(opt("--session") + "%")
-    sql = (f"SELECT ts, substr(session_id,1,8), patch FROM file_versions "
-           f"WHERE {' AND '.join(where)} ORDER BY ts")
+    # strftime(ts) instead of raw ts: DuckDB needs the optional `pytz` package to
+    # materialize a TIMESTAMPTZ into a Python datetime, so fetching the raw column
+    # crashes on a clean install without pytz. The header only needs the string.
+    sql = (f"SELECT strftime(ts,'%Y-%m-%d %H:%M:%S'), substr(session_id,1,8), patch "
+           f"FROM file_versions WHERE {' AND '.join(where)} ORDER BY ts")
     con = connect(read_only=True)
     try:
         for ts, sid, patch in con.execute(sql, params).fetchall():

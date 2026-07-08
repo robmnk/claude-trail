@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "claude-trail"
-version = "0.5.2"
+version = "0.6.0"
 description = "Observability TUI for Claude Code: a real-time trail of every Bash command Claude Code executes."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,7 +18,7 @@ dev = ["pytest", "ruff>=0.15,<0.16"]
 claude-trail = "claude_trail:main"
 
 [tool.hatch.build.targets.wheel]
-include = ["claude_trail.py"]
+include = ["claude_trail.py", "claude_trail_store.py"]
 
 [tool.ruff]
 line-length = 100
