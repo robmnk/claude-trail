@@ -499,8 +499,6 @@ def cmd_ingest(argv):
 
 # --- Search, stats, tokens CLI (Task 4) ---------------------------------------
 
-import re as _re
-
 
 def _print_rows(rows, headers):
     from rich.console import Console
@@ -519,7 +517,7 @@ def cmd_search(argv):
         print("usage: claude-trail search <regex> [--tool T --project P --since ISO --limit N -i]")
         return 2
     def opt(name, default=None):
-        return args[args.index(name) + 1] if name in args else default
+        return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else default
     flags = "(?i)" if "-i" in args else ""
     where, params = ["(regexp_matches(coalesce(text,''), ?) OR regexp_matches(coalesce(stdout,''), ?) OR regexp_matches(coalesce(stderr,''), ?))"], [flags+pat]*3
     if opt("--tool"):    where.append("tool_name = ?");                 params.append(opt("--tool"))
@@ -544,7 +542,7 @@ def cmd_tokens(argv):
     # default: per-session totals; with --session: per-command breakdown for it
     args = argv[1:]
     def opt(name, default=None):
-        return args[args.index(name) + 1] if name in args else default
+        return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else default
     sess, since = opt("--session"), opt("--since")
     by = opt("--by", "command" if sess else "session")
     limit = int(opt("--limit", "30"))
@@ -555,7 +553,7 @@ def cmd_tokens(argv):
     sql = {
         "session": f"""SELECT substr(session_id,1,8), count(*), sum(output_tokens),
                               sum(cache_creation_tokens), sum(cache_read_tokens),
-                              min(ts), max(ts)
+                              strftime(min(ts),'%Y-%m-%d %H:%M'), strftime(max(ts),'%Y-%m-%d %H:%M')
                        FROM api_requests {w} GROUP BY session_id
                        ORDER BY 3 DESC LIMIT {limit}""",
         "command": f"""SELECT strftime(ts,'%m-%d %H:%M'), tool_name,

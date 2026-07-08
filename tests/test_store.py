@@ -608,6 +608,24 @@ def test_cmd_tokens_default_per_session(tmp_path, monkeypatch, capsys):
     assert "50" in out              # sum(output_tokens) for the session
 
 
+def test_cmd_tokens_default_per_session_without_pytz(tmp_path, monkeypatch, capsys):
+    """The default per-session view must not require the optional `pytz` package.
+
+    DuckDB's Python client needs `pytz` to materialize a raw TIMESTAMPTZ into a
+    datetime; the session branch dodges that by strftime-ing min/max(ts) to
+    strings. Simulate a clean install without pytz by mapping the module to None
+    (so any `import pytz` raises ModuleNotFoundError), then run the default view:
+    it must return 0 and print the session row without raising. Regression for the
+    raw-min(ts)/max(ts) footgun that only passed while the dev env had pytz.
+    """
+    monkeypatch.setitem(sys.modules, "pytz", None)  # any `import pytz` now raises
+    sid = _build_cli_store(tmp_path, monkeypatch)
+    assert store.cmd_tokens(["tokens"]) == 0
+    out = capsys.readouterr().out
+    assert sid[:8] in out
+    assert "50" in out              # sum(output_tokens) for the session
+
+
 def test_cmd_tokens_session_per_command(tmp_path, monkeypatch, capsys):
     """--session <sid> switches the default --by to command: the Bash tool_use row
     prints with its generation-cost output tokens."""
