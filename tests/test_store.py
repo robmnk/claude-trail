@@ -673,3 +673,175 @@ def test_cmd_cat_and_cmd_diff_are_phase6_stubs(tmp_path, monkeypatch, capsys):
     assert "phase 6" in capsys.readouterr().out
     assert store.cmd_diff(["diff", "/some/path"]) == 0
     assert "phase 6" in capsys.readouterr().out
+
+
+# --- File versions + content-addressed blobs (Task 5) -------------------------
+#
+# Fixtures below mirror the real `toolUseResult` shapes confirmed in Step 5.1
+# (see the FILE VERSIONS comment block in claude_trail_store.py): a Write result
+# carries the full post `content` and a `type` of "create"/"update"; an Edit
+# result carries no `content` and reconstructs post by applying
+# oldString->newString to `originalFile`. Both carry a top-level `filePath` and a
+# `structuredPatch`, which is the detector the extractor keys on. Tests that need
+# a DB monkeypatch STORE_PATH to a temp file; the pure ones do not.
+
+
+def _edit_result_event(sid="sess-fv-0001", uuid="fv-edit-1", path="/tmp/demo.py"):
+    """A user tool_result for an Edit: originalFile (pre) + oldString/newString +
+    a real structuredPatch hunk, but NO `content` (post is reconstructed)."""
+    pre = "line one\nline two\nline three\n"
+    old = "line two\n"
+    new = "line two CHANGED\nline two-b\n"
+    return {
+        "type": "user", "uuid": uuid, "sessionId": sid,
+        "timestamp": "2026-06-30T04:00:01.000Z",
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu-edit-1",
+             "content": f"The file {path} has been updated."}]},
+        "toolUseResult": {
+            "filePath": path,
+            "oldString": old,
+            "newString": new,
+            "replaceAll": False,
+            "originalFile": pre,
+            "structuredPatch": [
+                {"oldStart": 2, "oldLines": 1, "newStart": 2, "newLines": 2,
+                 "lines": ["-line two", "+line two CHANGED", "+line two-b"]}],
+            "userModified": False,
+        },
+    }
+
+
+def _write_create_event(sid="sess-fv-0001", uuid="fv-write-1",
+                        path="/tmp/new.py", content="print('hello')\n"):
+    """A user tool_result for a Write of a new file: type "create", full post
+    `content`, originalFile null, structuredPatch []."""
+    return {
+        "type": "user", "uuid": uuid, "sessionId": sid,
+        "timestamp": "2026-06-30T04:00:00.000Z",
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu-write-1",
+             "content": f"File created successfully at: {path}"}]},
+        "toolUseResult": {
+            "type": "create", "filePath": path, "content": content,
+            "structuredPatch": [], "originalFile": None, "userModified": False,
+        },
+    }
+
+
+def test_put_blob_dedups_identical_content(tmp_path, monkeypatch):
+    """Two identical contents content-address to one blob row (sha dedup); None
+    stores nothing; a distinct content adds exactly one more."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    con = store.connect()
+    try:
+        a = store._put_blob(con, "same bytes")
+        b = store._put_blob(con, "same bytes")
+        assert a == b
+        assert con.execute("SELECT count(*) FROM blobs").fetchone()[0] == 1
+        assert store._put_blob(con, None) is None      # None -> no row, no sha
+        assert con.execute("SELECT count(*) FROM blobs").fetchone()[0] == 1
+        store._put_blob(con, "other bytes")
+        assert con.execute("SELECT count(*) FROM blobs").fetchone()[0] == 2
+    finally:
+        con.close()
+
+
+def test_render_patch_difflib_fallback_when_no_structured_patch():
+    """_render_patch prefers structuredPatch (as JSON); with none present it
+    falls back to a difflib unified diff; with no post it returns None. Pure."""
+    pre, post = "a\nb\nc\n", "a\nB\nc\n"
+    patch = store._render_patch(None, pre, post, "/x/y.txt")
+    assert patch is not None
+    assert "--- /x/y.txt" in patch and "+++ /x/y.txt" in patch
+    assert "-b" in patch and "+B" in patch
+    assert store._render_patch([], pre, post, "/x/y.txt") == patch  # empty list == absent
+    sp = [{"oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1,
+           "lines": ["-b", "+B"]}]
+    assert json.loads(store._render_patch(sp, pre, post, "/x/y.txt")) == sp
+    # no diff possible (create has pre=None; a missing post) -> None
+    assert store._render_patch(None, None, "content", "/x") is None
+    assert store._render_patch(None, "content", None, "/x") is None
+
+
+def test_file_version_from_event_returns_none_for_non_edits(tmp_path, monkeypatch):
+    """A Bash toolUseResult (no filePath/structuredPatch) and malformed events
+    yield None and write no file_versions."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    con = store.connect()
+    try:
+        assert store.file_version_from_event(con, _user_tool_result()) is None  # Bash result
+        assert store.file_version_from_event(con, {"type": "user"}) is None      # no toolUseResult
+        assert store.file_version_from_event(con, "not a dict") is None
+        assert con.execute("SELECT count(*) FROM file_versions").fetchone()[0] == 0
+    finally:
+        con.close()
+
+
+def test_file_version_from_event_edit_row_and_blob_roundtrip(tmp_path, monkeypatch):
+    """A synthetic Edit event yields a file_versions row with the right path and a
+    non-null post_sha; the post blob round-trips to the reconstructed content and
+    the patch comes from the structuredPatch (not difflib)."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    ev = _edit_result_event(path="/tmp/demo.py")
+    tur = ev["toolUseResult"]
+    expected_post = tur["originalFile"].replace(tur["oldString"], tur["newString"], 1)
+    con = store.connect()
+    try:
+        fv = store.file_version_from_event(con, ev)
+        assert fv is not None
+        assert fv["path"] == "/tmp/demo.py"
+        assert fv["pre_sha"] is not None and fv["post_sha"] is not None
+        # the reconstructed post is stored and reads back byte-for-byte
+        post = con.execute("SELECT content FROM blobs WHERE sha=?",
+                           [fv["post_sha"]]).fetchone()[0]
+        assert post == expected_post
+        pre = con.execute("SELECT content FROM blobs WHERE sha=?",
+                          [fv["pre_sha"]]).fetchone()[0]
+        assert pre == tur["originalFile"]
+        # patch is the JSON-encoded structuredPatch, not a difflib diff
+        assert json.loads(fv["patch"])[0]["newStart"] == 2
+    finally:
+        con.close()
+
+
+def test_ingest_all_captures_file_versions_and_blobs(tmp_path, monkeypatch):
+    """End-to-end: a transcript with a Write(create) and an Edit(update) yields
+    non-zero file_versions and blobs after ingest_all, the edit path round-trips,
+    and re-ingest is idempotent (offset-tracked, no duplicate file_versions)."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+
+    sid = "sess-fv-e2e-0001"
+    path = "/tmp/demo_e2e.py"
+    events = [
+        _write_create_event(sid, "fv-w-1", path, "v1\n"),
+        _edit_result_event(sid, "fv-e-1", path),
+        _user_prompt("u-fv-prompt", sid, "carry on", "2026-06-30T04:00:02.000Z"),
+    ]
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", events)
+
+    con = store.connect()
+    try:
+        def count(sql):
+            return con.execute(sql).fetchone()[0]
+
+        store.ingest_all(con)
+        assert count("SELECT count(*) FROM file_versions") == 2      # write + edit
+        assert count("SELECT count(*) FROM blobs") > 0               # real bytes stored
+        # the edit path is present with a non-null post_sha that round-trips
+        post_sha = con.execute(
+            "SELECT post_sha FROM file_versions WHERE path=? AND pre_sha IS NOT NULL",
+            [path]).fetchone()[0]
+        assert post_sha is not None
+        content = con.execute("SELECT content FROM blobs WHERE sha=?",
+                             [post_sha]).fetchone()[0]
+        assert content == "line one\nline two CHANGED\nline two-b\nline three\n"
+
+        # idempotent re-ingest: offset tracking means no line is reprocessed, so
+        # the append-only file_versions table does not grow
+        store.ingest_all(con)
+        assert count("SELECT count(*) FROM file_versions") == 2
+    finally:
+        con.close()

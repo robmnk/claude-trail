@@ -4,6 +4,7 @@ Ingests transcripts (~/.claude/projects/**/*.jsonl) and file snapshots into a
 single local DuckDB file; provides substring/regex search and file
 reconstruction. Single-writer ingester, read-only readers.
 """
+import difflib
 import hashlib
 import json
 import os
@@ -329,7 +330,7 @@ def ingest_transcript(con, path):
     complete, new_off = data[:nl + 1], last + nl + 1
     # subagent transcripts: <project>/<sid>/subagents/agent-<id>.jsonl
     agent_id = path.stem.removeprefix("agent-") if path.parent.name == "subagents" else None
-    raw_rows, rows, ureqs = [], [], []
+    raw_rows, rows, ureqs, fvs = [], [], [], []
     for line in complete.decode("utf-8", errors="replace").splitlines():
         if not line.strip():
             continue
@@ -346,6 +347,10 @@ def ingest_transcript(con, path):
         u = parse_usage(ev, agent_id)           # one api_requests row per assistant line
         if u:
             ureqs.append(u)
+        if ev.get("toolUseResult") is not None:  # edit/write results -> file version + blobs
+            fv = file_version_from_event(con, ev)
+            if fv:
+                fvs.append(fv)
     if raw_rows:
         _insert_raw(con, raw_rows)            # verbatim, always
         _upsert_session(con, path, raw_rows)
@@ -353,6 +358,8 @@ def ingest_transcript(con, path):
         _insert_events(con, rows)
     if ureqs:
         _insert_requests(con, ureqs)
+    if fvs:
+        _insert_file_versions(con, fvs)
     con.execute(
         "INSERT INTO ingest_state VALUES (?,?,?) "
         "ON CONFLICT (transcript_path) DO UPDATE SET last_offset=excluded.last_offset, last_mtime=excluded.last_mtime",
@@ -415,6 +422,140 @@ def ingest_all(con):
     for path in paths:
         total += ingest_transcript(con, path)
     return total
+
+
+# --- File versions + content-addressed blobs (Task 5) -------------------------
+#
+# Step 5.1 investigation (confirmed against the live corpus, 735 edit/write
+# `toolUseResult`s across 60 transcripts, zero shape mismatches). The plan's
+# field-name guesses are ADAPTED to what the data actually holds:
+#
+#   Write  -> toolUseResult = {type: "create"|"update", filePath, content,
+#             originalFile, structuredPatch, userModified}
+#       * filePath      : absolute path (top level)          [the path key]
+#       * content       : full POST content, always a str    [post source]
+#       * originalFile  : full PRE content; null on "create", str on "update"
+#       * structuredPatch: list of hunks; [] on "create"
+#
+#   Edit   -> toolUseResult = {filePath, oldString, newString, replaceAll,
+#             originalFile, structuredPatch, userModified}
+#       * NO `content` and NO `type`; POST is not stored directly.
+#       * originalFile  : full PRE content (str)
+#       * POST is reconstructed by applying oldString->newString to originalFile
+#         (all occurrences when replaceAll, else the first). See _post_content.
+#       * structuredPatch: non-empty list of hunks.
+#
+#   structuredPatch hunk = {oldStart, oldLines, newStart, newLines,
+#                           lines: [" ctx", "-removed", "+added", ...]}.
+#
+#   MultiEdit/NotebookEdit: NOT present in the corpus. _post_content
+#   defensively supports a MultiEdit `edits` list (apply sequentially) if a
+#   future version emits one; unknown shapes just yield post=None (non-fatal).
+#
+# Detector: a result is a file edit iff it has a top-level `filePath` (str) AND
+# a `structuredPatch` key. In the sample these co-occur perfectly (735 with
+# both, 2539 non-edit results with neither). A PDF Read carries `type:"parts"`
+# with `filePath` nested under `file`, NOT at top level, so it is correctly
+# skipped. Bash results (stdout/stderr, no filePath) are skipped too.
+#
+# file-history (~/.claude/file-history/<uuid>/<pathhash>@vN): full-content
+# snapshots keyed by an opaque path-hash, with no index tying <uuid>/<pathhash>
+# back to (session_id, real path, order) and no sidecar metadata. That mapping
+# is unsolvable without reversing the hash, and it is redundant here: every
+# transcript-covered edit already yields PRE (originalFile) and POST (content or
+# reconstruction) plus the patch. So file-history is SKIPPED; reconstruction
+# relies on toolUseResult alone (covers files Claude edited, which is the scope).
+
+
+def _put_blob(con, text):
+    """Content-address `text` into `blobs` (dedup by sha256); return its sha, or
+    None for None input. Empty string is a real blob (sha of "")."""
+    if text is None:
+        return None
+    sha = _sha(text)
+    con.execute("INSERT INTO blobs VALUES (?,?,?) ON CONFLICT (sha) DO NOTHING",
+                [sha, len(text.encode("utf-8", "replace")), text])
+    return sha
+
+
+def _post_content(tur, pre):
+    """Full post-edit content for a file result. Write carries it directly as
+    `content`; Edit does not, so reconstruct it by applying the recorded string
+    replacement(s) to the pre-edit `originalFile`. Returns None when neither the
+    content nor a usable pre+replacement is present. Never raises."""
+    content = tur.get("content")
+    if isinstance(content, str):
+        return content                     # Write: post given verbatim
+    if not isinstance(pre, str):
+        return None                        # no pre to apply an edit onto
+    edits = tur.get("edits")               # MultiEdit shape (defensive; unseen in corpus)
+    if isinstance(edits, list) and edits:
+        out = pre
+        for e in edits:
+            if not isinstance(e, dict):
+                continue
+            old, new = e.get("oldString"), e.get("newString")
+            if not isinstance(old, str) or not isinstance(new, str):
+                continue
+            out = out.replace(old, new) if e.get("replaceAll") else out.replace(old, new, 1)
+        return out
+    old, new = tur.get("oldString"), tur.get("newString")
+    if isinstance(old, str) and isinstance(new, str):
+        return pre.replace(old, new) if tur.get("replaceAll") else pre.replace(old, new, 1)
+    return None
+
+
+def _render_patch(structured, pre, post, path):
+    """Prefer the already-computed structuredPatch hunks (stored as JSON); else
+    fall back to a difflib unified diff when both pre and post are present; else
+    None (e.g. a create, which has no diff, only post content)."""
+    if structured:
+        return json.dumps(structured)
+    if pre is not None and post is not None:
+        return "".join(difflib.unified_diff(
+            pre.splitlines(True), post.splitlines(True),
+            fromfile=path, tofile=path))
+    return None
+
+
+def file_version_from_event(con, ev):
+    """For an Edit/Write/MultiEdit user tool_result event, return a `file_versions`
+    row dict and store its pre/post blobs via _put_blob. Returns None for anything
+    that is not a file-editing result (Bash, Read, no path, unknown shape). Uses
+    the shapes confirmed in Step 5.1 above. Never raises."""
+    if not isinstance(ev, dict):
+        return None
+    tur = ev.get("toolUseResult")
+    if not isinstance(tur, dict):
+        return None
+    path = tur.get("filePath")
+    if not isinstance(path, str) or not path or "structuredPatch" not in tur:
+        return None                        # not an edit/write result
+    pre = tur.get("originalFile")
+    if not isinstance(pre, str):
+        pre = None                         # null on create, or absent
+    post = _post_content(tur, pre)
+    return {
+        "event_id": ev.get("uuid"),
+        "session_id": ev.get("sessionId", ""),
+        "ts": ev.get("timestamp"),
+        "path": path,
+        "pre_sha": _put_blob(con, pre),
+        "post_sha": _put_blob(con, post),
+        "patch": _render_patch(tur.get("structuredPatch"), pre, post, path),
+    }
+
+
+_FV_COLS = ["event_id", "session_id", "ts", "path", "pre_sha", "post_sha", "patch"]
+
+
+def _insert_file_versions(con, rows):
+    # file_versions has no unique key: it is append-only, one row per edit event,
+    # and offset-tracked tailing guarantees each transcript line is processed
+    # once, so no ON CONFLICT dedup is needed (blobs dedup separately on sha).
+    con.executemany(
+        f"INSERT INTO file_versions ({','.join(_FV_COLS)}) VALUES ({','.join(['?'] * len(_FV_COLS))})",
+        [[r[c] for c in _FV_COLS] for r in rows])
 
 
 def compact_db(store_path=None):
