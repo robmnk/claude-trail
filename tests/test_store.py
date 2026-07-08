@@ -435,8 +435,108 @@ def test_ingest_all_subagent_attribution(tmp_path, monkeypatch):
         con.close()
 
 
+def _user_prompt(uuid, sid, text, ts):
+    """One plain user-prompt transcript line (string content -> exactly one
+    `events` row), so line counts and event counts move in lockstep."""
+    return {"type": "user", "uuid": uuid, "sessionId": sid, "timestamp": ts,
+            "message": {"role": "user", "content": text}}
+
+
+def test_ingest_incremental_append_and_partial_line(tmp_path, monkeypatch):
+    """Tailing: appended complete lines ingest exactly once and never re-count
+    the seed, and a trailing partial line (no newline yet) is withheld until its
+    terminating newline arrives. Exercises the offset math in ingest_transcript.
+    """
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+
+    sid = "sess-append-0001"
+    path = projects / "-fake-proj" / f"{sid}.jsonl"
+    seed = [_user_prompt("u-seed-1", sid, "first", "2026-06-30T02:00:00.000Z"),
+            _user_prompt("u-seed-2", sid, "second", "2026-06-30T02:00:01.000Z")]
+    _write_jsonl(path, seed)
+
+    con = store.connect()
+    try:
+        def count(sql):
+            return con.execute(sql).fetchone()[0]
+
+        assert store.ingest_all(con) == len(seed)               # 2 seed lines
+        assert count("SELECT count(*) FROM raw_events") == 2
+        assert count("SELECT count(*) FROM events") == 2
+
+        # append 2 complete lines PLUS a trailing partial line with NO newline
+        complete = "".join(json.dumps(e) + "\n" for e in [
+            _user_prompt("u-app-1", sid, "third", "2026-06-30T02:00:02.000Z"),
+            _user_prompt("u-app-2", sid, "fourth", "2026-06-30T02:00:03.000Z")])
+        partial = json.dumps(
+            _user_prompt("u-app-3", sid, "fifth-partial", "2026-06-30T02:00:04.000Z"))
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(complete + partial)                          # partial: no '\n'
+
+        # only the 2 completed lines land; the seed is not re-counted and the
+        # partial trailing line is withheld
+        assert store.ingest_all(con) == 2
+        assert count("SELECT count(*) FROM raw_events") == 4
+        assert count("SELECT count(*) FROM events") == 4
+        assert count("SELECT count(*) FROM raw_events WHERE uuid='u-app-3'") == 0
+
+        # re-running while the line is still partial changes nothing
+        assert store.ingest_all(con) == 0
+        assert count("SELECT count(*) FROM raw_events") == 4
+
+        # terminate the partial line -> it now ingests, exactly once
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n")
+        assert store.ingest_all(con) == 1
+        assert count("SELECT count(*) FROM raw_events") == 5
+        assert count("SELECT count(*) FROM events") == 5
+        assert count("SELECT count(*) FROM raw_events WHERE uuid='u-app-3'") == 1
+    finally:
+        con.close()
+
+
 def test_decode_project_maps_encoded_dir_name(tmp_path, monkeypatch):
     """A leading '-' cwd-encoded dir name decodes to a slash path label."""
     monkeypatch.setattr(store, "PROJECTS_DIR", tmp_path)
     path = tmp_path / "-home-naka-Projects-personal" / "abc.jsonl"
     assert store._decode_project(path) == "/home/naka/Projects/personal"
+
+
+def test_compact_db_reclaims_free_blocks_and_preserves_rows(tmp_path, monkeypatch):
+    """compact_db rewrites the store into a fresh file: every row survives, the
+    file is no larger, PRAGMA reports zero free blocks, and the temp is cleaned
+    up. This is the opt-in remedy for the ~2x free-block bloat a bulk ingest
+    leaves (CHECKPOINT alone never coalesces those blocks). Hermetic:
+    monkeypatched PROJECTS_DIR/STORE_PATH, no live corpus."""
+    projects = tmp_path / "projects"
+    store_path = tmp_path / "trail.duckdb"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", store_path)
+
+    sid = "sess-compact-0001"
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", _main_transcript_events(sid))
+
+    tables = ("raw_events", "events", "api_requests", "sessions")
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        before = {t: con.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in tables}
+    finally:
+        con.close()  # release the write lock before compacting (compact_db's contract)
+    assert all(v > 0 for v in before.values())  # the fixture actually populated every table
+
+    old_size, new_size = store.compact_db(store_path)
+    assert new_size <= old_size
+    assert not (store_path.with_suffix(store_path.suffix + ".compact-tmp")).exists()
+
+    con_ro = store.connect(read_only=True)
+    try:
+        after = {t: con_ro.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in tables}
+        # PRAGMA database_size columns: ...,used_blocks, free_blocks(=idx 5),...
+        free_blocks = con_ro.execute("PRAGMA database_size").fetchone()[5]
+    finally:
+        con_ro.close()
+    assert after == before   # no data loss across the rewrite
+    assert free_blocks == 0  # fully compacted, no interspersed free blocks left

@@ -309,9 +309,10 @@ def ingest_transcript(con, path):
     """Read new lines from `path` since last_offset; insert events; advance offset.
     Returns number of events inserted."""
     try:
-        size = path.stat().st_size
+        st = path.stat()
     except OSError:
         return 0
+    size = st.st_size
     row = con.execute("SELECT last_offset FROM ingest_state WHERE transcript_path=?",
                       [str(path)]).fetchone()
     last = row[0] if row else 0
@@ -355,7 +356,7 @@ def ingest_transcript(con, path):
     con.execute(
         "INSERT INTO ingest_state VALUES (?,?,?) "
         "ON CONFLICT (transcript_path) DO UPDATE SET last_offset=excluded.last_offset, last_mtime=excluded.last_mtime",
-        [str(path), new_off, size])
+        [str(path), new_off, st.st_mtime])  # last_mtime: real mtime; offset check uses size, not this
     return len(raw_rows)                       # count of transcript lines ingested
 
 
@@ -416,8 +417,63 @@ def ingest_all(con):
     return total
 
 
+def compact_db(store_path=None):
+    """Rewrite the store into a fresh file to reclaim free blocks; returns
+    (old_size, new_size) in bytes.
+
+    A bulk ingest leaves the file ~2x its packed size: CHECKPOINT only flushes
+    the WAL and truncates trailing space, it never coalesces the free blocks left
+    scattered through the file. The one thing that reclaims them is a full
+    rewrite, so COPY FROM DATABASE the whole store into a sibling temp file and
+    atomically swap it in (os.replace on the same directory/filesystem). The
+    original is untouched until that swap, and a half-written temp is cleaned up
+    on any failure, so a crash mid-compaction can never corrupt or drop the store.
+
+    The store's read-write connection MUST already be closed (the file has to be
+    unlocked). Returns (0, 0) if the store does not exist yet.
+    """
+    import duckdb  # lazy, same as connect()
+    path = Path(store_path) if store_path is not None else STORE_PATH
+    if not path.exists():
+        return (0, 0)
+    old_size = path.stat().st_size
+    tmp = path.with_suffix(path.suffix + ".compact-tmp")
+
+    def _cleanup_tmp():
+        for p in (tmp, Path(str(tmp) + ".wal")):
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+
+    _cleanup_tmp()  # drop any stale temp left by a previous aborted run
+    src_lit = str(path).replace("'", "''")   # ATTACH takes a string literal
+    dst_lit = str(tmp).replace("'", "''")
+    try:
+        mem = duckdb.connect()  # in-memory driver; src/dst are the only real DBs
+        try:
+            mem.execute(f"ATTACH '{src_lit}' AS src (READ_ONLY)")
+            mem.execute(f"ATTACH '{dst_lit}' AS dst")
+            mem.execute("COPY FROM DATABASE src TO dst")
+            mem.execute("CHECKPOINT dst")   # flush dst so its WAL is folded in before the swap
+            mem.execute("DETACH src")
+            mem.execute("DETACH dst")
+        finally:
+            mem.close()
+        os.replace(tmp, path)   # same dir -> atomic; original stands until this line
+    except BaseException:
+        _cleanup_tmp()          # never leave a half-written temp or clobber the original
+        raise
+    return (old_size, path.stat().st_size)
+
+
 def cmd_ingest(argv):
     watch = "--watch" in argv
+    # --compact rewrites the store to reclaim free blocks after the sweep; it is a
+    # one-shot maintenance step, so it is meaningless (and skipped) under --watch.
+    compact = "--compact" in argv and not watch
+    if "--compact" in argv and watch:
+        print("note: --compact is ignored with --watch (never compact inside the poll loop)")
     interval = 5.0
     con = connect()
     try:
@@ -428,7 +484,16 @@ def cmd_ingest(argv):
                 break
             time.sleep(interval)
     finally:
+        # Flush the WAL into the main file on exit (one-shot end, or --watch
+        # shutdown), never per-iteration. Note: CHECKPOINT does NOT reclaim
+        # DuckDB's interspersed free blocks, so the file stays ~2x its packed
+        # size after a bulk ingest; the full rewrite that does reclaim them is
+        # compact_db(), run below (non-watch only) after the write lock is freed.
+        con.execute("CHECKPOINT")
         con.close()
+    if compact:  # after con.close(), so the store file is unlocked for the rewrite
+        old, new = compact_db()
+        print(f"compacted {old // (1024 * 1024)}MB -> {new // (1024 * 1024)}MB")
     return 0
 
 
