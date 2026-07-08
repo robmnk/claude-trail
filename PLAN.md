@@ -15,7 +15,7 @@ The per-task bash verification steps are part of the definition of done; the
 - [x] 3. Incremental ingester (`ingest [--watch]`)
 - [x] 4. Search, stats, tokens CLI (Phase-1 shippable milestone)
 - [x] 5. File versions + content-addressed blobs
-- [ ] 6. Reconstruction CLI (`cat` / `diff`)
+- [x] 6. Reconstruction CLI (`cat` / `diff`)
 - [ ] 7. Docs + dependency note + version bump
 
 Deferred, out of scope this run: Task 8 (TUI search view).
