@@ -9,7 +9,7 @@ description = "Observability TUI for Claude Code: a real-time trail of every Bas
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
-dependencies = ["rich>=13.0"]
+dependencies = ["rich>=13.0", "duckdb>=1.0"]
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff>=0.15,<0.16"]
