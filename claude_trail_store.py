@@ -1110,9 +1110,96 @@ def cmd_tokens(argv):
     return 0
 
 
+def _fmt_bytes(n):
+    """Human-readable byte count (e.g. '949.2 MB'). None -> '?'."""
+    if n is None:
+        return "?"
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(n) < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+# Store-owned tables, in display order, for db_info's per-table row counts.
+_STORE_TABLES = ["raw_events", "events", "api_requests", "file_versions",
+                 "file_history", "blobs", "sessions", "ingest_state"]
+
+
+def db_info(con):
+    """DB properties + statistics as an ordered list of (label, value) string
+    pairs, shared by the `stats` CLI section and the TUI's database modal.
+
+    Read-only and safe on a not-yet-migrated schema: every optional table and
+    pragma is guarded, so an older (schema 1) or empty store degrades to the
+    subset it can answer rather than raising.
+    """
+    out = [
+        ("connection", str(STORE_PATH)),
+        ("source", "$CLAUDE_TRAIL_DB" if "CLAUDE_TRAIL_DB" in os.environ
+         else "default (~/.claude/trail.duckdb)"),
+    ]
+    try:
+        out.append(("duckdb", con.execute("SELECT version()").fetchone()[0]))
+    except Exception:
+        pass
+    try:
+        sv = con.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()
+        out.append(("schema version", sv[0] if sv else "?"))
+    except Exception:
+        pass
+    try:
+        out.append(("file size", _fmt_bytes(STORE_PATH.stat().st_size)))
+    except OSError:
+        pass
+    walp = Path(str(STORE_PATH) + ".wal")
+    if walp.exists():
+        out.append(("wal size", _fmt_bytes(walp.stat().st_size)))
+    # On-disk block accounting; PRAGMA columns vary by version, so map by name.
+    try:
+        row = con.execute("PRAGMA database_size").fetchone()
+        d = dict(zip([c[0] for c in con.description], row))
+        if d.get("database_size") is not None:
+            out.append(("db size", str(d["database_size"])))
+        if d.get("block_size") is not None:
+            out.append(("block size", _fmt_bytes(d["block_size"])))
+        if d.get("used_blocks") is not None and d.get("total_blocks") is not None:
+            out.append(("blocks used/total", f"{d['used_blocks']}/{d['total_blocks']}"))
+        if d.get("free_blocks") is not None:
+            out.append(("free blocks", str(d["free_blocks"])))
+    except Exception:
+        pass
+    # Per-table row counts, only for tables that exist (fresh/older schema safe).
+    try:
+        present = {r[0] for r in con.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema='main'").fetchall()}
+        for t in _STORE_TABLES:
+            if t in present:
+                out.append((f"rows {t}",
+                            f"{con.execute(f'SELECT count(*) FROM {t}').fetchone()[0]:,}"))
+    except Exception:
+        pass
+    return out
+
+
 def cmd_stats(argv):
+    if not STORE_PATH.exists():
+        # Opening read-only would raise on a missing file, so report where the
+        # store would live and how to create it instead of crashing.
+        print("== database ==")
+        print("   connection        ", str(STORE_PATH))
+        print("   source            ",
+              "$CLAUDE_TRAIL_DB" if "CLAUDE_TRAIL_DB" in os.environ
+              else "default (~/.claude/trail.duckdb)")
+        print("   status             not created yet; run `claude-trail ingest`")
+        return 0
     con = connect(read_only=True)
     try:
+        print("== database ==")
+        for label, value in db_info(con):
+            print(f"   {label:<18} {value}")
         for label, q in [
             ("sessions", "SELECT count(*) FROM sessions"),
             ("events",   "SELECT count(*) FROM events"),

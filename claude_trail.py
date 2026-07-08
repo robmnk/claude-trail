@@ -1238,6 +1238,31 @@ def build_session_panel(
     )
 
 
+def build_db_panel(info: list, term_height: int = 40) -> Panel:
+    """Full-screen audit-store database view (opened with `d`).
+
+    A right-aligned label / value grid of the store's connection string, DuckDB
+    and schema versions, on-disk sizes, block accounting, and per-table row
+    counts (from `claude_trail_store.db_info`). The rows are built on demand so
+    the normal feed never imports duckdb; an unavailable store renders a single
+    status row instead of raising.
+    """
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="dim", justify="right", no_wrap=True)
+    grid.add_column(ratio=1, overflow="fold")
+    for label, value in info:
+        grid.add_row(label, str(value))
+    hint = Text.from_markup("[dim italic]esc / q / ↵ : back[/dim italic]")
+    body = Group(grid, Text(""), hint)
+    return Panel(
+        body,
+        title=_panel_title("· database"),
+        box=box.ROUNDED,
+        padding=(1, 2),
+        height=term_height,
+    )
+
+
 def _search_root_base(search: "SearchState") -> str:
     """The dir to display match paths relative to (the active root's parent).
 
@@ -1440,7 +1465,7 @@ def build_panel(
 
     status2 = Text.from_markup(
         f"  [dim italic]cols:[/dim italic] {col_toggles}"
-        "  [dim italic]\u00b7  j/k:nav  \u21b5:view  s:session  o:log  f:folder  q:quit  c:clear[/dim italic]"
+        "  [dim italic]\u00b7  j/k:nav  \u21b5:view  s:session  d:db  o:log  f:folder  q:quit  c:clear[/dim italic]"
     )
 
     body = Group(content, Text(""), status, status2)
@@ -1633,6 +1658,7 @@ class Action(enum.Enum):
     RUN_SEARCH = enum.auto()        # run rg/grep for the open search modal
     OPEN_MATCH = enum.auto()        # open the selected search hit at its line
     OPEN_MATCH_FOLDER = enum.auto()  # open the folder containing the selected hit
+    LOAD_DB_INFO = enum.auto()      # load the audit-store properties for the `d` modal
     NONE = enum.auto()
 
 
@@ -1678,12 +1704,14 @@ class AppState:
     detail_entry: LogEntry | None = None
     session_detail: str | None = None  # a session_id while the session modal is open
     search: "SearchState | None" = None  # set while the search modal is open
+    db_info: list | None = None  # (label, value) pairs while the database modal is open
 
     def modal_open(self) -> bool:
-        """True while either full-screen modal (command detail or session detail)
-        is open. Only one is ever open at a time; while open, navigation/column/
-        clear keys are ignored (only Ctrl-C still quits)."""
-        return self.detail_entry is not None or self.session_detail is not None
+        """True while a full-screen modal (command detail, session detail, or the
+        database view) is open. Only one is ever open at a time; while open,
+        navigation/column/clear keys are ignored (only Ctrl-C still quits)."""
+        return (self.detail_entry is not None or self.session_detail is not None
+                or self.db_info is not None)
 
     def selected_entry(self) -> LogEntry | None:
         """The entry the cursor points at in the newest-first view, or None."""
@@ -1818,6 +1846,7 @@ def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
         if ch in ("\x1b", "q", "\r", "\n"):
             state.detail_entry = None
             state.session_detail = None
+            state.db_info = None
         return Action.NONE
     if ch in ("q", "\x03"):
         return Action.QUIT
@@ -1865,10 +1894,39 @@ def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
         return Action.OPEN_SESSION
     elif ch == "f":
         return Action.OPEN_FILES
+    elif ch == "d":
+        # Open the audit-store database modal. The store (and duckdb) is imported
+        # lazily by main() when this action fires, so the normal feed never loads
+        # duckdb; apply_key stays pure and does no I/O here.
+        return Action.LOAD_DB_INFO
     return Action.NONE
 
 
 # ==== Main ====
+
+
+def _load_db_info() -> list:
+    """Load the audit-store properties for the database modal.
+
+    Lazily imports the store (and thus duckdb) only when the `d` modal is opened,
+    so the normal feed and the hook never load duckdb. Never raises: a missing
+    store, a missing duckdb, or any query error renders as a single status row.
+    """
+    try:
+        from claude_trail_store import STORE_PATH, connect, db_info
+    except Exception as e:  # duckdb/module not importable
+        return [("database", f"unavailable: {e}")]
+    if not STORE_PATH.exists():
+        return [("connection", str(STORE_PATH)),
+                ("status", "no store yet; run: claude-trail ingest")]
+    try:
+        con = connect(read_only=True)
+        try:
+            return db_info(con)
+        finally:
+            con.close()
+    except Exception as e:
+        return [("connection", str(STORE_PATH)), ("error", str(e))]
 
 
 def _signal_exit(signum, frame):
@@ -1920,6 +1978,8 @@ def main():
             )
         if state.detail_entry is not None:
             return build_detail_panel(state.detail_entry, console.height, name_map, color_map)
+        if state.db_info is not None:
+            return build_db_panel(state.db_info, console.height)
         return build_panel(
             state.entries, console.height, state.visible_cols,
             state.cursor, state.scroll_offset, name_map, color_map, agent_map,
@@ -2039,6 +2099,8 @@ def main():
                                     folder = open_containing_folder(
                                         s.results[s.cursor][0])
                                     s.flash = f"opened folder: {folder}"
+                            elif action is Action.LOAD_DB_INFO:
+                                state.db_info = _load_db_info()
                             ready, _, _ = select.select([fd], [], [], 0)
                         if quit_now:
                             break

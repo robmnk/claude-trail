@@ -61,7 +61,8 @@ python3 claude_trail.py   # if running from a clone
 | `g`/`G` | Jump to top/bottom |
 | `Enter` | Open the full-command detail view for the selected command |
 | `s` | Open the session-detail modal for the selected row's session (identity header + subagent list with live status) |
-| `Esc` | Close the open modal, command detail or session detail (also `q` or `Enter` while it is open) |
+| `d` | Open the audit-store database modal: connection string, DuckDB / schema version, on-disk sizes, block accounting, and per-table row counts (opens the DuckDB store read-only, on demand) |
+| `Esc` | Close the open modal, command detail, session detail, or database (also `q` or `Enter` while it is open) |
 | `o` | Open selected session's commands (filtered JSONL) in `$VISUAL` or the platform default launcher |
 | `f` | Open file manager on folder of files referenced in selected command |
 | `/` | Open per-session recursive search for the selected row's session. Type a query then `Enter` to run; `Tab` toggles the root between the transcript folder (`<sid>.jsonl` + `subagents/**`) and the session's cwd. In results: `j`/`k` browse, `Enter` opens the hit at its line, `f` opens the hit's folder, `/` edits the query, `Esc`/`q` close |
@@ -114,7 +115,7 @@ Adding a column is a single entry in the list.
 
 ## Audit store
 
-`claude_trail_store.py` is a separate, DuckDB-backed audit trail. It ingests the Claude Code transcripts (`~/.claude/projects/**/*.jsonl`, including `subagents/agent-<id>.jsonl`) into one local file and answers search / token / file-reconstruction queries over the full history. It is independent of the live TUI: `claude_trail.py main()` only lazily imports it when the first argument is one of the store subcommands (so the TUI and hook never load `duckdb`).
+`claude_trail_store.py` is a separate, DuckDB-backed audit trail. It ingests the Claude Code transcripts (`~/.claude/projects/**/*.jsonl`, including `subagents/agent-<id>.jsonl`) into one local file and answers search / token / file-reconstruction queries over the full history. It is independent of the live TUI: `claude_trail.py main()` only lazily imports it when the first argument is one of the store subcommands (so the TUI and hook never load `duckdb`). The one interactive exception is the TUI `d` (database) modal, whose `_load_db_info()` imports the store and opens it read-only on demand; `db_info(con)` returns the (label, value) rows shared by that modal and the `stats` CLI section (connection string, DuckDB / schema version, on-disk sizes, block accounting, per-table counts).
 
 - **Store file:** `~/.claude/trail.duckdb`, overridable via `$CLAUDE_TRAIL_DB` (constant `STORE_PATH`). `connect(read_only=...)` opens it; the parent dir is created on demand.
 - **Reads transcripts, not the hook.** The store ingests transcripts, so it covers every tool (Read, Edit, Write, Grep, Task, ...) and gets each call's result and edit patch for free. The live TUI is unchanged and still tails `command-log.jsonl`, which the PostToolUse hook writes and which is Bash-only. Two independent data paths: the hook feeds the TUI, the transcripts feed the store.

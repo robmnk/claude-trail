@@ -73,7 +73,8 @@ python3 claude_trail.py   # if running from a clone
 | `g` / `G` | Jump to top / bottom |
 | `Enter` | Open the full-command detail view for the selected command |
 | `s` | Open the session-detail modal for the selected row's session (identity header + subagent list with live status) |
-| `Esc` | Close the open modal, command detail or session detail (also `q` or `Enter` while it is open) |
+| `d` | Open the audit-store database modal: connection string, DuckDB / schema version, on-disk sizes, block accounting, and per-table row counts (opens the DuckDB store read-only, on demand) |
+| `Esc` | Close the open modal (command detail, session detail, or database) (also `q` or `Enter` while it is open) |
 | `o` | Open the selected session's commands (filtered JSONL) in `$VISUAL` / `$EDITOR`, else the platform launcher (`xdg-open` on Linux, `open` on macOS) |
 | `f` | Open the file manager on the folder of files referenced in the selected command |
 | `/` | Search the selected row's session recursively (`rg`, else `grep`). `Tab` toggles the root between the transcript folder and the session's cwd; `Enter` runs the query. In results: `j` / `k` browse, `Enter` opens a hit at its line, `f` opens the hit's folder, `/` edits the query, `Esc` / `q` close |
@@ -117,7 +118,7 @@ A single `ingest` process is the only writer; every other subcommand opens the f
 ```bash
 claude-trail ingest [--watch] [--compact] [--file-history-only]  # tail transcripts + file-history into the store (single writer)
 claude-trail search <regex> [--tool T --session S --project P --since ISO --limit N -i]
-claude-trail stats                               # session / event / token / reconstruction-coverage counts
+claude-trail stats                               # database properties + session / event / token / reconstruction-coverage counts
 claude-trail tokens [--session S] [--by session|command|tool|day|model] [--since ISO] [--limit N]
 claude-trail cat <path> [--session S] [--at ISO] # reconstruct a file's bytes (rewind with --at)
 claude-trail diff <path> [--session S] [--all-sources]  # list a path's edits oldest-first

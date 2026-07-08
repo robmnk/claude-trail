@@ -1708,6 +1708,74 @@ class TestSessionModal:
         assert state.detail_entry is None
         assert state.session_detail is None
 
+
+class TestDatabaseModal:
+    """The `d` database modal: the load action, modal key handling, the
+    build_db_panel rendering, and the lazy loader's graceful fallback."""
+
+    def _entries(self, n):
+        return [{"command": f"c{i}", "session_id": f"sid-{i}"} for i in range(n)]
+
+    def test_d_returns_load_db_info_action(self):
+        # apply_key stays pure: it returns the action but does not open the modal
+        # or touch duckdb itself (main() performs the lazy load).
+        state = feed.AppState(entries=self._entries(3), cursor=0)
+        result = feed.apply_key(state, "d", 10)
+        assert result is feed.Action.LOAD_DB_INFO
+        assert state.db_info is None
+        assert state.modal_open() is False
+
+    def test_db_info_set_marks_modal_open(self):
+        state = feed.AppState(entries=self._entries(1), db_info=[("connection", "/x")])
+        assert state.modal_open() is True
+
+    def test_db_modal_swallows_navigation(self):
+        state = feed.AppState(entries=self._entries(3), cursor=1,
+                              db_info=[("connection", "/x")])
+        result = feed.apply_key(state, "j", 10)
+        assert result is feed.Action.NONE
+        assert state.cursor == 1               # navigation ignored while modal open
+        assert state.db_info is not None       # still open
+
+    def test_db_modal_swallows_d(self):
+        # pressing d again while the modal is open must not re-trigger the loader
+        state = feed.AppState(entries=self._entries(3), db_info=[("connection", "/x")])
+        result = feed.apply_key(state, "d", 10)
+        assert result is feed.Action.NONE
+        assert state.db_info is not None
+
+    def test_db_modal_esc_closes(self):
+        state = feed.AppState(entries=self._entries(1), db_info=[("connection", "/x")])
+        result = feed.apply_key(state, "\x1b", 10)
+        assert result is feed.Action.NONE
+        assert state.db_info is None
+
+    def test_db_modal_q_closes_not_quits(self):
+        state = feed.AppState(entries=self._entries(1), db_info=[("connection", "/x")])
+        assert feed.apply_key(state, "q", 10) is feed.Action.NONE
+        assert state.db_info is None
+
+    def test_build_db_panel_renders_rows(self):
+        console = Console(width=100, record=True)
+        panel = feed.build_db_panel(
+            [("connection", "/home/x/.claude/trail.duckdb"), ("rows events", "5")],
+            term_height=20)
+        console.print(panel)
+        out = console.export_text()
+        assert "database" in out               # panel title suffix
+        assert "connection" in out
+        assert "trail.duckdb" in out
+        assert "rows events" in out
+
+    def test_load_db_info_missing_store_reports_hint(self, tmp_path, monkeypatch):
+        # No live store: the loader must not raise; it returns a status hint. The
+        # `from claude_trail_store import STORE_PATH` inside _load_db_info reads the
+        # patched module attribute at call time.
+        import claude_trail_store as store
+        monkeypatch.setattr(store, "STORE_PATH", tmp_path / "nope.duckdb")
+        info = dict(feed._load_db_info())
+        assert "no store yet" in info.get("status", "")
+
     def _model(self, **kw):
         subagents = kw.pop("subagents", (
             feed.SubagentInfo(

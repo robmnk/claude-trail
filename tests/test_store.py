@@ -679,6 +679,45 @@ def test_cmd_stats_prints_counts_including_output_tokens(tmp_path, monkeypatch, 
     assert "50" in out                  # sum(output_tokens) on the api-requests line
 
 
+def test_cmd_stats_includes_database_section(tmp_path, monkeypatch, capsys):
+    """stats leads with a `== database ==` block: connection string, duckdb
+    version, and per-table row counts from db_info."""
+    _build_cli_store(tmp_path, monkeypatch)
+    assert store.cmd_stats(["stats"]) == 0
+    out = capsys.readouterr().out
+    assert "== database ==" in out
+    assert "connection" in out
+    assert "trail.duckdb" in out
+    assert "duckdb" in out
+    assert "rows events" in out
+
+
+def test_db_info_reports_connection_version_and_counts(tmp_path, monkeypatch):
+    """db_info returns (label, value) pairs including the connection path, a
+    non-empty duckdb version, and per-table row counts for a populated store."""
+    _build_cli_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        info = dict(store.db_info(con))
+    finally:
+        con.close()
+    assert info["connection"].endswith("trail.duckdb")
+    assert "source" in info
+    assert info["duckdb"]                          # non-empty version string
+    assert "rows events" in info
+    assert int(info["rows events"].replace(",", "")) >= 1
+
+
+def test_cmd_stats_missing_db_reports_location(tmp_path, monkeypatch, capsys):
+    """On a not-yet-created store, stats reports where it would live and how to
+    create it (return 0) instead of raising on the read-only open."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "does-not-exist.duckdb")
+    assert store.cmd_stats(["stats"]) == 0
+    out = capsys.readouterr().out
+    assert "== database ==" in out
+    assert "not created yet" in out
+
+
 # cat/diff are no longer stubs: their real reconstruction behavior is exercised
 # in the "Reconstruction CLI: cat / diff (Task 6)" section at the end of this file.
 
