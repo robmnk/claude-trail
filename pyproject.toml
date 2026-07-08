@@ -18,7 +18,7 @@ dev = ["pytest", "ruff>=0.15,<0.16"]
 claude-trail = "claude_trail:main"
 
 [tool.hatch.build.targets.wheel]
-include = ["claude_trail.py"]
+include = ["claude_trail.py", "claude_trail_store.py"]
 
 [tool.ruff]
 line-length = 100
