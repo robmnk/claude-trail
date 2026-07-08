@@ -845,3 +845,100 @@ def test_ingest_all_captures_file_versions_and_blobs(tmp_path, monkeypatch):
         assert count("SELECT count(*) FROM file_versions") == 2
     finally:
         con.close()
+
+
+def _edit_result_null_original_event(sid="sess-fv-0001", uuid="fv-edit-null-1",
+                                     path="/tmp/nopre.py"):
+    """The dominant real Edit shape: originalFile is null (77% of real Edits), so
+    there is no PRE to reconstruct POST from. Only the path + structuredPatch (the
+    diff) are recoverable; both content shas end up null."""
+    return {
+        "type": "user", "uuid": uuid, "sessionId": sid,
+        "timestamp": "2026-06-30T04:00:03.000Z",
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu-edit-null-1",
+             "content": f"The file {path} has been updated."}]},
+        "toolUseResult": {
+            "filePath": path,
+            "oldString": "line two\n",
+            "newString": "line two CHANGED\n",
+            "replaceAll": False,
+            "originalFile": None,           # the majority shape: no PRE content
+            "structuredPatch": [
+                {"oldStart": 2, "oldLines": 1, "newStart": 2, "newLines": 1,
+                 "lines": ["-line two", "+line two CHANGED"]}],
+            "userModified": False,
+        },
+    }
+
+
+def test_file_version_from_event_edit_null_original_file(tmp_path, monkeypatch):
+    """An Edit with originalFile null (the dominant real shape) does not crash and
+    still emits a row: correct path, a non-null patch from structuredPatch, but
+    null pre_sha/post_sha (no PRE to content-address, nothing to reconstruct)."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    ev = _edit_result_null_original_event(path="/tmp/nopre.py")
+    con = store.connect()
+    try:
+        fv = store.file_version_from_event(con, ev)
+        assert fv is not None
+        assert fv["path"] == "/tmp/nopre.py"
+        assert fv["pre_sha"] is None and fv["post_sha"] is None
+        assert fv["patch"] is not None                       # structuredPatch kept
+        assert json.loads(fv["patch"])[0]["newStart"] == 2
+        # nothing was content-addressed (no pre, no reconstructable post)
+        assert con.execute("SELECT count(*) FROM blobs").fetchone()[0] == 0
+    finally:
+        con.close()
+
+
+def test_post_content_replace_all_vs_first():
+    """_post_content honours replaceAll: True rewrites EVERY occurrence, the
+    default (absent) and explicit False rewrite only the FIRST. This all-vs-first
+    branch is the one Edit reconstruction subtlety. Pure, no DB."""
+    pre = "x = FOO\ny = FOO\nz = FOO\n"
+    tur_all = {"oldString": "FOO", "newString": "BAR", "replaceAll": True}
+    assert store._post_content(tur_all, pre) == "x = BAR\ny = BAR\nz = BAR\n"
+    tur_default = {"oldString": "FOO", "newString": "BAR"}  # replaceAll absent
+    assert store._post_content(tur_default, pre) == "x = BAR\ny = FOO\nz = FOO\n"
+    tur_false = {"oldString": "FOO", "newString": "BAR", "replaceAll": False}
+    assert store._post_content(tur_false, pre) == "x = BAR\ny = FOO\nz = FOO\n"
+
+
+def test_ingest_truncation_rescan_no_file_version_duplication(tmp_path, monkeypatch):
+    """A truncated/rewritten transcript rescans from offset 0 (ingest_transcript:
+    `if size < last: last = 0`), reprocessing every line. The event_id dedup in
+    _insert_file_versions (anti-join, no unique constraint to ON CONFLICT on) must
+    keep file_versions from growing on that rescan; without it every row would be
+    duplicated. Hermetic: monkeypatched PROJECTS_DIR/STORE_PATH."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+
+    sid = "sess-fv-rescan-0001"
+    path = "/tmp/demo_rescan.py"
+    events = [
+        _write_create_event(sid, "fv-w-1", path, "v1\n"),
+        _edit_result_event(sid, "fv-e-1", path),
+    ]
+    transcript = projects / "-fake-proj" / f"{sid}.jsonl"
+    _write_jsonl(transcript, events)
+
+    con = store.connect()
+    try:
+        def count(sql):
+            return con.execute(sql).fetchone()[0]
+
+        store.ingest_all(con)
+        before = count("SELECT count(*) FROM file_versions")
+        assert before == 2                                   # write + edit
+
+        # Force the truncation-rescan branch: push the recorded offset past the
+        # file size so `size < last` fires and the whole file is reprocessed.
+        con.execute("UPDATE ingest_state SET last_offset = last_offset + 100000 "
+                    "WHERE transcript_path = ?", [str(transcript)])
+        assert store.ingest_all(con) == len(events)          # every line rescanned
+
+        assert count("SELECT count(*) FROM file_versions") == before  # no dup
+    finally:
+        con.close()

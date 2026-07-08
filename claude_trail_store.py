@@ -426,8 +426,9 @@ def ingest_all(con):
 
 # --- File versions + content-addressed blobs (Task 5) -------------------------
 #
-# Step 5.1 investigation (confirmed against the live corpus, 735 edit/write
-# `toolUseResult`s across 60 transcripts, zero shape mismatches). The plan's
+# Step 5.1 investigation, confirmed against the live corpus (735 edit/write
+# `toolUseResult`s across 60 transcripts, zero shape mismatches) and the curated
+# 233-row store (the file_versions counts below are measured from it). The plan's
 # field-name guesses are ADAPTED to what the data actually holds:
 #
 #   Write  -> toolUseResult = {type: "create"|"update", filePath, content,
@@ -436,13 +437,20 @@ def ingest_all(con):
 #       * content       : full POST content, always a str    [post source]
 #       * originalFile  : full PRE content; null on "create", str on "update"
 #       * structuredPatch: list of hunks; [] on "create"
+#       * userModified=true: `content` is the user's edited final text (what
+#         landed on disk), not Claude's proposal; stored as-is.
 #
 #   Edit   -> toolUseResult = {filePath, oldString, newString, replaceAll,
 #             originalFile, structuredPatch, userModified}
 #       * NO `content` and NO `type`; POST is not stored directly.
-#       * originalFile  : full PRE content (str)
-#       * POST is reconstructed by applying oldString->newString to originalFile
-#         (all occurrences when replaceAll, else the first). See _post_content.
+#       * originalFile  : full PRE content (str) WHEN PRESENT, but it is NULL on
+#         the large majority of real edits (142/184 Edit results, 77%, in the
+#         curated corpus; the plan wrongly assumed it is always a str). With no
+#         PRE there is nothing to reconstruct POST from, so both content shas end
+#         up null and only path + structuredPatch (the diff) are recorded.
+#       * POST (only when originalFile is present) is reconstructed by applying
+#         oldString->newString to originalFile (all occurrences when replaceAll,
+#         else the first). See _post_content.
 #       * structuredPatch: non-empty list of hunks.
 #
 #   structuredPatch hunk = {oldStart, oldLines, newStart, newLines,
@@ -452,19 +460,30 @@ def ingest_all(con):
 #   defensively supports a MultiEdit `edits` list (apply sequentially) if a
 #   future version emits one; unknown shapes just yield post=None (non-fatal).
 #
+# CONTENT-COVERAGE LIMITATION (from the null-originalFile majority above):
+# toolUseResult alone yields FULL POST CONTENT for only ~39% of rows (91/233
+# have a non-null post_sha; 47/233 a non-null pre_sha). The other ~61% are
+# patch-only: `cat` cannot rebuild their bytes, but `diff` (structuredPatch)
+# still works. Closing that gap is the file-history backfill follow-up below.
+#
 # Detector: a result is a file edit iff it has a top-level `filePath` (str) AND
 # a `structuredPatch` key. In the sample these co-occur perfectly (735 with
 # both, 2539 non-edit results with neither). A PDF Read carries `type:"parts"`
 # with `filePath` nested under `file`, NOT at top level, so it is correctly
 # skipped. Bash results (stdout/stderr, no filePath) are skipped too.
 #
-# file-history (~/.claude/file-history/<uuid>/<pathhash>@vN): full-content
-# snapshots keyed by an opaque path-hash, with no index tying <uuid>/<pathhash>
-# back to (session_id, real path, order) and no sidecar metadata. That mapping
-# is unsolvable without reversing the hash, and it is redundant here: every
-# transcript-covered edit already yields PRE (originalFile) and POST (content or
-# reconstruction) plus the patch. So file-history is SKIPPED; reconstruction
-# relies on toolUseResult alone (covers files Claude edited, which is the scope).
+# file-history (~/.claude/file-history/<session_id>/<pathhash>@vN): full-content
+# snapshots, and the layout IS solvable (the plan's "unsolvable/redundant" claim
+# is false). The dir name IS the transcript session_id (verified 76/76 match),
+# <pathhash> = sha256(<absolute_path>)[:16] (forward-hash verified, 42/42 stems
+# for a sampled session), and @vN is the per-file snapshot order. It is exactly
+# the source that fills the ~61% of edits whose originalFile is null, so it is
+# NOT redundant with toolUseResult. Ingesting it is deferred:
+#   FOLLOW-UP file-history backfill (its own phase, conductor-scheduled): walk
+#   <session_id>/<pathhash>@vN, map each stem back to its path via the known
+#   sha256(path)[:16], and blob the snapshots to give the ~61% patch-only rows
+#   real PRE/POST content. NOT implemented here; this phase relies on
+#   toolUseResult alone (files Claude edited, at the ~39% content coverage above).
 
 
 def _put_blob(con, text):
@@ -550,12 +569,31 @@ _FV_COLS = ["event_id", "session_id", "ts", "path", "pre_sha", "post_sha", "patc
 
 
 def _insert_file_versions(con, rows):
-    # file_versions has no unique key: it is append-only, one row per edit event,
-    # and offset-tracked tailing guarantees each transcript line is processed
-    # once, so no ON CONFLICT dedup is needed (blobs dedup separately on sha).
+    # Dedup on event_id (mirroring _insert_events / _insert_requests) so a
+    # reprocessed line never duplicates a row. file_versions has NO unique
+    # constraint, so ON CONFLICT is unavailable; dedup is an anti-join against the
+    # target instead. Two paths reprocess a line and must not double-insert: the
+    # deterministic truncation rescan (ingest_transcript: `if size < last: last =
+    # 0`), and the crash window between this insert and the ingest_state offset
+    # advance. Collapse the batch by event_id first (only the keyed rows; a
+    # null/empty event_id, which essentially never occurs since a user tool_result
+    # carries a uuid, is kept as-is and never matches the anti-join, so it still
+    # inserts). Blobs dedup separately on sha.
+    keyed, unkeyed = {}, []
+    for r in rows:
+        if r["event_id"]:
+            keyed[r["event_id"]] = r      # collapse repeats sharing one event uuid
+        else:
+            unkeyed.append(r)             # null/empty key: keep each row distinct
+    rows = list(keyed.values()) + unkeyed
+    con.execute("CREATE TEMP TABLE IF NOT EXISTS _fv_stage AS SELECT * FROM file_versions WHERE 0=1")
+    con.execute("DELETE FROM _fv_stage")
     con.executemany(
-        f"INSERT INTO file_versions ({','.join(_FV_COLS)}) VALUES ({','.join(['?'] * len(_FV_COLS))})",
+        f"INSERT INTO _fv_stage ({','.join(_FV_COLS)}) VALUES ({','.join(['?'] * len(_FV_COLS))})",
         [[r[c] for c in _FV_COLS] for r in rows])
+    con.execute("INSERT INTO file_versions SELECT * FROM _fv_stage s "
+                "WHERE NOT EXISTS (SELECT 1 FROM file_versions f WHERE f.event_id = s.event_id)")
+    con.execute("DELETE FROM _fv_stage")
 
 
 def compact_db(store_path=None):
