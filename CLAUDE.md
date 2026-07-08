@@ -111,3 +111,47 @@ Adding a column is a single entry in the list.
 - Columns are defined once in the module-level `COLUMNS` list of frozen `Column` records (`key`, `name`, `style`, `kwargs`, `render`). `build_table` builds a base `RenderCtx(name_map, color_map, agent_map)`, computes each row's `(session_id, agent_id)` run boundaries, and per row `dataclasses.replace`s the base ctx with that row's `agent_label`/`run_first`/`run_last` before calling `col.render(entry, ctx)` for each visible column in list order; there is no per-column `if col_id == ...` ladder. `build_detail_panel` reuses `_render_session` for the Session tint and `_danger_prefixed` for the Command danger `* ` marker (it keeps the raw, un-normalized command so newlines survive). Default visibility is derived from the list (`{c.key: True for c in COLUMNS}`); the digit-toggle branch in `apply_key` accepts `ch.isdigit() and int(ch) in visible_cols` and still refuses to hide the last visible column.
 - Column visibility persists during session, status bar shows toggle state as `1 2 3 4 5 6`
 - Platform-specific file launcher: `xdg-open` on Linux, `open` on macOS, selected via `claude_trail._platform_opener()`. Honours `$VISUAL` first if set.
+
+## Audit store
+
+`claude_trail_store.py` is a separate, DuckDB-backed audit trail. It ingests the Claude Code transcripts (`~/.claude/projects/**/*.jsonl`, including `subagents/agent-<id>.jsonl`) into one local file and answers search / token / file-reconstruction queries over the full history. It is independent of the live TUI: `claude_trail.py main()` only lazily imports it when the first argument is one of the store subcommands (so the TUI and hook never load `duckdb`).
+
+- **Store file:** `~/.claude/trail.duckdb`, overridable via `$CLAUDE_TRAIL_DB` (constant `STORE_PATH`). `connect(read_only=...)` opens it; the parent dir is created on demand.
+- **Reads transcripts, not the hook.** The store ingests transcripts, so it covers every tool (Read, Edit, Write, Grep, Task, ...) and gets each call's result and edit patch for free. The live TUI is unchanged and still tails `command-log.jsonl`, which the PostToolUse hook writes and which is Bash-only. Two independent data paths: the hook feeds the TUI, the transcripts feed the store.
+
+### Subcommands
+
+Invoked as `claude-trail <cmd>` (installed) or `python3 claude_trail.py <cmd>` (from a clone):
+
+```
+ingest [--watch] [--compact]
+search <regex> [--tool T] [--session S] [--project P] [--since ISO] [--limit N] [-i]
+stats
+tokens [--session S] [--by session|command|tool|day|model] [--since ISO] [--limit N]
+cat <path> [--session S] [--at ISO]
+diff <path> [--session S]
+```
+
+- `ingest` is the **single writer**: it holds DuckDB's one read-write connection, tails each transcript from its last byte offset, and is idempotent (re-ingest inserts nothing). Run it from cron or leave one `--watch` process polling every 5s. Every other subcommand (and any ad-hoc reader) opens the file **read-only**; the hook never writes DuckDB (many short-lived hook processes would contend on the write lock). `--compact` runs once after the sweep (ignored under `--watch`) and reclaims DuckDB's interspersed free blocks by rewriting the store into a fresh file (a plain `CHECKPOINT` never coalesces them, so a bulk ingest otherwise leaves the file ~2x its packed size).
+- `search` is a regex/substring full scan over `events.text`/`stdout`/`stderr` (no FTS index); `-i` is case-insensitive.
+- `tokens` defaults to per-session totals; passing `--session` switches the default `--by` to `command`.
+
+### Data model
+
+- **Lossless `raw_events` layer.** Every transcript line is stored verbatim first (all event types, byte-for-byte, malformed lines keyed by content hash). `events`, `api_requests`, `file_versions`, and `sessions` are derived projections of it: drop them and they rebuild from `raw_events`; delete the source transcripts and nothing is lost.
+- **Append-only events.** A tool call (`tool_use`) and its result (`tool_result`) are **separate rows** joined on `tool_use_id`, never updated in place (so re-ingest stays idempotent). The `actions` view stitches each call back together with its result.
+
+### Token accounting
+
+The API bills per request, not per tool call, so the store is explicit about exact vs derived:
+
+- `api_requests` is one row per API request, deduped on `request_id` (a request is written as several content-block lines with identical usage). Synthetic messages (`model == "<synthetic>"`) are skipped. Subagent transcripts are ingested under the parent `sessionId`, and `agent_id` splits main-thread vs subagent spend.
+- `session_tokens` view: **exact** per-session totals.
+- `command_tokens` view: **exact generation cost per command** (the `output_tokens` of the request that emitted the `tool_use`, including any thinking/text in the same message). When one request emits N parallel tool calls it exposes `calls_in_request` and an even `output_tokens_share` split.
+- `request_context` view: **read-back approximation.** A command's output is paid for as input on the next request; this view reports each request's context size and its growth over the previous request in the same (session, agent) thread. It goes negative across a compaction boundary, which is real signal, not an error.
+
+### File reconstruction
+
+- Edits are captured as content-addressed **blobs** (full file content, deduped by `sha256`) plus the `structuredPatch` diff, in `file_versions` (`pre_sha`/`post_sha`/`patch`).
+- `cat <path> [--at ISO]` **rewinds** a file: it reconstructs the file's exact bytes as of `--at` (or latest), so you can recover or roll back to an earlier version. `diff <path>` lists that path's edits oldest-first with their patches.
+- **Limitation:** full-content reconstruction currently covers only ~39% of edits, those whose `originalFile`/`content` is present in the transcript. The rest are **patch-only**: `diff` works, but `cat` cannot rebuild their bytes (null `post_sha`). Closing that gap is the planned **file-history backfill** follow-up (ingest `~/.claude/file-history/<session_id>/<pathhash>@vN` snapshots to give the patch-only rows real PRE/POST content).

@@ -1039,3 +1039,22 @@ def test_cmd_cat_patch_only_returns_1_but_diff_shows_patch(tmp_path, monkeypatch
     assert sid[:8] in out                                # the version is listed
     assert "line two CHANGED" in out                     # its structuredPatch shown
     assert "(no patch)" not in out                       # it HAS a patch
+
+
+def test_cmd_diff_without_pytz(tmp_path, monkeypatch, capsys):
+    """diff must not require the optional `pytz` package.
+
+    DuckDB's Python client needs `pytz` to materialize a raw TIMESTAMPTZ into a
+    datetime; diff dodges that by strftime-ing ts to a string for its header.
+    Simulate a clean install without pytz by mapping the module to None (so any
+    `import pytz` raises ModuleNotFoundError), then run diff over a path with a
+    stored edit: it must return 0 and print without raising. Regression for the
+    raw-ts footgun that only passed while the dev env had pytz (mirrors the
+    per-session tokens guard test)."""
+    monkeypatch.setitem(sys.modules, "pytz", None)  # any `import pytz` now raises
+    sid = "sess-diff-nopytz-0001"
+    _build_reconstruction_store(tmp_path, monkeypatch, sid, _write_then_edit_events(sid))
+    assert store.cmd_diff(["diff", CATDIFF_PATH]) == 0
+    out = capsys.readouterr().out
+    assert sid[:8] in out                                # header rendered
+    assert "line two CHANGED" in out                     # the Edit's structuredPatch

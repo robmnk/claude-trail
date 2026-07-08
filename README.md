@@ -108,6 +108,23 @@ Each line in `~/.claude/command-log.jsonl`:
 
 Timestamps are in the user's local timezone (ISO 8601 with offset). Commands run inside a subagent also carry optional `agent_id` and `agent_type` fields; their absence means the main agent.
 
+## Audit store
+
+Alongside the live TUI, `claude-trail` ships a DuckDB-backed audit store that ingests the Claude Code transcripts (`~/.claude/projects/**/*.jsonl`, subagents included) into one local file: `~/.claude/trail.duckdb` (override with `$CLAUDE_TRAIL_DB`). Because it reads transcripts instead of the hook, it covers **every** tool (not just Bash) and captures each call's result and file-edit patch.
+
+A single `ingest` process is the only writer; every other subcommand opens the file read-only:
+
+```bash
+claude-trail ingest [--watch] [--compact]        # tail transcripts into the store (single writer)
+claude-trail search <regex> [--tool T --session S --project P --since ISO --limit N -i]
+claude-trail stats                               # session / event / token counts
+claude-trail tokens [--session S] [--by session|command|tool|day|model] [--since ISO] [--limit N]
+claude-trail cat <path> [--session S] [--at ISO] # reconstruct a file's bytes (rewind with --at)
+claude-trail diff <path> [--session S]           # list a path's edits oldest-first
+```
+
+Run `ingest` from cron or leave one `--watch` process polling; it is idempotent (byte-offset tailing), and `--compact` reclaims free blocks with a full rewrite. `tokens` reports exact per-session and per-command spend; `cat` / `diff` reconstruct edited files from content-addressed blobs plus `structuredPatch` diffs. Full-content reconstruction currently covers the edits whose original content is in the transcript (~39%); the rest are patch-only (`diff` works, `cat` cannot rebuild their bytes).
+
 ## Notes
 
 ### Platform support
