@@ -10,7 +10,7 @@ The per-task bash verification steps are part of the definition of done; the
 `## Verify` command below is the automated regression gate.
 
 ## Phases
-- [ ] 1. Dependency, module skeleton, DB bootstrap
+- [x] 1. Dependency, module skeleton, DB bootstrap
 - [ ] 2. Transcript parser (pure, unit-tested)
 - [ ] 3. Incremental ingester (`ingest [--watch]`)
 - [ ] 4. Search, stats, tokens CLI (Phase-1 shippable milestone)
