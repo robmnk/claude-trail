@@ -13,7 +13,7 @@ The per-task bash verification steps are part of the definition of done; the
 - [x] 1. Dependency, module skeleton, DB bootstrap
 - [x] 2. Transcript parser (pure, unit-tested)
 - [x] 3. Incremental ingester (`ingest [--watch]`)
-- [ ] 4. Search, stats, tokens CLI (Phase-1 shippable milestone)
+- [x] 4. Search, stats, tokens CLI (Phase-1 shippable milestone)
 - [ ] 5. File versions + content-addressed blobs
 - [ ] 6. Reconstruction CLI (`cat` / `diff`)
 - [ ] 7. Docs + dependency note + version bump
