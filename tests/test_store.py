@@ -667,12 +667,8 @@ def test_cmd_stats_prints_counts_including_output_tokens(tmp_path, monkeypatch, 
     assert "50" in out                  # sum(output_tokens) on the api-requests line
 
 
-def test_cmd_cat_and_cmd_diff_are_phase6_stubs(tmp_path, monkeypatch, capsys):
-    """cat/diff are stubs until Phase 6: they note the deferral and return 0."""
-    assert store.cmd_cat(["cat", "/some/path"]) == 0
-    assert "phase 6" in capsys.readouterr().out
-    assert store.cmd_diff(["diff", "/some/path"]) == 0
-    assert "phase 6" in capsys.readouterr().out
+# cat/diff are no longer stubs: their real reconstruction behavior is exercised
+# in the "Reconstruction CLI: cat / diff (Task 6)" section at the end of this file.
 
 
 # --- File versions + content-addressed blobs (Task 5) -------------------------
@@ -942,3 +938,104 @@ def test_ingest_truncation_rescan_no_file_version_duplication(tmp_path, monkeypa
         assert count("SELECT count(*) FROM file_versions") == before  # no dup
     finally:
         con.close()
+
+
+# --- Reconstruction CLI: cat / diff (Task 6) ----------------------------------
+#
+# Hermetic: a synthetic store is built by ingest_all from a transcript holding
+# Write(create)/Edit file_versions under a fake ~/.claude/projects layout in
+# tmp_path. PROJECTS_DIR and STORE_PATH are monkeypatched so cmd_cat/cmd_diff,
+# which open their OWN read-only connection, hit that store and never the live
+# corpus or the real DB. The writer is closed before the commands run so the file
+# is unlocked for the read-only reopen. stdout is captured via capsys. The Edit
+# fixture (_edit_result_event) reconstructs post by applying oldString->newString
+# to originalFile, so both the Write and the Edit have a non-null post_sha.
+
+CATDIFF_PATH = "/tmp/catdiff_demo.py"
+CATDIFF_WRITE_CONTENT = "print('hello')\n"                       # Write(create) post
+CATDIFF_EDIT_POST = "line one\nline two CHANGED\nline two-b\nline three\n"  # Edit post
+
+
+def _build_reconstruction_store(tmp_path, monkeypatch, sid, events):
+    """Ingest `events` into a hermetic store and leave PROJECTS_DIR/STORE_PATH
+    monkeypatched so cmd_cat/cmd_diff (own read-only connection) read it."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", events)
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+    finally:
+        con.close()  # unlock the file for the cmd_* read-only reopen
+
+
+def _write_then_edit_events(sid):
+    """A Write(create) of a path at 04:00:00 followed by an Edit of the SAME path
+    at 04:00:01. Both yield a file_version with a non-null post_sha (the Write
+    carries `content`; the Edit reconstructs post from originalFile), so the path
+    has two reconstructable versions in chronological order."""
+    return [
+        _write_create_event(sid, "cd-w-1", CATDIFF_PATH, CATDIFF_WRITE_CONTENT),
+        _edit_result_event(sid, "cd-e-1", CATDIFF_PATH),
+    ]
+
+
+def test_cmd_cat_prints_latest_reconstructed_content(tmp_path, monkeypatch, capsys):
+    """cat <path> prints the LATEST reconstructed bytes: with a Write(create)
+    then an Edit of the same path, the post-Edit content is returned."""
+    sid = "sess-cat-0001"
+    _build_reconstruction_store(tmp_path, monkeypatch, sid, _write_then_edit_events(sid))
+    assert store.cmd_cat(["cat", CATDIFF_PATH]) == 0
+    assert capsys.readouterr().out == CATDIFF_EDIT_POST
+
+
+def test_cmd_cat_at_returns_earlier_content(tmp_path, monkeypatch, capsys):
+    """cat --at <ts between the two versions> returns the EARLIER content: the
+    `fv.ts <= ?` cutoff excludes the later Edit, leaving the Write's bytes."""
+    sid = "sess-cat-0002"
+    _build_reconstruction_store(tmp_path, monkeypatch, sid, _write_then_edit_events(sid))
+    assert store.cmd_cat(["cat", CATDIFF_PATH, "--at", "2026-06-30T04:00:00.500Z"]) == 0
+    assert capsys.readouterr().out == CATDIFF_WRITE_CONTENT
+
+
+def test_cmd_cat_unknown_path_returns_1(tmp_path, monkeypatch, capsys):
+    """cat on a path with no stored version prints the sentinel and returns 1."""
+    sid = "sess-cat-0003"
+    _build_reconstruction_store(tmp_path, monkeypatch, sid, _write_then_edit_events(sid))
+    assert store.cmd_cat(["cat", "/tmp/no-such-file.py"]) == 1
+    assert "no stored version for that path/time" in capsys.readouterr().out
+
+
+def test_cmd_diff_lists_both_versions_oldest_first(tmp_path, monkeypatch, capsys):
+    """diff <path> prints every stored version oldest-first, each with its patch:
+    the Write(create) block (no diff -> "(no patch)") precedes the Edit block (its
+    structuredPatch), and both carry the 8-char session prefix header."""
+    sid = "sess-diff-0001"
+    _build_reconstruction_store(tmp_path, monkeypatch, sid, _write_then_edit_events(sid))
+    assert store.cmd_diff(["diff", CATDIFF_PATH]) == 0
+    out = capsys.readouterr().out
+    assert out.count(sid[:8]) == 2                       # one header per version
+    assert "line two CHANGED" in out                     # the Edit's structuredPatch
+    # oldest-first: the create (04:00:00, no patch) prints before the edit (04:00:01)
+    assert out.index("(no patch)") < out.index("line two CHANGED")
+
+
+def test_cmd_cat_patch_only_returns_1_but_diff_shows_patch(tmp_path, monkeypatch, capsys):
+    """A path whose only version is patch-only (Edit with originalFile null ->
+    null post_sha): cat has nothing to reconstruct (returns 1) while diff still
+    lists the version with its structuredPatch."""
+    sid = "sess-patchonly-0001"
+    path = "/tmp/patchonly_demo.py"
+    _build_reconstruction_store(
+        tmp_path, monkeypatch, sid,
+        [_edit_result_null_original_event(sid, "po-e-1", path)])
+
+    assert store.cmd_cat(["cat", path]) == 1
+    assert "no stored version for that path/time" in capsys.readouterr().out
+
+    assert store.cmd_diff(["diff", path]) == 0
+    out = capsys.readouterr().out
+    assert sid[:8] in out                                # the version is listed
+    assert "line two CHANGED" in out                     # its structuredPatch shown
+    assert "(no patch)" not in out                       # it HAS a patch
