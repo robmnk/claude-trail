@@ -2227,7 +2227,7 @@ def main():
     argv = sys.argv[1:]
     if argv and argv[0] == "hook":
         sys.exit(hook_main())
-    if argv and argv[0] in ("ingest", "search", "cat", "diff", "stats", "tokens", "reset-db"):
+    if argv and argv[0] in ("ingest", "search", "cat", "diff", "stats", "tokens", "reset-db", "prune-raw"):
         from claude_trail_store import cli_main  # lazy: only loads duckdb on demand
         sys.exit(cli_main(argv))
 

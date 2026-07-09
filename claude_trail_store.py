@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS raw_events(
   ts              TIMESTAMPTZ,
   type            TEXT,               -- every event type, kept as-is (system, mode, attachment, ...)
   transcript_path TEXT,
-  raw             TEXT                -- the complete original JSONL line, byte-for-byte
+  raw             TEXT                -- verbatim JSONL line, kept only for file-history-snapshot + malformed lines; NULL otherwise (see ingest_transcript / prune_raw_events)
 );                                    -- TEXT (not JSON) so malformed lines persist too; query via json_extract(raw,...) / raw::JSON
 CREATE INDEX IF NOT EXISTS raw_session_ts ON raw_events(session_id, ts);
 CREATE INDEX IF NOT EXISTS raw_type ON raw_events(type);
@@ -371,8 +371,16 @@ def ingest_transcript(con, path):
             raw_rows.append((_sha(line), None, None, None, str(path), line))
             continue
         uid = ev.get("uuid") or _sha(line)
+        typ = ev.get("type")
+        # Keep the lightweight index row for every line, but store the verbatim
+        # `raw` payload only for what the store still reads back: file-history
+        # -snapshot lines (via _snapshot_records). Every other line's payload is
+        # a redundant third copy (the transcript on disk + the `events`
+        # projection already hold it) and nothing reads it, so drop it to keep
+        # the store lean. Malformed lines (except branch above) keep their raw.
+        raw_val = line if typ == "file-history-snapshot" else None
         raw_rows.append((uid, ev.get("sessionId", ""), ev.get("timestamp"),
-                         ev.get("type"), str(path), line))
+                         typ, str(path), raw_val))
         rows.extend(parse_event(ev, agent_id))  # derived events; may be empty for a line
         u = parse_usage(ev, agent_id)           # one api_requests row per assistant line
         if u:
@@ -382,8 +390,8 @@ def ingest_transcript(con, path):
             if fv:
                 fvs.append(fv)
     if raw_rows:
-        _insert_raw(con, raw_rows)            # verbatim, always
-        _upsert_session(con, path, raw_rows)
+        _insert_raw(con, raw_rows)            # index rows always; payload only for snapshots/malformed
+        _upsert_session(con, path, raw_rows)  # sees every line (event_count stays exact)
     if rows:
         _insert_events(con, rows)
     if ureqs:
@@ -1061,6 +1069,27 @@ def compact_db(store_path=None):
     return (old_size, path.stat().st_size)
 
 
+def prune_raw_events(con):
+    """Clear the verbatim `raw` payload of every raw_events row the store never
+    reads back, keeping the lightweight (uuid, type, ts, session) index row.
+
+    Only file-history-snapshot lines are read after ingest (`_snapshot_records`);
+    everything else duplicates the on-disk transcript and the `events` projection.
+    Malformed lines (type IS NULL) keep their raw too. The `type <> '...'` filter
+    is NULL-safe on purpose: `NULL <> 'x'` is NULL, so malformed rows are skipped
+    (raw retained). Returns (rows_cleared, bytes_cleared). The caller must compact
+    afterwards for the space to actually return to the OS (a DuckDB UPDATE only
+    frees blocks). Idempotent: a second run clears 0 rows."""
+    rows, nbytes = con.execute(
+        "SELECT count(*), coalesce(sum(octet_length(encode(raw))), 0) "
+        "FROM raw_events WHERE raw IS NOT NULL AND type <> 'file-history-snapshot'"
+    ).fetchone()
+    if rows:
+        con.execute("UPDATE raw_events SET raw = NULL "
+                    "WHERE raw IS NOT NULL AND type <> 'file-history-snapshot'")
+    return rows, nbytes
+
+
 class _IngestProgress:
     """Live Rich progress for the ingest phases, auto-disabled off a tty (so cron
     and piped runs stay quiet and the summary log lines carry the detail instead).
@@ -1355,6 +1384,60 @@ def cmd_reset_db(argv):
             print(f"error: could not delete {p}: {e}")
             return 1
     print("reset done; run `claude-trail ingest` to rebuild")
+    return 0
+
+
+def cmd_prune_raw(argv):
+    """Shrink the store by clearing the bulky verbatim raw_events payload, then
+    compact to reclaim the space. Prompts for confirmation unless -y/--yes.
+
+    raw_events is a verbatim third copy of the transcripts (which stay on disk):
+    only file-history-snapshot lines are read after ingest, so clearing the rest
+    frees the store's single biggest consumer (typically ~2/3 of it) and breaks
+    no feature (search/tokens/cat/diff read events/api_requests/file_versions/
+    blobs). The (uuid, type, ts, session) index rows and every derived table are
+    kept. Going forward, `ingest` no longer stores these payloads, so the store
+    stays lean; this one-shot cleans up rows written before that change.
+    `--no-compact` skips the rewrite (leaves the freed blocks for a later compact).
+    """
+    assume_yes = "-y" in argv or "--yes" in argv
+    do_compact = "--no-compact" not in argv
+    if not STORE_PATH.exists():
+        print(f"no store at {STORE_PATH}; nothing to prune")
+        return 0
+    con = connect()
+    rows, nbytes = con.execute(
+        "SELECT count(*), coalesce(sum(octet_length(encode(raw))), 0) "
+        "FROM raw_events WHERE raw IS NOT NULL AND type <> 'file-history-snapshot'"
+    ).fetchone()
+    if not rows:
+        con.close()
+        print("raw_events already pruned; nothing to clear")
+        return 0
+    print(f"prune-raw will clear the verbatim payload of {rows:,} raw_events rows "
+          f"(~{_fmt_bytes(nbytes)} of JSON),")
+    print("keeping file-history-snapshot + malformed lines and every derived table.")
+    print("search / tokens / cat / diff keep working; transcripts under "
+          "~/.claude/projects stay the source of truth.")
+    if not assume_yes:
+        try:
+            answer = input("Proceed? [y/N] ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in ("y", "yes"):
+            con.close()
+            print("aborted; nothing changed")
+            return 1
+    cleared, _ = prune_raw_events(con)
+    print(f"cleared {cleared:,} rows (~{_fmt_bytes(nbytes)})")
+    con.execute("CHECKPOINT")
+    con.close()
+    if do_compact:
+        old, new = compact_db()
+        print(f"compacted {_fmt_bytes(old)} -> {_fmt_bytes(new)}")
+    else:
+        print("skipped compaction (--no-compact); run `claude-trail ingest --compact` to reclaim")
+    print(f"store: {STORE_PATH} ({_fmt_bytes(_store_size())})")
     return 0
 
 
@@ -1728,4 +1811,4 @@ def cli_main(argv):
     cmd = argv[0]
     return {"ingest": cmd_ingest, "search": cmd_search, "stats": cmd_stats,
             "tokens": cmd_tokens, "cat": cmd_cat, "diff": cmd_diff,
-            "reset-db": cmd_reset_db}[cmd](argv)
+            "reset-db": cmd_reset_db, "prune-raw": cmd_prune_raw}[cmd](argv)
