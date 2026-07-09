@@ -1327,6 +1327,75 @@ _STORE_TABLES = ["raw_events", "events", "api_requests", "file_versions",
                  "file_history", "blobs", "sessions", "ingest_state"]
 
 
+def command_tokens_for(con, session_id, command, ts=None):
+    """Output-token generation cost of the request that emitted a Bash command,
+    matched by (session_id, command text). Used by the TUI command-detail modal.
+
+    A tool call is billed as part of the API request that emitted it, so the cost
+    is that request's `output_tokens` (thinking/text in the same message included),
+    split evenly when the request emitted several parallel tool calls. Returns
+    ``{"output_tokens", "calls_in_request", "share", "model"}`` or None when there
+    is no matching ingested request (the store tails transcripts, so a just-run
+    command may not be recorded yet). `ts` (the hook's ISO timestamp) breaks ties
+    when the same command ran more than once in the session, picking the tool_use
+    closest in time; without it the most recent match wins. Read-only; never
+    raises for a caller that already guarded the connection.
+    """
+    if not session_id or not command:
+        return None
+    if ts:
+        order = "ORDER BY abs(epoch(e.ts) - epoch(try_cast(? AS TIMESTAMPTZ))) NULLS LAST"
+        params = [session_id, command, ts]
+    else:
+        order = "ORDER BY e.ts DESC"
+        params = [session_id, command]
+    row = con.execute(
+        f"""SELECT e.request_id, r.output_tokens, r.model
+            FROM events e JOIN api_requests r ON r.request_id = e.request_id
+            WHERE e.type = 'tool_use' AND e.session_id = ? AND e.text = ?
+            {order} LIMIT 1""",
+        params,
+    ).fetchone()
+    if not row:
+        return None
+    request_id, output_tokens, model = row
+    calls = con.execute(
+        "SELECT count(*) FROM events WHERE request_id = ? AND type = 'tool_use'",
+        [request_id],
+    ).fetchone()[0] or 1
+    out = output_tokens or 0
+    return {
+        "output_tokens": out,
+        "calls_in_request": calls,
+        "share": out / calls,
+        "model": model or "",
+    }
+
+
+def session_token_totals(con, session_id):
+    """Exact per-session token totals from the `session_tokens` view (subagent
+    spend included, since subagent transcripts ingest under the parent sessionId).
+
+    Returns ``{"requests", "output_tokens", "input_tokens", "cache_read_tokens",
+    "cache_creation_tokens", "subagent_output_tokens"}`` (Nones coalesced to 0) or
+    None when the session has no ingested API requests. Used by the TUI
+    session-detail modal's Tokens total. Read-only.
+    """
+    if not session_id:
+        return None
+    row = con.execute(
+        """SELECT requests, output_tokens, input_tokens,
+                  cache_read_tokens, cache_creation_tokens, subagent_output_tokens
+           FROM session_tokens WHERE session_id = ?""",
+        [session_id],
+    ).fetchone()
+    if not row:
+        return None
+    keys = ["requests", "output_tokens", "input_tokens",
+            "cache_read_tokens", "cache_creation_tokens", "subagent_output_tokens"]
+    return {k: (v or 0) for k, v in zip(keys, row)}
+
+
 def db_info(con):
     """DB properties + statistics as an ordered list of (label, value) string
     pairs, shared by the `stats` CLI section and the TUI's database modal.

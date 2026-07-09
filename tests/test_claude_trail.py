@@ -1163,6 +1163,27 @@ class TestRendering:
         out = self._text(feed.build_detail_panel(self._entry(), 40, agent_map={}))
         assert "Agent" not in out
 
+    def test_detail_panel_shows_tokens_when_present(self):
+        tokens = {"output_tokens": 1234, "calls_in_request": 1,
+                  "share": 1234.0, "model": "claude-opus-4-8"}
+        out = self._text(feed.build_detail_panel(self._entry(), 40, tokens=tokens))
+        assert "Tokens" in out
+        assert "1,234" in out                # thousands-separated share
+        assert "claude-opus-4-8" in out
+
+    def test_detail_panel_omits_tokens_when_none(self):
+        out = self._text(feed.build_detail_panel(self._entry(), 40, tokens=None))
+        assert "Tokens" not in out
+
+    def test_detail_panel_notes_shared_request(self):
+        # A request that emitted 2 parallel tool calls: the share is half, and the
+        # panel says so rather than implying the command cost the whole request.
+        tokens = {"output_tokens": 200, "calls_in_request": 2,
+                  "share": 100.0, "model": "claude-opus-4-8"}
+        out = self._text(feed.build_detail_panel(self._entry(), 40, tokens=tokens))
+        assert "1/2 of a 2-call request" in out
+        assert "100" in out
+
 
 class TestCountActiveSessions:
     """count_active_sessions: distinct session_ids seen within the window."""
@@ -1626,7 +1647,8 @@ class TestApplyKey:
         entries = self._entries(3)
         state = feed.AppState(entries=entries, cursor=0)
         result = feed.apply_key(state, "\r", 10)
-        assert result is feed.Action.NONE
+        # Enter opens the modal AND asks main() to load the command's token cost.
+        assert result is feed.Action.OPEN_DETAIL
         assert state.detail_entry == {"command": "c2"}  # newest
 
     def test_detail_mode_j_is_inert(self):
@@ -1690,7 +1712,8 @@ class TestSessionModal:
     def test_s_opens_session_detail_for_selected_session(self):
         state = feed.AppState(entries=self._entries(3), cursor=0)
         result = feed.apply_key(state, "s", 10)
-        assert result is feed.Action.NONE
+        # Opening a session asks main() to load its token total.
+        assert result is feed.Action.OPEN_SESSION_DETAIL
         # cursor 0 = newest = last appended (sid-2)
         assert state.session_detail == "sid-2"
         assert state.modal_open() is True
@@ -1860,6 +1883,30 @@ class TestDatabaseModal:
         assert "run1" in out  # short agent id, to correlate with the feed
         assert "Subagents (2, 1 running)" in out
 
+    def test_panel_shows_token_total_when_present(self):
+        tokens = {"requests": 42, "output_tokens": 12345, "input_tokens": 6789,
+                  "cache_read_tokens": 1_000_000, "cache_creation_tokens": 234_567,
+                  "subagent_output_tokens": 0}
+        out = self._text(feed.build_session_panel(self._model(), term_height=30,
+                                                  tokens=tokens))
+        assert "Tokens" in out
+        assert "12,345" in out               # output total, thousands-separated
+        assert "42 req" in out
+        assert "by subagents" not in out     # none ran
+
+    def test_panel_omits_tokens_when_none(self):
+        out = self._text(feed.build_session_panel(self._model(), term_height=30,
+                                                  tokens=None))
+        assert "Tokens" not in out
+
+    def test_panel_notes_subagent_output_when_present(self):
+        tokens = {"requests": 10, "output_tokens": 5000, "input_tokens": 100,
+                  "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                  "subagent_output_tokens": 1500}
+        out = self._text(feed.build_session_panel(self._model(), term_height=30,
+                                                  tokens=tokens))
+        assert "1,500 by subagents" in out
+
     def test_panel_empty_subagents_shows_placeholder(self):
         out = self._text(feed.build_session_panel(self._model(subagents=()),
                                                   term_height=30))
@@ -1889,6 +1936,37 @@ class TestDatabaseModal:
         out = self._text(feed.build_session_panel(model, term_height=30))
         assert "~/Projects/x" in out
         assert home + "/Projects/x" not in out  # absolute home prefix hidden
+
+
+class TestTokenLoaders:
+    """The lazy token loaders behind the command/session modals: they guard bad
+    input and degrade to None (omit the Tokens row) when the store is absent,
+    never raising into the TUI loop."""
+
+    def test_command_tokens_none_entry(self):
+        assert feed._load_command_tokens(None) is None
+
+    def test_command_tokens_missing_session_or_command(self):
+        assert feed._load_command_tokens({"command": "ls"}) is None       # no sid
+        assert feed._load_command_tokens({"session_id": "s"}) is None      # no cmd
+
+    def test_command_tokens_missing_store_returns_none(self, tmp_path, monkeypatch):
+        # No store file: the loader must not raise; it omits the row (None). The
+        # `from claude_trail_store import STORE_PATH` inside _with_store reads the
+        # patched module attribute at call time.
+        import claude_trail_store as store
+        monkeypatch.setattr(store, "STORE_PATH", tmp_path / "nope.duckdb")
+        entry = {"session_id": "s", "command": "ls", "timestamp": "2026-01-01T00:00:00+00:00"}
+        assert feed._load_command_tokens(entry) is None
+
+    def test_session_tokens_none_sid(self):
+        assert feed._load_session_tokens(None) is None
+        assert feed._load_session_tokens("") is None
+
+    def test_session_tokens_missing_store_returns_none(self, tmp_path, monkeypatch):
+        import claude_trail_store as store
+        monkeypatch.setattr(store, "STORE_PATH", tmp_path / "nope.duckdb")
+        assert feed._load_session_tokens("some-sid") is None
 
 
 class TestSearchRoots:

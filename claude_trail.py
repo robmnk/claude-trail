@@ -1091,15 +1091,38 @@ def _panel_title(extra: str = "") -> str:
     return "".join(parts) + " "
 
 
+def _format_command_tokens(tokens: dict) -> Text:
+    """The Tokens cell for the command-detail modal: the generation cost the
+    audit store attributes to this command (that request's output tokens, split
+    evenly when the request emitted several parallel tool calls), plus the model.
+    """
+    share = int(round(tokens.get("share", 0)))
+    calls = tokens.get("calls_in_request", 1) or 1
+    model = tokens.get("model") or ""
+    text = Text()
+    text.append(f"{share:,}", style="bold")
+    text.append(" output", style="dim")
+    if calls > 1:
+        text.append(f"  ·  1/{calls} of a {calls}-call request", style="dim")
+    if model:
+        text.append(f"  ·  {model}", style="dim")
+    return text
+
+
 def build_detail_panel(
     entry: LogEntry,
     term_height: int,
     name_map: dict[str, str] | None = None,
     color_map: dict[str, str] | None = None,
     agent_map: dict[str, dict] | None = None,
+    tokens: dict | None = None,
 ) -> Panel:
     """Full-screen view of a single command: metadata header plus the complete,
-    untruncated command text (newlines preserved)."""
+    untruncated command text (newlines preserved).
+
+    `tokens` (loaded on Enter via the audit store) adds a Tokens row with the
+    command's generation cost; it is omitted when the store has no matching
+    request (unavailable, or the command not yet ingested)."""
     cmd = entry.get("command", "")
     ctx = RenderCtx(name_map=name_map, color_map=color_map)
 
@@ -1116,6 +1139,8 @@ def build_detail_panel(
     files = extract_files(cmd)
     if files:
         meta.add_row("Files", files)
+    if tokens:
+        meta.add_row("Tokens", _format_command_tokens(tokens))
 
     # Reuse the Command column's danger marker, but keep the raw (un-normalized)
     # command so newlines are preserved in this full-screen view.
@@ -1176,21 +1201,39 @@ def _session_started_line(model: "SessionModel") -> str:
     return when
 
 
+def _format_session_tokens(tokens: dict) -> Text:
+    """The Tokens cell for the session-detail modal: exact per-session totals
+    (generation output, input, combined cache, request count) from the audit
+    store; subagent output is called out when any subagent ran."""
+    text = Text()
+    text.append(f"{tokens['output_tokens']:,}", style="bold")
+    text.append(" output", style="dim")
+    text.append(f"  ·  {tokens['input_tokens']:,} input", style="dim")
+    cache = tokens["cache_read_tokens"] + tokens["cache_creation_tokens"]
+    text.append(f"  ·  {cache:,} cache", style="dim")
+    text.append(f"  ·  {tokens['requests']:,} req", style="dim")
+    if tokens.get("subagent_output_tokens"):
+        text.append(f"  ·  {tokens['subagent_output_tokens']:,} by subagents", style="dim")
+    return text
+
+
 def build_session_panel(
     model: "SessionModel",
     name_map: dict[str, str] | None = None,
     color_map: dict[str, str] | None = None,
     term_height: int = 40,
+    tokens: dict | None = None,
 ) -> Panel:
     """Full-screen session-detail view (opened with `s`).
 
     A metadata header (id, name tinted by the session's `/color` plus its live
-    status, `~`-abbreviated folder, full transcript path, version, start time)
-    followed by a table of the session's subagents: status glyph
-    (`●` running / `✓` done / `✗` stopped), description, agent type, and the
-    tool-call count (`N+` when the count was byte-capped). Empty state reads
-    "No subagents." `load_session_model` is cached, so rebuilding this each
-    frame is cheap and still reflects live running->done transitions.
+    status, `~`-abbreviated folder, full transcript path, version, start time,
+    and, when the audit store has data, a Tokens total row) followed by a table
+    of the session's subagents: status glyph (`●` running / `✓` done /
+    `✗` stopped), description, agent type, and the tool-call count (`N+` when the
+    count was byte-capped). Empty state reads "No subagents."
+    `load_session_model` is cached, so rebuilding this each frame is cheap and
+    still reflects live running->done transitions.
     """
     sid = model.session_id
     color = rich_color(color_map.get(sid)) if color_map else None
@@ -1208,6 +1251,8 @@ def build_session_panel(
     meta.add_row("Transcript", Text(model.transcript_path or "(none)", style="dim"))
     meta.add_row("Version", model.version or "(unknown)")
     meta.add_row("Started", _session_started_line(model))
+    if tokens:
+        meta.add_row("Tokens", _format_session_tokens(tokens))
 
     running = sum(1 for s in model.subagents if s.status == "running")
     header = Text.from_markup(
@@ -1671,6 +1716,8 @@ class Action(enum.Enum):
     OPEN_MATCH = enum.auto()        # open the selected search hit at its line
     OPEN_MATCH_FOLDER = enum.auto()  # open the folder containing the selected hit
     LOAD_DB_INFO = enum.auto()      # load the audit-store properties for the `d` modal
+    OPEN_DETAIL = enum.auto()       # command modal just opened; load its token cost
+    OPEN_SESSION_DETAIL = enum.auto()  # session modal just opened; load its token total
     NONE = enum.auto()
 
 
@@ -1717,6 +1764,8 @@ class AppState:
     session_detail: str | None = None  # a session_id while the session modal is open
     search: "SearchState | None" = None  # set while the search modal is open
     db_info: list | None = None  # (label, value) pairs while the database modal is open
+    detail_tokens: dict | None = None   # token cost for the open command modal (loaded on Enter)
+    session_tokens: dict | None = None  # token total for the open session modal (loaded on `s`)
 
     def modal_open(self) -> bool:
         """True while a full-screen modal (command detail, session detail, or the
@@ -1859,6 +1908,8 @@ def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
             state.detail_entry = None
             state.session_detail = None
             state.db_info = None
+            state.detail_tokens = None
+            state.session_tokens = None
         return Action.NONE
     if ch in ("q", "\x03"):
         return Action.QUIT
@@ -1880,14 +1931,22 @@ def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
     elif ch.isdigit() and int(ch) in state.visible_cols:
         state.toggle_col(int(ch))
     elif ch in ("\r", "\n"):
+        # Open the command-detail modal; main() loads its token cost (OPEN_DETAIL)
+        # so apply_key stays pure and never touches duckdb itself.
         state.detail_entry = state.selected_entry()
+        return Action.OPEN_DETAIL
     elif ch == "s":
         # Open the session-detail modal for the selected row's session. Opening
         # it precludes the command modal (only one modal open at a time).
         entry = state.selected_entry()
         # Treat an empty/missing session_id (hand-edited or legacy line) as no
         # session so the modal stays closed instead of showing a blank identity.
-        state.session_detail = (entry.get("session_id") or None) if entry else None
+        sid = (entry.get("session_id") or None) if entry else None
+        state.session_detail = sid
+        # Only ask main() to load the token total when a session actually opened;
+        # an empty/missing session_id leaves the modal closed and returns NONE.
+        if sid:
+            return Action.OPEN_SESSION_DETAIL
     elif ch == "/":
         # Open the per-session search modal for the selected row's session,
         # resolving its transcript-folder and cwd roots up front (S.1). Unlike
@@ -1941,6 +2000,60 @@ def _load_db_info() -> list:
         return [("connection", str(STORE_PATH)), ("error", str(e))]
 
 
+def _with_store(fn):
+    """Open the audit store read-only, call `fn(con)`, and return its result.
+
+    Shared plumbing for the token lookups the command/session modals trigger:
+    the store (and duckdb) is imported lazily on the keypress, so the normal feed
+    and the hook never load duckdb. Returns None on any failure (duckdb/module
+    not importable, no store file yet, or a query error) so a caller can simply
+    omit the Tokens row rather than crash the TUI."""
+    try:
+        from claude_trail_store import STORE_PATH, connect
+    except Exception:
+        return None
+    if not STORE_PATH.exists():
+        return None
+    try:
+        con = connect(read_only=True)
+        try:
+            return fn(con)
+        finally:
+            con.close()
+    except Exception:
+        return None
+
+
+def _load_command_tokens(entry: LogEntry | None) -> dict | None:
+    """Token cost of `entry`'s command from the audit store, or None. Loaded once
+    when the command-detail modal opens (see Action.OPEN_DETAIL)."""
+    if not entry:
+        return None
+    sid = entry.get("session_id") or ""
+    cmd = entry.get("command") or ""
+    if not sid or not cmd:
+        return None
+
+    def query(con):
+        from claude_trail_store import command_tokens_for
+        return command_tokens_for(con, sid, cmd, entry.get("timestamp"))
+
+    return _with_store(query)
+
+
+def _load_session_tokens(sid: str | None) -> dict | None:
+    """Per-session token totals from the audit store, or None. Loaded once when
+    the session-detail modal opens (see Action.OPEN_SESSION_DETAIL)."""
+    if not sid:
+        return None
+
+    def query(con):
+        from claude_trail_store import session_token_totals
+        return session_token_totals(con, sid)
+
+    return _with_store(query)
+
+
 def _signal_exit(signum, frame):
     """Fatal-signal handler: raise SystemExit so main()'s finally restores the tty.
 
@@ -1987,10 +2100,12 @@ def main():
             return build_session_panel(
                 load_session_model(state.session_detail),
                 name_map, color_map, console.height,
+                tokens=state.session_tokens,
             )
         if state.detail_entry is not None:
             return build_detail_panel(
                 state.detail_entry, console.height, name_map, color_map, agent_map,
+                tokens=state.detail_tokens,
             )
         if state.db_info is not None:
             return build_db_panel(state.db_info, console.height)
@@ -2115,6 +2230,12 @@ def main():
                                     s.flash = f"opened folder: {folder}"
                             elif action is Action.LOAD_DB_INFO:
                                 state.db_info = _load_db_info()
+                            elif action is Action.OPEN_DETAIL:
+                                state.detail_tokens = _load_command_tokens(
+                                    state.detail_entry)
+                            elif action is Action.OPEN_SESSION_DETAIL:
+                                state.session_tokens = _load_session_tokens(
+                                    state.session_detail)
                             ready, _, _ = select.select([fd], [], [], 0)
                         if quit_now:
                             break

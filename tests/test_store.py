@@ -666,6 +666,61 @@ def test_cmd_tokens_by_day_and_by_model_run(tmp_path, monkeypatch, capsys):
     assert "claude-opus-4-8" in out_model
 
 
+def test_command_tokens_for_matches_bash_command(tmp_path, monkeypatch):
+    """command_tokens_for maps (session, command text) to the emitting request's
+    generation cost: the 'echo hi' fixture cost 50 output tokens on a 1-call
+    request, model claude-opus-4-8."""
+    sid = _build_cli_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        t = store.command_tokens_for(con, sid, "echo hi")
+        # ts tie-break path must return the same single match
+        t_ts = store.command_tokens_for(con, sid, "echo hi", ts="2026-06-30T02:00:01Z")
+    finally:
+        con.close()
+    assert t == {"output_tokens": 50, "calls_in_request": 1,
+                 "share": 50.0, "model": "claude-opus-4-8"}
+    assert t_ts == t
+
+
+def test_command_tokens_for_no_match_returns_none(tmp_path, monkeypatch):
+    """A command/session that never emitted a request, or empty args, yield None
+    (the TUI then omits the Tokens row)."""
+    sid = _build_cli_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        assert store.command_tokens_for(con, sid, "no_such_command_zzz") is None
+        assert store.command_tokens_for(con, "no-such-session", "echo hi") is None
+        assert store.command_tokens_for(con, sid, "") is None
+        assert store.command_tokens_for(con, "", "echo hi") is None
+    finally:
+        con.close()
+
+
+def test_session_token_totals(tmp_path, monkeypatch):
+    """session_token_totals returns the exact per-session totals (one request:
+    50 out / 100 in / 200 cache-read / 30 cache-create, no subagent spend)."""
+    sid = _build_cli_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        t = store.session_token_totals(con, sid)
+    finally:
+        con.close()
+    assert t == {"requests": 1, "output_tokens": 50, "input_tokens": 100,
+                 "cache_read_tokens": 200, "cache_creation_tokens": 30,
+                 "subagent_output_tokens": 0}
+
+
+def test_session_token_totals_no_match_returns_none(tmp_path, monkeypatch):
+    _build_cli_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        assert store.session_token_totals(con, "no-such-session") is None
+        assert store.session_token_totals(con, "") is None
+    finally:
+        con.close()
+
+
 def test_cmd_stats_prints_counts_including_output_tokens(tmp_path, monkeypatch, capsys):
     """stats prints each labelled count block, including the api-requests /
     output-tokens line the spec pins."""
