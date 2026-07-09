@@ -1223,6 +1223,8 @@ def build_session_panel(
     color_map: dict[str, str] | None = None,
     term_height: int = 40,
     tokens: dict | None = None,
+    highlight_agent_id: str | None = None,
+    agent_map: dict[str, dict] | None = None,
 ) -> Panel:
     """Full-screen session-detail view (opened with `s`).
 
@@ -1234,6 +1236,11 @@ def build_session_panel(
     count was byte-capped). Empty state reads "No subagents."
     `load_session_model` is cached, so rebuilding this each frame is cheap and
     still reflects live running->done transitions.
+
+    When opened from a subagent row, `highlight_agent_id` is that row's agent id:
+    a `Subagent` metadata row surfaces its complete name (the thing the Agent
+    column truncates) and its row in the subagents table is reversed. Opened from
+    a main-agent row it is None, so the page renders exactly as before.
     """
     sid = model.session_id
     color = rich_color(color_map.get(sid)) if color_map else None
@@ -1247,6 +1254,17 @@ def build_session_panel(
         name.append(f"  ({model.status})", style="bold green")
     meta.add_row("Session", sid or "(none)")
     meta.add_row("Name", name)
+    # Opened from a subagent row: surface that subagent's complete name (the
+    # Agent column ellipsizes it) right under Name, tinted like the feed.
+    if highlight_agent_id is not None:
+        info = next(
+            (s for s in model.subagents if s.agent_id == highlight_agent_id), None
+        )
+        if info is not None:
+            full = f"{short_agent_id(info.agent_id)}  {info.description}".rstrip()
+            if info.agent_type:
+                full += f"  ({info.agent_type})"
+            meta.add_row("Subagent", Text(full, style=AGENT_STYLE))
     meta.add_row("Folder", _tilde(model.cwd))
     meta.add_row("Transcript", Text(model.transcript_path or "(none)", style="dim"))
     meta.add_row("Version", model.version or "(unknown)")
@@ -1271,12 +1289,15 @@ def build_session_panel(
             count = f"{s.command_count}+" if s.command_count_capped else str(s.command_count)
             count_cell = count if s.command_count else Text(count, style="dim")
             short = short_agent_id(s.agent_id)
+            # Reverse the spotlighted subagent's row (opened from its feed row).
+            row_style = "reverse" if s.agent_id == highlight_agent_id else None
             subs.add_row(
                 Text(glyph, style=gstyle),
                 f"{short}  {s.description}" if s.description else short,
                 s.agent_type,
                 Text(s.status, style=gstyle),
                 count_cell,
+                style=row_style,
             )
         subagent_block = subs
     else:
@@ -1762,6 +1783,7 @@ class AppState:
     )
     detail_entry: LogEntry | None = None
     session_detail: str | None = None  # a session_id while the session modal is open
+    session_agent_id: str | None = None  # subagent to spotlight on session page (None = main agent)
     search: "SearchState | None" = None  # set while the search modal is open
     db_info: list | None = None  # (label, value) pairs while the database modal is open
     detail_tokens: dict | None = None   # token cost for the open command modal (loaded on Enter)
@@ -1907,6 +1929,7 @@ def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
         if ch in ("\x1b", "q", "\r", "\n"):
             state.detail_entry = None
             state.session_detail = None
+            state.session_agent_id = None
             state.db_info = None
             state.detail_tokens = None
             state.session_tokens = None
@@ -1943,6 +1966,9 @@ def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
         # session so the modal stays closed instead of showing a blank identity.
         sid = (entry.get("session_id") or None) if entry else None
         state.session_detail = sid
+        # Spotlight the row's subagent on the session page (None for a main-agent
+        # row, so it renders exactly as before); only when the modal opens.
+        state.session_agent_id = entry_agent_id(entry) if sid else None
         # Only ask main() to load the token total when a session actually opened;
         # an empty/missing session_id leaves the modal closed and returns NONE.
         if sid:
@@ -2101,6 +2127,7 @@ def main():
                 load_session_model(state.session_detail),
                 name_map, color_map, console.height,
                 tokens=state.session_tokens,
+                highlight_agent_id=state.session_agent_id, agent_map=agent_map,
             )
         if state.detail_entry is not None:
             return build_detail_panel(

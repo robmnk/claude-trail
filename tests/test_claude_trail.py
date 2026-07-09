@@ -1779,6 +1779,30 @@ class TestSessionModal:
         assert state.detail_entry is None
         assert state.session_detail is None
 
+    def test_s_on_subagent_row_tracks_agent_id(self):
+        # opening from a subagent row records its agent id to spotlight it
+        state = feed.AppState(
+            entries=[{"command": "c", "session_id": "sid-0", "agent_id": "aid-9"}],
+            cursor=0)
+        feed.apply_key(state, "s", 10)
+        assert state.session_detail == "sid-0"
+        assert state.session_agent_id == "aid-9"
+
+    def test_s_on_main_agent_row_leaves_agent_id_none(self):
+        # a main-agent row (no agent_id) opens the page with nothing spotlighted
+        state = feed.AppState(
+            entries=[{"command": "c", "session_id": "sid-0"}], cursor=0)
+        feed.apply_key(state, "s", 10)
+        assert state.session_detail == "sid-0"
+        assert state.session_agent_id is None
+
+    def test_close_clears_session_agent_id(self):
+        state = feed.AppState(entries=self._entries(3),
+                              session_detail="sid-0", session_agent_id="aid-9")
+        feed.apply_key(state, "\x1b", 10)
+        assert state.session_detail is None
+        assert state.session_agent_id is None
+
 
 class TestDatabaseModal:
     """The `d` database modal: the load action, modal key handling, the
@@ -1936,6 +1960,50 @@ class TestDatabaseModal:
         out = self._text(feed.build_session_panel(model, term_height=30))
         assert "~/Projects/x" in out
         assert home + "/Projects/x" not in out  # absolute home prefix hidden
+
+    # A description far longer than the feed's 6-wide Agent column, so the feed
+    # would ellipsize it but the session page surfaces it in full.
+    _LONG_DESC = "Refactor the agent attribution pipeline across the whole feed"
+
+    def _highlight_model(self):
+        subs = (
+            feed.SubagentInfo(
+                agent_id="aaaaaaaa-1111", agent_type="code-reviewer",
+                description=self._LONG_DESC, status="done", command_count=4),
+            feed.SubagentInfo(
+                agent_id="bbbbbbbb-2222", agent_type="Explore",
+                description="other run", status="running", command_count=1),
+        )
+        return self._model(subagents=subs)
+
+    def _reverse_segments(self, panel, width=120):
+        # Segments carrying reverse=True: the ellipsis-safe way to assert a row
+        # is emphasized (export_text drops the reverse SGR on a record console).
+        console = Console(width=width)
+        return [s for s in console.render(panel, console.options)
+                if s.style and s.style.reverse]
+
+    def test_highlight_subagent_surfaces_full_name_and_emphasizes_row(self):
+        panel = feed.build_session_panel(
+            self._highlight_model(), term_height=30,
+            highlight_agent_id="aaaaaaaa-1111")
+        out = self._text(panel, width=120)
+        # complete description surfaced in a Subagent metadata row, untruncated,
+        # with the agent type appended in parens (unique to the metadata row)
+        assert self._LONG_DESC in out
+        assert "(code-reviewer)" in out
+        # the matching subagents-table row is reversed
+        rev = self._reverse_segments(panel)
+        assert any("Refactor" in s.text for s in rev)
+
+    def test_no_highlight_renders_no_subagent_meta_row(self):
+        # opened from a main-agent row (highlight None): no Subagent metadata row
+        # and no reversed table row - identical to before this phase
+        panel = feed.build_session_panel(
+            self._highlight_model(), term_height=30, highlight_agent_id=None)
+        out = self._text(panel, width=120)
+        assert "(code-reviewer)" not in out   # no metadata Subagent row
+        assert self._reverse_segments(panel) == []
 
 
 class TestTokenLoaders:
