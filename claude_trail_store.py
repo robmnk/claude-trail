@@ -1108,7 +1108,144 @@ class _IngestProgress:
             self._progress.advance(self._fh)
 
 
+def _ingest_lock_path():
+    """Path of the singleton lock file guarding one-shot detached ingests.
+
+    Keyed to the STORE's directory (NOT a fixed global path): the thing we
+    serialize is DuckDB's single write lock on STORE_PATH, so two processes
+    pointed at different $CLAUDE_TRAIL_DB stores must NOT block each other.
+    Deriving it from STORE_PATH at call time also makes tests that patch
+    STORE_PATH self-isolating (each gets its own lock under its own tmp dir).
+    """
+    return os.path.join(os.path.dirname(str(STORE_PATH)) or ".", "trail-ingest.lock")
+
+
+def _acquire_ingest_lock():
+    """Try to grab the singleton ingest lock without blocking.
+
+    Returns an open, flock-held file descriptor on success, or None if another
+    process already holds it. The caller owns the returned fd and must keep it
+    open for as long as the lock should be held, then close it to release.
+
+    fcntl is imported lazily (POSIX only: Linux + macOS, all this tool targets)
+    so `import claude_trail_store` still succeeds on a platform without it -- this
+    helper is only ever reached through the --detach path.
+    """
+    import fcntl  # lazy: POSIX-only, keeps the module import portable
+
+    lock_path = _ingest_lock_path()
+    os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        # LOCK_EX | LOCK_NB: take the exclusive lock or fail immediately rather
+        # than block. Another live ingest already holding it -> EWOULDBLOCK ->
+        # we return None so the caller can skip this run entirely.
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        # Only EWOULDBLOCK/EAGAIN (a held LOCK_NB flock) is a clean "skip this
+        # run". Any OTHER OSError (ENOLCK on some NFS, EPERM, ...) is an
+        # environmental failure that must surface, not be swallowed into a
+        # permanent silent skip where ingest never runs again with no signal.
+        os.close(fd)
+        return None
+    except BaseException:
+        # Propagate everything else, but do not leak the fd we just opened.
+        os.close(fd)
+        raise
+    # Keep the lock fd out of the std range (0/1/2). os.open returns the lowest
+    # free fd, so if a std fd was closed at launch (e.g. cron `0<&-`) the flock
+    # could land on 0/1/2 -- and the child's dup2(devnull, 0/1/2) below would
+    # then silently drop it mid-ingest, defeating the whole singleton guard. A
+    # singleton lock released while the run is still going lets a second ingest
+    # start and contend on DuckDB's one write lock. F_DUPFD copies onto the SAME
+    # open file description, so the flock is preserved on the new fd.
+    if fd < 3:
+        newfd = fcntl.fcntl(fd, fcntl.F_DUPFD, 3)
+        os.close(fd)
+        fd = newfd
+    return fd
+
+
+def _detach_child_argv(argv):
+    """The argv the forked child re-enters cmd_ingest with.
+
+    --detach implies a single one-shot run: strip --detach (so the child does
+    not recurse back into _ingest_detach) and --watch (detach never watches).
+    Every other flag (--compact, --file-history-only, -v/--verbose) passes
+    through unchanged.
+    """
+    return [a for a in argv if a not in ("--detach", "--watch")]
+
+
+def _ingest_detach(argv):
+    """Run a one-shot ingest in a detached background process, returning at once.
+
+    For a Claude Code hook: `claude-trail ingest --detach` forks the ingest off
+    and unblocks the hook immediately, with a singleton lock so concurrent
+    turns/sessions never pile up ingests contending on DuckDB's one write lock.
+    A skipped run loses nothing -- ingest is incremental and idempotent, so the
+    next turn's detach catches up whatever a skipped one missed.
+    """
+    if not hasattr(os, "fork"):
+        # os.fork is POSIX-only (absent on e.g. Windows). This tool targets
+        # Linux + macOS; return cleanly rather than crash the hook.
+        _log("--detach requires os.fork (POSIX only); nothing ingested")
+        return 1
+
+    fd = _acquire_ingest_lock()
+    if fd is None:
+        # Another ingest already holds the lock: skip WITHOUT forking or
+        # ingesting. Reachable/testable without a fork; the next turn catches up.
+        return 0
+
+    # --detach implies a single one-shot run: strip --detach (so the forked child
+    # does not recurse back into here) and --watch, keeping every other flag.
+    child_argv = _detach_child_argv(argv)
+
+    pid = os.fork()
+    if pid > 0:
+        # Parent (the hook process): close OUR copy of the lock fd and return
+        # instantly so the hook unblocks. NOTE: fork() duplicated the fd, but the
+        # parent's and child's fds refer to the SAME open file description holding
+        # ONE flock; the lock releases only when ALL fds on that description are
+        # closed, so closing here does NOT drop the child's lock -- it only
+        # relinquishes the parent's reference to it.
+        os.close(fd)
+        return 0
+
+    # Child: fully detach so it outlives the hook process that spawned it.
+    try:
+        # New session + process group: no controlling tty, and no longer in the
+        # hook's process group, so the hook exiting cannot signal us.
+        os.setsid()
+        # Redirect std streams to /dev/null: the parent has already returned and
+        # the tty may be gone, so ingest's stdout/stderr must not touch the hook's
+        # fds. (sys.stdout.isatty() now sees /dev/null -> the Rich bar stays off.)
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for stdfd in (0, 1, 2):
+            os.dup2(devnull, stdfd)
+        # Only close devnull when it is above the std range: if a std fd was
+        # closed at launch, os.open may have handed us devnull AS 0/1/2, which we
+        # just dup2'd onto -- closing it would drop a std stream we mean to keep.
+        if devnull > 2:
+            os.close(devnull)
+        # Keep `fd` open for the whole run: it is what holds the flock, releasing
+        # only when this child exits and all fds on the description finally close.
+        cmd_ingest(child_argv)
+    except BaseException:
+        # _exit (not sys.exit): skip atexit handlers / buffer flushes in the
+        # forked child, which could otherwise double-flush the parent's buffers.
+        os._exit(1)
+    os._exit(0)
+
+
 def cmd_ingest(argv):
+    # --detach: fork a one-shot ingest into the background and return at once (for
+    # a Claude Code hook). Dispatched here so `claude-trail ingest --detach` needs
+    # no cli_main change; the forked child re-enters cmd_ingest with --detach
+    # stripped (see _ingest_detach), taking the normal one-shot path below.
+    if "--detach" in argv:
+        return _ingest_detach(argv)
     watch = "--watch" in argv
     # --file-history-only runs just the file-history backfill pass (Phase 8): it does
     # NOT sweep transcripts and does NOT touch ingest_state, but uses the same

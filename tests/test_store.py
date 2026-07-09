@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -1738,3 +1739,83 @@ def test_file_history_promotes_after_dir_pruned(tmp_path, monkeypatch):
                            "AND path=?", [abspath]).fetchone()[0] == 1  # emitted from the stored blob
     finally:
         con.close()
+
+
+# --- ingest --detach: singleton lock + background fork (Phase 1) ---------------
+
+
+def test_acquire_ingest_lock_is_exclusive_and_reusable(tmp_path, monkeypatch):
+    """The lock is keyed to STORE_PATH's dir: the first acquire returns a held fd,
+    a second acquire while it is open is refused (None), and closing the first fd
+    releases it so a later acquire succeeds again."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    first = store._acquire_ingest_lock()
+    assert first  # truthy open fd (>= 3; 0/1/2 are the std streams)
+    try:
+        assert store._acquire_ingest_lock() is None   # held -> refused, no block
+    finally:
+        os.close(first)
+    again = store._acquire_ingest_lock()               # released -> acquirable again
+    assert again
+    os.close(again)
+
+
+def test_ingest_detach_skips_without_forking_when_lock_held(tmp_path, monkeypatch):
+    """When the lock is already held, `ingest --detach` returns 0 immediately
+    without forking and without ingesting (idempotent skip). Exercised WITHOUT a
+    real fork: os.fork is patched to flag any call, and the store is never even
+    created because the skip returns before connect()."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    forked = []
+    monkeypatch.setattr(os, "fork", lambda: forked.append(True))
+
+    held = store._acquire_ingest_lock()                # pre-hold the lock
+    assert held
+    try:
+        assert store.cmd_ingest(["ingest", "--detach"]) == 0
+    finally:
+        os.close(held)
+    assert forked == []                                # never forked
+    assert not (tmp_path / "trail.duckdb").exists()    # nothing ingested/written
+
+
+def test_ingest_detach_parent_branch_closes_fd_and_returns(tmp_path, monkeypatch):
+    """Lock-acquired path, parent branch simulated: os.fork returns a positive pid
+    (as it does in the real parent) so no child runs; the parent closes its lock
+    fd, returns 0, and ingests nothing itself. Closing the fd here also releases
+    the lock, which a follow-up acquire confirms."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    monkeypatch.setattr(os, "fork", lambda: 4242)      # pretend to be the parent
+    closed = []
+    real_close = os.close
+    monkeypatch.setattr(os, "close", lambda fd: (closed.append(fd), real_close(fd))[1])
+
+    assert store.cmd_ingest(["ingest", "--detach"]) == 0
+    assert closed                                      # parent closed its lock fd
+    assert not (tmp_path / "trail.duckdb").exists()    # parent does not ingest
+    # The lock is free again (all fds on the description closed).
+    monkeypatch.setattr(os, "close", real_close)
+    fd = store._acquire_ingest_lock()
+    assert fd
+    os.close(fd)
+
+
+def test_detach_child_argv_strips_detach_and_watch_keeps_rest():
+    """The forked child re-enters cmd_ingest with --detach and --watch removed
+    (so it cannot recurse and never watches) while every other flag survives."""
+    assert store._detach_child_argv(
+        ["ingest", "--detach", "--watch", "--compact"]
+    ) == ["ingest", "--compact"]
+    assert store._detach_child_argv(
+        ["ingest", "--detach", "--file-history-only", "-v"]
+    ) == ["ingest", "--file-history-only", "-v"]
+
+
+def test_ingest_detach_returns_cleanly_without_os_fork(tmp_path, monkeypatch):
+    """On a platform without os.fork (non-POSIX), `ingest --detach` returns 1
+    cleanly rather than crashing the hook, and never reaches lock acquisition
+    (no lock file is created under STORE_PATH's dir)."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    monkeypatch.delattr(os, "fork", raising=False)
+    assert store.cmd_ingest(["ingest", "--detach"]) == 1
+    assert not (tmp_path / "trail-ingest.lock").exists()  # _acquire_ingest_lock never reached
