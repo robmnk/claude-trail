@@ -1804,6 +1804,152 @@ class TestSessionModal:
         assert state.session_agent_id is None
 
 
+class TestSessionScroll:
+    """Scrolling the session modal's subagent list: the `session_scroll` key
+    handling (j/k/g/G) while the modal is open, its reset on open/close, and the
+    build_session_panel window math (mirrors the search-panel windowing tests)."""
+
+    def _entries(self, n):
+        return [{"command": f"c{i}", "session_id": f"sid-{i}"} for i in range(n)]
+
+    def _model(self, n_sub):
+        subs = tuple(
+            feed.SubagentInfo(
+                agent_id=f"a{i:03d}", agent_type="Explore",
+                description=f"sub-{i}", status="done", command_count=i)
+            for i in range(n_sub)
+        )
+        return feed.SessionModel(
+            session_id="sid-0", name="nm", status="busy", live=True,
+            cwd="/home/naka/x", version="2.1", kind="interactive",
+            started_at=1783058624928, transcript_path="/t/x.jsonl", subagents=subs)
+
+    def _text(self, panel, width=100):
+        console = Console(width=width, record=True)
+        console.print(panel)
+        return console.export_text()
+
+    # --- key handling (state mutation) ---
+
+    def test_j_scrolls_subagent_list_down_not_the_cursor(self):
+        # while the session modal is open, j/k move session_scroll, not the feed
+        # cursor, and never close the modal (Action.NONE)
+        state = feed.AppState(entries=self._entries(3), cursor=1, session_detail="sid-0")
+        assert feed.apply_key(state, "j", 10) is feed.Action.NONE
+        assert state.session_scroll == 1
+        assert state.cursor == 1                 # feed cursor untouched
+        assert state.session_detail == "sid-0"   # modal still open
+
+    def test_k_scrolls_up_and_floors_at_zero(self):
+        state = feed.AppState(entries=self._entries(3), session_detail="sid-0",
+                              session_scroll=2)
+        feed.apply_key(state, "k", 10)
+        assert state.session_scroll == 1
+        feed.apply_key(state, "k", 10)
+        feed.apply_key(state, "k", 10)  # already at 0, must not go negative
+        assert state.session_scroll == 0
+
+    def test_arrow_keys_scroll_like_jk(self):
+        state = feed.AppState(entries=self._entries(3), session_detail="sid-0")
+        feed.apply_key(state, "down", 10)
+        assert state.session_scroll == 1
+        feed.apply_key(state, "up", 10)
+        assert state.session_scroll == 0
+
+    def test_g_scrolls_to_top(self):
+        state = feed.AppState(entries=self._entries(3), session_detail="sid-0",
+                              session_scroll=5)
+        feed.apply_key(state, "g", 10)
+        assert state.session_scroll == 0
+
+    def test_G_sets_bottom_sentinel(self):
+        # G parks a sentinel that build_session_panel / render clamp to the bottom
+        state = feed.AppState(entries=self._entries(3), session_detail="sid-0")
+        feed.apply_key(state, "G", 10)
+        assert state.session_scroll == 10**9
+
+    def test_open_resets_scroll(self):
+        # a stale offset from a previous open must not carry into the new modal
+        state = feed.AppState(entries=self._entries(3), cursor=0, session_scroll=7)
+        feed.apply_key(state, "s", 10)
+        assert state.session_detail == "sid-2"   # cursor 0 = newest
+        assert state.session_scroll == 0
+
+    def test_close_resets_scroll(self):
+        state = feed.AppState(entries=self._entries(3), session_detail="sid-0",
+                              session_scroll=7)
+        feed.apply_key(state, "\x1b", 10)
+        assert state.session_detail is None
+        assert state.session_scroll == 0
+
+    def test_scroll_keys_do_not_leak_to_command_modal(self):
+        # the command-detail modal keeps its full-swallow behavior: j is ignored
+        # and leaves session_scroll at 0
+        entries = self._entries(3)
+        state = feed.AppState(entries=entries, detail_entry=entries[0])
+        assert feed.apply_key(state, "j", 10) is feed.Action.NONE
+        assert state.session_scroll == 0
+        assert state.detail_entry is entries[0]  # still open
+
+    # --- clamp helper ---
+
+    def test_clamp_helper_bounds_scroll(self):
+        m = self._model(8)               # capacity 3 at term_height 20 -> max 5
+        assert feed._clamp_session_scroll(10**9, m, 20) == 5   # G sentinel -> bottom
+        assert feed._clamp_session_scroll(-4, m, 20) == 0      # never negative
+        assert feed._clamp_session_scroll(2, m, 20) == 2       # in range untouched
+
+    def test_clamp_helper_fits_pins_to_zero(self):
+        m = self._model(2)               # fits the window -> only valid offset is 0
+        assert feed._clamp_session_scroll(9, m, 20) == 0
+
+    # --- window rendering ---
+
+    def test_long_list_clips_to_window_and_reports_range(self):
+        # capacity 3 (term_height 20): the top window shows the first 3 subagents
+        # and the header reports the "n-m of N" range
+        out = self._text(feed.build_session_panel(self._model(8), term_height=20,
+                                                  scroll=0))
+        assert "sub-0" in out and "sub-2" in out
+        assert "sub-3" not in out and "sub-7" not in out
+        assert "1-3 of 8" in out
+
+    def test_G_sentinel_renders_bottom_window(self):
+        # the huge sentinel is clamped for display to the last full window
+        out = self._text(feed.build_session_panel(self._model(8), term_height=20,
+                                                  scroll=10**9))
+        assert "sub-5" in out and "sub-7" in out
+        assert "sub-4" not in out and "sub-0" not in out
+        assert "6-8 of 8" in out
+
+    def test_j_then_render_steps_window_by_one(self):
+        out = self._text(feed.build_session_panel(self._model(8), term_height=20,
+                                                  scroll=1))
+        assert "sub-1" in out and "sub-3" in out
+        assert "sub-0" not in out and "sub-4" not in out
+        assert "2-4 of 8" in out
+
+    def test_short_list_renders_all_rows_without_range_hint(self):
+        out = self._text(feed.build_session_panel(self._model(3), term_height=20,
+                                                  scroll=0))
+        assert "sub-0" in out and "sub-1" in out and "sub-2" in out
+        assert " of 3" not in out                 # no range indicator when it fits
+        assert "Subagents (3, 0 running)" in out
+
+    def test_windowing_preserves_hint_footer(self):
+        # the back hint must never be pushed off the height-cropped panel, even at
+        # the worst-case metadata height (highlight Subagent row + Tokens row)
+        tokens = {"requests": 1, "output_tokens": 5, "input_tokens": 1,
+                  "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                  "subagent_output_tokens": 0}
+        out = self._text(feed.build_session_panel(
+            self._model(30), term_height=25, tokens=tokens,
+            highlight_agent_id="a000", scroll=10**9))
+        assert "esc / q" in out                   # footer survived the crop
+        assert "23-30 of 30" in out               # bottom window
+        assert "Tokens" in out                    # token row not regressed
+
+
 class TestDatabaseModal:
     """The `d` database modal: the load action, modal key handling, the
     build_db_panel rendering, and the lazy loader's graceful fallback."""

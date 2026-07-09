@@ -63,6 +63,14 @@ CHROME_ROWS = 10  # title, status, padding
 # rows, table header, blank spacers, hint); the results window is sized so the
 # table body never overflows the panel and crops the cursor row out of view.
 SEARCH_CHROME_ROWS = 11
+# Same idea for the session modal's subagent table. The metadata header is
+# variable-height (an optional Subagent row and an optional Tokens row on top of
+# the six always-present rows), so this is the worst-case chrome: 2 borders +
+# 2 vertical padding + 8 max meta rows + 1 blank + Subagents header + table
+# header + 1 blank + hint. Sizing off the maximum keeps the hint on screen
+# regardless of which optional meta rows are present (a few rows go unused when
+# they are absent, same trade-off SEARCH_CHROME_ROWS accepts).
+SESSION_CHROME_ROWS = 17
 MIN_VISIBLE_ROWS = 3
 SESSION_NAME_CACHE_TTL = 2.0  # seconds
 SESSION_COLOR_CACHE_TTL = 5.0  # seconds
@@ -1225,6 +1233,7 @@ def build_session_panel(
     tokens: dict | None = None,
     highlight_agent_id: str | None = None,
     agent_map: dict[str, dict] | None = None,
+    scroll: int = 0,
 ) -> Panel:
     """Full-screen session-detail view (opened with `s`).
 
@@ -1241,6 +1250,11 @@ def build_session_panel(
     a `Subagent` metadata row surfaces its complete name (the thing the Agent
     column truncates) and its row in the subagents table is reversed. Opened from
     a main-agent row it is None, so the page renders exactly as before.
+
+    `scroll` windows the subagent list (nav keys drive it while the modal is
+    open) so a long list does not overflow the height-cropped panel; it is
+    clamped here for display and the header shows an `n-m of N` range while
+    windowed. A list that fits renders whole with no range hint.
     """
     sid = model.session_id
     color = rich_color(color_map.get(sid)) if color_map else None
@@ -1272,10 +1286,20 @@ def build_session_panel(
     if tokens:
         meta.add_row("Tokens", _format_session_tokens(tokens))
 
+    # Window the subagent list around `scroll` so it never overflows the
+    # height-cropped panel (mirrors the search panel's result windowing).
+    n = len(model.subagents)
+    scroll = _clamp_session_scroll(scroll, model, term_height)
+    win_start = scroll
+    win_end = min(n, scroll + _session_capacity(term_height))
+    windowed = model.subagents[win_start:win_end]
+
     running = sum(1 for s in model.subagents if s.status == "running")
     header = Text.from_markup(
         f"[bold]Subagents[/bold] [dim]({len(model.subagents)}, {running} running)[/dim]"
     )
+    if (win_start, win_end) != (0, n):
+        header.append(f"  {win_start + 1}-{win_end} of {n}", style="dim")
 
     if model.subagents:
         subs = Table(box=None, pad_edge=False, header_style="dim", expand=True)
@@ -1284,7 +1308,7 @@ def build_session_panel(
         subs.add_column("Type", width=16, no_wrap=True, overflow="ellipsis")
         subs.add_column("Status", width=8)
         subs.add_column("Cmds", justify="right", width=5)
-        for s in model.subagents:
+        for s in windowed:
             glyph, gstyle = _SUBAGENT_GLYPHS.get(s.status, ("?", "dim"))
             count = f"{s.command_count}+" if s.command_count_capped else str(s.command_count)
             count_cell = count if s.command_count else Text(count, style="dim")
@@ -1376,6 +1400,23 @@ def _result_window(cursor: int, total: int, capacity: int) -> tuple[int, int]:
         return 0, total
     start = max(0, min(cursor - capacity // 2, total - capacity))
     return start, start + capacity
+
+
+def _session_capacity(term_height: int) -> int:
+    """Subagent rows that fit in the session modal once its chrome is accounted
+    for (mirrors `visible_row_count` / the search panel's capacity math)."""
+    return max(term_height - SESSION_CHROME_ROWS, MIN_VISIBLE_ROWS)
+
+
+def _clamp_session_scroll(scroll: int, model: "SessionModel", term_height: int) -> int:
+    """Clamp a session-modal scroll offset to `[0, len(subagents) - capacity]`.
+
+    Shared by `build_session_panel` (display safety) and `render_panel`, which
+    writes the clamped value back to `AppState` each frame so `G`'s sentinel
+    (10**9) settles on the true bottom and `k` then steps up one row at a time.
+    """
+    capacity = _session_capacity(term_height)
+    return max(0, min(scroll, max(0, len(model.subagents) - capacity)))
 
 
 def build_search_panel(search: "SearchState", term_height: int = 40) -> Panel:
@@ -1784,6 +1825,7 @@ class AppState:
     detail_entry: LogEntry | None = None
     session_detail: str | None = None  # a session_id while the session modal is open
     session_agent_id: str | None = None  # subagent to spotlight on session page (None = main agent)
+    session_scroll: int = 0  # scroll offset over the session modal's subagent list
     search: "SearchState | None" = None  # set while the search modal is open
     db_info: list | None = None  # (label, value) pairs while the database modal is open
     detail_tokens: dict | None = None   # token cost for the open command modal (loaded on Enter)
@@ -1930,9 +1972,24 @@ def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
             state.detail_entry = None
             state.session_detail = None
             state.session_agent_id = None
+            state.session_scroll = 0
             state.db_info = None
             state.detail_tokens = None
             state.session_tokens = None
+            return Action.NONE
+        # In the session modal only, the nav keys scroll the subagent list
+        # instead of being swallowed. G's sentinel and every offset are clamped
+        # for display in build_session_panel (and written back by render_panel).
+        # The command-detail / database modals keep full-swallow behavior.
+        if state.session_detail is not None:
+            if ch in ("j", "down"):
+                state.session_scroll += 1
+            elif ch in ("k", "up"):
+                state.session_scroll = max(0, state.session_scroll - 1)
+            elif ch == "g":
+                state.session_scroll = 0
+            elif ch == "G":
+                state.session_scroll = 10**9  # clamped in build_session_panel
         return Action.NONE
     if ch in ("q", "\x03"):
         return Action.QUIT
@@ -1969,6 +2026,7 @@ def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
         # Spotlight the row's subagent on the session page (None for a main-agent
         # row, so it renders exactly as before); only when the modal opens.
         state.session_agent_id = entry_agent_id(entry) if sid else None
+        state.session_scroll = 0  # start each open at the top of the list
         # Only ask main() to load the token total when a session actually opened;
         # an empty/missing session_id leaves the modal closed and returns NONE.
         if sid:
@@ -2123,11 +2181,18 @@ def main():
         if state.search is not None:
             return build_search_panel(state.search, console.height)
         if state.session_detail is not None:
+            model = load_session_model(state.session_detail)
+            # Write the clamped scroll back so `G`'s sentinel settles on the true
+            # bottom and `k` then steps up one row (build_session_panel also
+            # clamps for display; keeping state in range makes j/k deterministic).
+            state.session_scroll = _clamp_session_scroll(
+                state.session_scroll, model, console.height
+            )
             return build_session_panel(
-                load_session_model(state.session_detail),
-                name_map, color_map, console.height,
+                model, name_map, color_map, console.height,
                 tokens=state.session_tokens,
                 highlight_agent_id=state.session_agent_id, agent_map=agent_map,
+                scroll=state.session_scroll,
             )
         if state.detail_entry is not None:
             return build_detail_panel(
