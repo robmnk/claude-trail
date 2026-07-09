@@ -901,6 +901,70 @@ class TestEnvInt:
                 assert feed._env_int(self.KEY, 8) == 8
 
 
+class TestColumnWidthWiring:
+    """The five .env width keys must actually reach COLUMNS / DIR_LABEL_WIDTH.
+
+    TestLoadDotenv / TestEnvInt cover the helpers in isolation; this reloads the
+    module end-to-end (the TestConfigDir reload pattern) so a typo in any key
+    name at the COLUMNS call sites (or in DIR_LABEL_WIDTH) is caught: such a typo
+    would silently no-op that column while every helper test still passed.
+    Columns are matched by their stable name, not a positional index, so the
+    assertions survive column reordering.
+    """
+
+    # Non-default and mutually distinct, so a swapped key name also fails.
+    _OVERRIDES = {
+        "CLAUDE_TRAIL_COL_TIME_WIDTH": "10",
+        "CLAUDE_TRAIL_COL_SESSION_WIDTH": "17",
+        "CLAUDE_TRAIL_COL_AGENT_WIDTH": "30",
+        "CLAUDE_TRAIL_COL_DIRECTORY_WIDTH": "19",
+        "CLAUDE_TRAIL_COL_FILES_WIDTH": "25",
+    }
+
+    def _cols_by_name(self):
+        return {c.name: c for c in feed.COLUMNS}
+
+    def test_env_widths_reach_columns_and_dir_label(self, tmp_path):
+        import importlib
+        env = tmp_path / ".env"
+        env.write_text(
+            "".join(f"{k}={v}\n" for k, v in self._OVERRIDES.items()),
+            encoding="utf-8",
+        )
+        try:
+            with patch.dict(os.environ, {"CLAUDE_TRAIL_ENV": str(env)}):
+                importlib.reload(feed)
+                cols = self._cols_by_name()
+                assert cols["Time"].kwargs["width"] == 10
+                assert cols["Session"].kwargs["width"] == 17
+                assert cols["Agent"].kwargs["width"] == 30
+                assert cols["Files"].kwargs["width"] == 25
+                assert feed.DIR_LABEL_WIDTH == 19
+                # Directory shares DIR_LABEL_WIDTH (its own key drives both).
+                assert cols["Directory"].kwargs["width"] == 19
+        finally:
+            # patch.dict restored CLAUDE_TRAIL_ENV to the conftest-isolated
+            # (nonexistent) path; reload so later tests see default widths again.
+            importlib.reload(feed)
+
+    def test_clean_reload_reproduces_defaults(self, tmp_path):
+        # A clean environment (no .env, no CLAUDE_TRAIL_COL_* env vars) must
+        # reproduce the pre-phase literal widths exactly.
+        import importlib
+        absent = tmp_path / "absent.env"
+        with patch.dict(os.environ, {"CLAUDE_TRAIL_ENV": str(absent)}):
+            for k in [k for k in os.environ if k.startswith("CLAUDE_TRAIL_COL_")]:
+                os.environ.pop(k)
+            importlib.reload(feed)
+            cols = self._cols_by_name()
+            assert cols["Time"].kwargs["width"] == 8
+            assert cols["Session"].kwargs["width"] == 13
+            assert cols["Agent"].kwargs["width"] == 24
+            assert feed.DIR_LABEL_WIDTH == 14
+            assert cols["Directory"].kwargs["width"] == 14
+            assert cols["Files"].kwargs["width"] == 20
+
+
 class TestHookMain:
     def _run_hook(self, tmp_path, payload):
         import io
