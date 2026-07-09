@@ -76,6 +76,7 @@ python3 claude_trail.py   # if running from a clone
 | `d` | Open the audit-store database modal: connection string, DuckDB / schema version, on-disk sizes, block accounting, and per-table row counts (opens the DuckDB store read-only, on demand) |
 | `Esc` | Close the open modal (command detail, session detail, or database) (also `q` or `Enter` while it is open) |
 | `o` | Open the selected session's commands (filtered JSONL) in `$VISUAL` / `$EDITOR`, else the platform launcher (`xdg-open` on Linux, `open` on macOS) |
+| `t` | Open a pretty-printed copy of the selected session's transcript (`<sid>.jsonl`) in `$VISUAL` / `$EDITOR`, else the platform launcher |
 | `f` | Open the file manager on the folder of files referenced in the selected command |
 | `/` | Search the selected row's session recursively (`rg`, else `grep`). `Tab` toggles the root between the transcript folder and the session's cwd; `Enter` runs the query. In results: `j` / `k` browse, `Enter` opens a hit at its line, `f` opens the hit's folder, `/` edits the query, `Esc` / `q` close |
 | `1`-`6` | Toggle columns (1=Time, 2=Session, 3=Directory, 4=Files, 5=Command, 6=Agent) |
