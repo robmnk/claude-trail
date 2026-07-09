@@ -718,6 +718,64 @@ def test_cmd_stats_missing_db_reports_location(tmp_path, monkeypatch, capsys):
     assert "not created yet" in out
 
 
+def test_cmd_ingest_logs_summary(tmp_path, monkeypatch, capsys):
+    """cmd_ingest emits timestamped progress: a start line, the transcript and
+    stored-delta summaries, per-phase timing, and the final store line. The Rich
+    bar is disabled under a non-tty (capsys), so the summary lines carry detail."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    sid = "sess-ing-log-1"
+    _write_jsonl(projects / "-fake" / f"{sid}.jsonl", _main_transcript_events(sid))
+    assert store.cmd_ingest(["ingest"]) == 0
+    out = capsys.readouterr().out
+    assert "ingest start:" in out
+    assert "transcripts:" in out
+    assert "stored:" in out
+    assert "raw_events" in out
+    assert "store:" in out
+
+
+def test_cmd_ingest_verbose_logs_per_transcript(tmp_path, monkeypatch, capsys):
+    """-v adds one line per changed transcript (bar off under a non-tty)."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    sid = "sess-ing-log-2"
+    _write_jsonl(projects / "-fake" / f"{sid}.jsonl", _main_transcript_events(sid))
+    assert store.cmd_ingest(["ingest", "-v"]) == 0
+    out = capsys.readouterr().out
+    assert "transcript" in out
+    assert sid in out
+
+
+def test_cmd_reset_db_deletes_with_yes(tmp_path, monkeypatch, capsys):
+    """reset-db --yes deletes the store file and reports it (return 0)."""
+    _build_cli_store(tmp_path, monkeypatch)
+    db = tmp_path / "trail.duckdb"
+    assert db.exists()
+    assert store.cmd_reset_db(["reset-db", "--yes"]) == 0
+    assert not db.exists()
+    assert "deleted" in capsys.readouterr().out
+
+
+def test_cmd_reset_db_no_store_returns_zero(tmp_path, monkeypatch, capsys):
+    """reset-db on an absent store is a no-op that returns 0."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "absent.duckdb")
+    assert store.cmd_reset_db(["reset-db"]) == 0
+    assert "nothing to reset" in capsys.readouterr().out
+
+
+def test_cmd_reset_db_declined_keeps_file(tmp_path, monkeypatch, capsys):
+    """Without --yes, a 'n' at the prompt aborts (return 1) and keeps the file."""
+    _build_cli_store(tmp_path, monkeypatch)
+    db = tmp_path / "trail.duckdb"
+    monkeypatch.setattr("builtins.input", lambda *a: "n")
+    assert store.cmd_reset_db(["reset-db"]) == 1
+    assert db.exists()
+    assert "aborted" in capsys.readouterr().out
+
+
 # cat/diff are no longer stubs: their real reconstruction behavior is exercised
 # in the "Reconstruction CLI: cat / diff (Task 6)" section at the end of this file.
 

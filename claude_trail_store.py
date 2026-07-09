@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -445,17 +446,80 @@ def _upsert_session(con, path, raw_rows):
          max(ts_vals, default=None), len(raw_rows)])  # event_count = transcript lines
 
 
-def ingest_all(con):
+def _now_hms():
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def _log(msg):
+    """Timestamped ingest progress line (stdout, flushed for live tailing)."""
+    print(f"[{_now_hms()}] {msg}", flush=True)
+
+
+def _rel_transcript(path):
+    """Short label for a transcript in verbose logs: `<parent>/<name>`."""
+    return "/".join(path.parts[-2:])
+
+
+# Tables ingest mutates, for the per-sweep stored-delta summary (present only).
+_INGEST_COUNT_TABLES = ["raw_events", "events", "api_requests",
+                        "file_versions", "blobs", "file_history"]
+
+
+def _table_counts(con):
+    """Row counts for the ingest-touched tables that currently exist."""
+    present = {r[0] for r in con.execute(
+        "SELECT table_name FROM information_schema.tables "
+        "WHERE table_schema='main'").fetchall()}
+    return {t: con.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+            for t in _INGEST_COUNT_TABLES if t in present}
+
+
+def _store_size():
+    """On-disk size of the store file plus its WAL (0 for parts not present)."""
     total = 0
-    paths = sorted(PROJECTS_DIR.glob("*/*.jsonl")) + sorted(PROJECTS_DIR.glob("*/*/subagents/*.jsonl"))
-    for path in paths:
-        total += ingest_transcript(con, path)
-    # M6: the file-history pass runs AFTER the transcript sweep, so a path first
-    # revealed by this run's transcripts resolves its snapshots this run (within the
-    # pass the promotion UPDATE runs after the index build, before emitting rows).
-    # It prints its own progress line; `total` stays the transcript-line count.
-    ingest_file_history(con)
+    for p in (STORE_PATH, Path(str(STORE_PATH) + ".wal")):
+        try:
+            total += p.stat().st_size
+        except OSError:
+            pass
     return total
+
+
+def _transcript_paths():
+    """All transcript files: main `<sid>.jsonl` plus subagent `subagents/*.jsonl`."""
+    return (sorted(PROJECTS_DIR.glob("*/*.jsonl"))
+            + sorted(PROJECTS_DIR.glob("*/*/subagents/*.jsonl")))
+
+
+def _sweep_transcripts(con, paths=None, verbose=False, tick=None):
+    """Ingest every transcript under PROJECTS_DIR. Returns (files, changed, lines):
+    transcript files seen, how many had new data, and lines ingested. Calls
+    `tick()` once per file (drives the progress bar) and logs one line per changed
+    transcript when `verbose`."""
+    if paths is None:
+        paths = _transcript_paths()
+    changed = lines = 0
+    for path in paths:
+        n = ingest_transcript(con, path)
+        if n:
+            changed += 1
+            lines += n
+            if verbose:
+                _log(f"  transcript {_rel_transcript(path)}: +{n} lines")
+        if tick:
+            tick()
+    return len(paths), changed, lines
+
+
+def ingest_all(con, verbose=False):
+    """Sweep transcripts then backfill file-history (M6: file-history AFTER the
+    transcript sweep, so a path first revealed this run resolves its snapshots
+    this run; within the pass the promotion UPDATE runs after the index build,
+    before emitting rows). Returns the transcript-line count (the historical
+    contract); per-file lines are logged when `verbose`."""
+    _files, _changed, lines = _sweep_transcripts(con, verbose=verbose)
+    ingest_file_history(con, verbose=verbose)
+    return lines
 
 
 # --- File versions + content-addressed blobs (Task 5) -------------------------
@@ -834,7 +898,7 @@ def _emit_file_history_versions(con):
     return after - before
 
 
-def ingest_file_history(con):
+def ingest_file_history(con, verbose=False, on_total=None, tick=None):
     """Backfill ~/.claude/file-history snapshots into blobs + file_history, and emit
     resolved snapshots as source='file-history' file_versions rows so cat can
     reconstruct the ~61% of edits that are patch-only in transcripts. Returns
@@ -858,6 +922,16 @@ def ingest_file_history(con):
     for sid, ph, ver, bfn, btime, key in _snapshot_records(con):
         records.setdefault((sid, ph, ver), (bfn, btime, key))
 
+    # Snapshots to read this sweep (immutable; already-stored PKs are skipped
+    # before any byte is read). Report the total up front so the caller can size a
+    # progress bar, and log it when verbose.
+    pending = (sum(1 for k in records if k not in existing)
+               if FILE_HISTORY_DIR.exists() else 0)
+    if on_total:
+        on_total(pending)
+    if verbose:
+        _log(f"  file-history: {len(records)} records, {pending} new snapshots to read")
+
     new_rows, new_count = [], 0
     # Disk-reading passes only when the file-history dir still exists. When it has
     # been pruned (the loss scenario this phase insures against), the snapshots are
@@ -867,6 +941,8 @@ def ingest_file_history(con):
         for (sid, ph, ver), (bfn, btime, key) in records.items():
             if (sid, ph, ver) in existing:
                 continue                   # immutable: never re-read
+            if tick:
+                tick()                     # advance the bar once per pending snapshot
             snap_path = FILE_HISTORY_DIR / sid / bfn
             got = _read_snapshot(snap_path)
             if got is None:
@@ -927,7 +1003,10 @@ def ingest_file_history(con):
                             [p, ph])
         resolved = _emit_file_history_versions(con)
 
-    if new_count or resolved:
+    # With a progress driver attached (cmd_ingest), stay silent here so this print
+    # cannot corrupt the live bar; cmd_ingest reports the counts after it closes.
+    # Standalone callers (ingest_all, tests) keep the original one-line summary.
+    if tick is None and (new_count or resolved):
         print(f"file-history: {new_count} new snapshots, {resolved} resolved")
     return (new_count, resolved)
 
@@ -982,28 +1061,109 @@ def compact_db(store_path=None):
     return (old_size, path.stat().st_size)
 
 
+class _IngestProgress:
+    """Live Rich progress for the ingest phases, auto-disabled off a tty (so cron
+    and piped runs stay quiet and the summary log lines carry the detail instead).
+
+    Exposes the tick callbacks that `_sweep_transcripts` and `ingest_file_history`
+    accept; when disabled every method is a no-op, so those loops run untouched.
+    """
+
+    def __init__(self, enabled):
+        self.enabled = enabled
+        self._progress = None
+        self._tx = None
+        self._fh = None
+
+    def __enter__(self):
+        if self.enabled:
+            from rich.progress import (BarColumn, MofNCompleteColumn, Progress,
+                                       SpinnerColumn, TextColumn, TimeElapsedColumn)
+            self._progress = Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(), MofNCompleteColumn(), TimeElapsedColumn())
+            self._progress.start()
+        return self
+
+    def __exit__(self, *exc):
+        if self._progress:
+            self._progress.stop()
+        return False
+
+    def start_transcripts(self, total):
+        if self._progress:
+            self._tx = self._progress.add_task("transcripts ", total=total)
+
+    def tick_transcript(self):
+        if self._progress and self._tx is not None:
+            self._progress.advance(self._tx)
+
+    def start_file_history(self, total):
+        if self._progress:
+            self._fh = self._progress.add_task("file-history", total=total)
+
+    def tick_file_history(self):
+        if self._progress and self._fh is not None:
+            self._progress.advance(self._fh)
+
+
 def cmd_ingest(argv):
     watch = "--watch" in argv
     # --file-history-only runs just the file-history backfill pass (Phase 8): it does
     # NOT sweep transcripts and does NOT touch ingest_state, but uses the same
     # connect() writer and end-of-run CHECKPOINT, so --compact still composes.
     fh_only = "--file-history-only" in argv
+    # -v/--verbose logs one line per changed transcript (and the file-history scan)
+    # when the live bar is off; with the bar on, the bar itself carries progress.
+    verbose = "-v" in argv or "--verbose" in argv
     # --compact rewrites the store to reclaim free blocks after the sweep; it is a
     # one-shot maintenance step, so it is meaningless (and skipped) under --watch.
     compact = "--compact" in argv and not watch
     if "--compact" in argv and watch:
-        print("note: --compact is ignored with --watch (never compact inside the poll loop)")
+        _log("note: --compact is ignored with --watch (never compact inside the poll loop)")
     interval = 5.0
     con = connect()
+    mode = "watch" if watch else ("file-history-only" if fh_only else "one-shot")
+    # The live bar needs a tty; off a tty (cron/pipe) it is disabled and the
+    # per-file verbose logs (safe with no bar to corrupt) carry the detail.
+    bar_enabled = sys.stdout.isatty()
+    file_verbose = verbose and not bar_enabled
+    _log(f"ingest start: {STORE_PATH} (mode {mode})")
+    sweep = 0
     try:
         while True:
-            if fh_only:
-                new, resolved = ingest_file_history(con)
-                if not (new or resolved):     # ingest_file_history prints only when nonzero
-                    print("file-history: 0 new snapshots, 0 resolved")
-            else:
-                n = ingest_all(con)
-                print(f"ingested {n} events")
+            sweep += 1
+            t0 = time.monotonic()
+            before = _table_counts(con)
+            files = changed = lines = 0
+            t_tx = 0.0
+            with _IngestProgress(bar_enabled) as prog:
+                if not fh_only:
+                    paths = _transcript_paths()
+                    prog.start_transcripts(len(paths))
+                    s = time.monotonic()
+                    files, changed, lines = _sweep_transcripts(
+                        con, paths=paths, verbose=file_verbose, tick=prog.tick_transcript)
+                    t_tx = time.monotonic() - s
+                s = time.monotonic()
+                fh_new, fh_resolved = ingest_file_history(
+                    con, verbose=file_verbose,
+                    on_total=prog.start_file_history, tick=prog.tick_file_history)
+                t_fh = time.monotonic() - s
+            after = _table_counts(con)
+            delta = {k: after.get(k, 0) - before.get(k, 0) for k in after}
+            elapsed = time.monotonic() - t0
+            # Under --watch, stay quiet on an idle sweep (nothing new) so the poll
+            # loop does not spam; always report a changed sweep and any one-shot run.
+            if not watch or changed or fh_new or fh_resolved or any(delta.values()):
+                if not fh_only:
+                    _log(f"transcripts: {changed}/{files} changed, +{lines} lines")
+                _log(f"file-history: {fh_new} new snapshots, {fh_resolved} resolved")
+                _log("stored: " + ", ".join(
+                    f"+{delta.get(k, 0)} {k}" for k in _INGEST_COUNT_TABLES if k in after))
+                _log(f"sweep {sweep} done in {elapsed:.1f}s "
+                     f"(transcripts {t_tx:.1f}s, file-history {t_fh:.1f}s)")
             if not watch:
                 break
             time.sleep(interval)
@@ -1013,11 +1173,51 @@ def cmd_ingest(argv):
         # DuckDB's interspersed free blocks, so the file stays ~2x its packed
         # size after a bulk ingest; the full rewrite that does reclaim them is
         # compact_db(), run below (non-watch only) after the write lock is freed.
+        _log("checkpoint: flushing WAL to disk")
         con.execute("CHECKPOINT")
         con.close()
     if compact:  # after con.close(), so the store file is unlocked for the rewrite
         old, new = compact_db()
-        print(f"compacted {old // (1024 * 1024)}MB -> {new // (1024 * 1024)}MB")
+        _log(f"compacted {_fmt_bytes(old)} -> {_fmt_bytes(new)}")
+    _log(f"store: {STORE_PATH} ({_fmt_bytes(_store_size())})")
+    return 0
+
+
+def cmd_reset_db(argv):
+    """Delete the DuckDB store file (and its WAL) so the next `ingest` rebuilds it
+    from the transcripts. Prompts for confirmation unless -y/--yes is given.
+
+    The store is a derived cache: every table rebuilds from the transcripts under
+    ~/.claude/projects, and file-history snapshot blobs re-ingest from
+    ~/.claude/file-history while it exists, so a reset loses nothing a later
+    `ingest` cannot rebuild (barring file-history already pruned).
+    """
+    assume_yes = "-y" in argv or "--yes" in argv
+    targets = [STORE_PATH, Path(str(STORE_PATH) + ".wal")]
+    existing = [p for p in targets if p.exists()]
+    if not existing:
+        print(f"no store at {STORE_PATH}; nothing to reset")
+        return 0
+    print("reset-db will DELETE:")
+    for p in existing:
+        print(f"   {p}  ({_fmt_bytes(p.stat().st_size)})")
+    print("It rebuilds from transcripts on the next `claude-trail ingest`.")
+    if not assume_yes:
+        try:
+            answer = input("Delete these files? [y/N] ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in ("y", "yes"):
+            print("aborted; nothing deleted")
+            return 1
+    for p in existing:
+        try:
+            p.unlink()
+            print(f"deleted {p}")
+        except OSError as e:
+            print(f"error: could not delete {p}: {e}")
+            return 1
+    print("reset done; run `claude-trail ingest` to rebuild")
     return 0
 
 
@@ -1321,4 +1521,5 @@ def cmd_diff(argv):
 def cli_main(argv):
     cmd = argv[0]
     return {"ingest": cmd_ingest, "search": cmd_search, "stats": cmd_stats,
-            "tokens": cmd_tokens, "cat": cmd_cat, "diff": cmd_diff}[cmd](argv)
+            "tokens": cmd_tokens, "cat": cmd_cat, "diff": cmd_diff,
+            "reset-db": cmd_reset_db}[cmd](argv)

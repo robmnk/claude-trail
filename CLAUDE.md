@@ -125,15 +125,18 @@ Adding a column is a single entry in the list.
 Invoked as `claude-trail <cmd>` (installed) or `python3 claude_trail.py <cmd>` (from a clone):
 
 ```
-ingest [--watch] [--compact] [--file-history-only]
+ingest [--watch] [--compact] [--file-history-only] [-v]
 search <regex> [--tool T] [--session S] [--project P] [--since ISO] [--limit N] [-i]
 stats
 tokens [--session S] [--by session|command|tool|day|model] [--since ISO] [--limit N]
 cat <path> [--session S] [--at ISO]
 diff <path> [--session S] [--all-sources]
+reset-db [-y]
 ```
 
 - `ingest` is the **single writer**: it holds DuckDB's one read-write connection, tails each transcript from its last byte offset, and is idempotent (re-ingest inserts nothing). It sweeps transcripts first, then backfills file-history (see below). Run it from cron or leave one `--watch` process polling every 5s. Every other subcommand (and any ad-hoc reader) opens the file **read-only**; the hook never writes DuckDB (many short-lived hook processes would contend on the write lock). `--compact` runs once after the sweep (ignored under `--watch`) and reclaims DuckDB's interspersed free blocks by rewriting the store into a fresh file (a plain `CHECKPOINT` never coalesces them, so a bulk ingest otherwise leaves the file ~2x its packed size). `--file-history-only` runs just the file-history backfill pass (does not touch `ingest_state`; composes with `--compact`).
+  - **Progress + logging.** On a tty, `ingest` shows a live Rich progress bar (`_IngestProgress`) for the two long phases, sized by transcript-file count and by the number of new file-history snapshots (immutable, already-stored PKs are skipped before the bar is sized). Off a tty (cron/pipe) the bar is disabled and it prints timestamped lines instead (`_log`): `ingest start`, per-sweep `transcripts: changed/total`, `file-history: N new / M resolved`, a `stored: +rows` per-table delta (`_table_counts` before/after), and `sweep done` with per-phase timing; `-v`/`--verbose` adds one line per changed transcript when the bar is off. Under `--watch` an idle sweep logs nothing. `ingest_file_history` stays silent when a progress `tick` is attached (so it cannot corrupt the bar); its own one-line summary prints only for standalone callers (`ingest_all`, tests).
+- `reset-db` deletes the store file and its WAL (confirmation prompt unless `-y`/`--yes`). The store is a derived cache (rebuildable from `~/.claude/projects`, plus file-history blobs re-ingestable while `~/.claude/file-history` exists), so a reset loses nothing a later `ingest` cannot rebuild.
 - `search` is a regex/substring full scan over `events.text`/`stdout`/`stderr` (no FTS index); `-i` is case-insensitive.
 - `tokens` defaults to per-session totals; passing `--session` switches the default `--by` to `command`.
 
