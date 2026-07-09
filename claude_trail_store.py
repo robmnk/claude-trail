@@ -1141,10 +1141,40 @@ def _acquire_ingest_lock():
         # than block. Another live ingest already holding it -> EWOULDBLOCK ->
         # we return None so the caller can skip this run entirely.
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except BlockingIOError:
+        # Only EWOULDBLOCK/EAGAIN (a held LOCK_NB flock) is a clean "skip this
+        # run". Any OTHER OSError (ENOLCK on some NFS, EPERM, ...) is an
+        # environmental failure that must surface, not be swallowed into a
+        # permanent silent skip where ingest never runs again with no signal.
         os.close(fd)
         return None
+    except BaseException:
+        # Propagate everything else, but do not leak the fd we just opened.
+        os.close(fd)
+        raise
+    # Keep the lock fd out of the std range (0/1/2). os.open returns the lowest
+    # free fd, so if a std fd was closed at launch (e.g. cron `0<&-`) the flock
+    # could land on 0/1/2 -- and the child's dup2(devnull, 0/1/2) below would
+    # then silently drop it mid-ingest, defeating the whole singleton guard. A
+    # singleton lock released while the run is still going lets a second ingest
+    # start and contend on DuckDB's one write lock. F_DUPFD copies onto the SAME
+    # open file description, so the flock is preserved on the new fd.
+    if fd < 3:
+        newfd = fcntl.fcntl(fd, fcntl.F_DUPFD, 3)
+        os.close(fd)
+        fd = newfd
     return fd
+
+
+def _detach_child_argv(argv):
+    """The argv the forked child re-enters cmd_ingest with.
+
+    --detach implies a single one-shot run: strip --detach (so the child does
+    not recurse back into _ingest_detach) and --watch (detach never watches).
+    Every other flag (--compact, --file-history-only, -v/--verbose) passes
+    through unchanged.
+    """
+    return [a for a in argv if a not in ("--detach", "--watch")]
 
 
 def _ingest_detach(argv):
@@ -1169,9 +1199,8 @@ def _ingest_detach(argv):
         return 0
 
     # --detach implies a single one-shot run: strip --detach (so the forked child
-    # does not recurse back into here) and --watch (detach never watches). Every
-    # other flag (--compact, --file-history-only, -v/--verbose) passes through.
-    child_argv = [a for a in argv if a not in ("--detach", "--watch")]
+    # does not recurse back into here) and --watch, keeping every other flag.
+    child_argv = _detach_child_argv(argv)
 
     pid = os.fork()
     if pid > 0:
@@ -1195,7 +1224,11 @@ def _ingest_detach(argv):
         devnull = os.open(os.devnull, os.O_RDWR)
         for stdfd in (0, 1, 2):
             os.dup2(devnull, stdfd)
-        os.close(devnull)
+        # Only close devnull when it is above the std range: if a std fd was
+        # closed at launch, os.open may have handed us devnull AS 0/1/2, which we
+        # just dup2'd onto -- closing it would drop a std stream we mean to keep.
+        if devnull > 2:
+            os.close(devnull)
         # Keep `fd` open for the whole run: it is what holds the flock, releasing
         # only when this child exits and all fds on the description finally close.
         cmd_ingest(child_argv)

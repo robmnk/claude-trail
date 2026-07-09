@@ -1798,3 +1798,24 @@ def test_ingest_detach_parent_branch_closes_fd_and_returns(tmp_path, monkeypatch
     fd = store._acquire_ingest_lock()
     assert fd
     os.close(fd)
+
+
+def test_detach_child_argv_strips_detach_and_watch_keeps_rest():
+    """The forked child re-enters cmd_ingest with --detach and --watch removed
+    (so it cannot recurse and never watches) while every other flag survives."""
+    assert store._detach_child_argv(
+        ["ingest", "--detach", "--watch", "--compact"]
+    ) == ["ingest", "--compact"]
+    assert store._detach_child_argv(
+        ["ingest", "--detach", "--file-history-only", "-v"]
+    ) == ["ingest", "--file-history-only", "-v"]
+
+
+def test_ingest_detach_returns_cleanly_without_os_fork(tmp_path, monkeypatch):
+    """On a platform without os.fork (non-POSIX), `ingest --detach` returns 1
+    cleanly rather than crashing the hook, and never reaches lock acquisition
+    (no lock file is created under STORE_PATH's dir)."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    monkeypatch.delattr(os, "fork", raising=False)
+    assert store.cmd_ingest(["ingest", "--detach"]) == 1
+    assert not (tmp_path / "trail-ingest.lock").exists()  # _acquire_ingest_lock never reached
