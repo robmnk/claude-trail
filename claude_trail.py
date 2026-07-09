@@ -73,6 +73,7 @@ AGENT_TOOLUSE_BYTE_CAP = 512 * 1024  # cap per agent transcript when counting to
 # session modal). Placed first in the label so it survives the Agent column's
 # ellipsis: two subagents sharing a description still read as distinct.
 AGENT_ID_LABEL_LEN = 4
+AGENT_STYLE = "cyan"  # tint of the Agent column, reused on the detail pages
 # Directory column width; short_path left-truncates the cwd to this, keeping the
 # distinctive tail (the actual dir) visible. Kept in sync with the Column below.
 DIR_LABEL_WIDTH = 14
@@ -248,14 +249,14 @@ def _render_agent(entry: LogEntry, ctx: RenderCtx):
     glyph = ("─ " if ctx.run_first and ctx.run_last else
              "┌ " if ctx.run_first else
              "└ " if ctx.run_last else "│ ")
-    return Text(glyph + (label if ctx.run_first else ""), style="cyan")
+    return Text(glyph + (label if ctx.run_first else ""), style=AGENT_STYLE)
 
 
 COLUMNS = [
     Column(1, "Time", "cyan", {"width": 8, "no_wrap": True}, _render_time),
     Column(2, "Session", "magenta",
            {"width": 13, "no_wrap": True, "overflow": "ellipsis"}, _render_session),
-    Column(6, "Agent", "cyan",
+    Column(6, "Agent", AGENT_STYLE,
            {"width": 24, "no_wrap": True, "overflow": "ellipsis"}, _render_agent),
     Column(3, "Directory", "green", {"width": DIR_LABEL_WIDTH, "no_wrap": True},
            _render_directory),
@@ -1095,6 +1096,7 @@ def build_detail_panel(
     term_height: int,
     name_map: dict[str, str] | None = None,
     color_map: dict[str, str] | None = None,
+    agent_map: dict[str, dict] | None = None,
 ) -> Panel:
     """Full-screen view of a single command: metadata header plus the complete,
     untruncated command text (newlines preserved)."""
@@ -1106,6 +1108,10 @@ def build_detail_panel(
     meta.add_column(ratio=1)
     meta.add_row("Time", format_time(entry.get("timestamp", "")))
     meta.add_row("Session", _render_session(entry, ctx))
+    # Agent row only for subagent rows; agent_label is None for the main agent.
+    label = agent_label(entry, agent_map or {})
+    if label is not None:
+        meta.add_row("Agent", Text(label, style=AGENT_STYLE))
     meta.add_row("Directory", entry.get("cwd", "") or "(none)")
     files = extract_files(cmd)
     if files:
@@ -1983,7 +1989,9 @@ def main():
                 name_map, color_map, console.height,
             )
         if state.detail_entry is not None:
-            return build_detail_panel(state.detail_entry, console.height, name_map, color_map)
+            return build_detail_panel(
+                state.detail_entry, console.height, name_map, color_map, agent_map,
+            )
         if state.db_info is not None:
             return build_db_panel(state.db_info, console.height)
         return build_panel(
