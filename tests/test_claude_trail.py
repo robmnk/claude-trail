@@ -1285,6 +1285,67 @@ class TestFilterSessionLog:
         assert base.startswith("claude-trail-session-")
 
 
+class TestFormatSessionTranscript:
+    """format_session_transcript pretty-prints a session transcript to a temp
+    `.json` file (one indented block per line, blank-separated) or None when the
+    transcript can't be resolved."""
+
+    def _write_transcript(self, projects_root, sid, lines):
+        project = projects_root / "-home-naka-Projects-x"
+        project.mkdir(parents=True, exist_ok=True)
+        path = project / f"{sid}.jsonl"
+        path.write_text("".join(l + "\n" for l in lines), encoding="utf-8")
+        feed._transcript_path_cache.pop(sid, None)  # avoid a stale cached path
+        return path
+
+    def test_pretty_output_round_trips_to_source_objects(self, tmp_path):
+        import json
+        sid = "trans-rt"
+        source = [
+            {"type": "user", "content": "hello", "n": 1},
+            {"type": "assistant", "content": ["a", "b"], "nested": {"x": 2}},
+            {"type": "system", "unicode": "café"},
+        ]
+        self._write_transcript(tmp_path, sid, [json.dumps(o) for o in source])
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed.tempfile, "gettempdir", return_value=str(tmp_path)):
+            out = feed.format_session_transcript(sid)
+        content = Path(out).read_text(encoding="utf-8")
+        blocks = content.split("\n\n")
+        assert [json.loads(b) for b in blocks] == source
+
+    def test_output_is_indented_and_json_extension(self, tmp_path):
+        import json
+        sid = "trans-fmt"
+        self._write_transcript(tmp_path, sid, [json.dumps({"a": 1})])
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed.tempfile, "gettempdir", return_value=str(tmp_path)):
+            out = feed.format_session_transcript(sid)
+        assert out.endswith(".json")
+        assert os.path.basename(out).startswith("claude-trail-transcript-")
+        assert '  "a": 1' in Path(out).read_text(encoding="utf-8")  # indent=2
+
+    def test_malformed_line_survives_verbatim(self, tmp_path):
+        import json
+        sid = "trans-bad"
+        self._write_transcript(tmp_path, sid, [
+            json.dumps({"ok": True}),
+            "this is not json {{{",
+            json.dumps({"ok": False}),
+        ])
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed.tempfile, "gettempdir", return_value=str(tmp_path)):
+            out = feed.format_session_transcript(sid)
+        content = Path(out).read_text(encoding="utf-8")
+        assert "this is not json {{{" in content
+
+    def test_missing_transcript_returns_none(self, tmp_path):
+        feed._transcript_path_cache.pop("never-existed", None)
+        with patch.object(feed, "PROJECTS_DIR", tmp_path), \
+             patch.object(feed.tempfile, "gettempdir", return_value=str(tmp_path)):
+            assert feed.format_session_transcript("never-existed") is None
+
+
 class TestOpenFileFolder:
     def test_opens_parent_of_absolute_file(self, tmp_path):
         f = tmp_path / "sub" / "file.txt"
@@ -1630,6 +1691,19 @@ class TestApplyKey:
         result = feed.apply_key(state, "o", 10)
         assert result is feed.Action.OPEN_SESSION
         assert state.cursor == 1
+
+    def test_t_returns_open_transcript_without_moving_cursor(self):
+        state = feed.AppState(entries=self._entries(3), cursor=1)
+        result = feed.apply_key(state, "t", 10)
+        assert result is feed.Action.OPEN_TRANSCRIPT
+        assert state.cursor == 1
+
+    def test_t_is_inert_while_modal_open(self):
+        entries = self._entries(3)
+        state = feed.AppState(entries=entries, detail_entry=entries[0])
+        result = feed.apply_key(state, "t", 10)
+        assert result is feed.Action.NONE
+        assert state.detail_entry is entries[0]  # modal stays open
 
     def test_f_returns_open_files_without_moving_cursor(self):
         state = feed.AppState(entries=self._entries(3), cursor=1)

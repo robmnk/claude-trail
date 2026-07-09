@@ -1038,6 +1038,38 @@ def filter_session_log(session_id: str) -> str | None:
     return out_path
 
 
+def format_session_transcript(session_id: str) -> str | None:
+    """Pretty-print a session's transcript to a temp `.json` file and return that
+    path (or None if the transcript can't be resolved).
+
+    Reads `~/.claude/projects/*/<session_id>.jsonl` (via `_find_transcript`) line
+    by line and re-emits each JSON object indented; a line that isn't valid JSON
+    is passed through unchanged. Blocks are joined by a blank line rather than
+    assembled into one array (readable for large transcripts, which can run to
+    many MB), so the output is `.json`, not JSONL.
+    """
+    transcript = _find_transcript(session_id)
+    if transcript is None:
+        return None
+    safe_id = re.sub(r"[^a-zA-Z0-9-]", "", session_id[:8]) or "unknown"
+    out_path = os.path.join(tempfile.gettempdir(), f"claude-trail-transcript-{safe_id}.json")
+    blocks: list[str] = []
+    with open(transcript, "r", encoding="utf-8") as f_in:
+        for line in f_in:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                blocks.append(line)  # keep malformed lines verbatim
+                continue
+            blocks.append(json.dumps(obj, indent=2, ensure_ascii=False))
+    with open(out_path, "w", encoding="utf-8") as f_out:
+        f_out.write("\n\n".join(blocks))
+    return out_path
+
+
 def open_file_folder(entry: LogEntry) -> None:
     """Open the folder containing files referenced in the command."""
     cmd = entry.get("command", "")
@@ -1773,6 +1805,7 @@ class Action(enum.Enum):
 
     QUIT = enum.auto()
     OPEN_SESSION = enum.auto()
+    OPEN_TRANSCRIPT = enum.auto()   # open the selected session's pretty transcript
     OPEN_FILES = enum.auto()
     RUN_SEARCH = enum.auto()        # run rg/grep for the open search modal
     OPEN_MATCH = enum.auto()        # open the selected search hit at its line
@@ -2047,6 +2080,8 @@ def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
             state.search = SearchState(sid=sid, roots=roots, root=default_root)
     elif ch == "o":
         return Action.OPEN_SESSION
+    elif ch == "t":
+        return Action.OPEN_TRANSCRIPT
     elif ch == "f":
         return Action.OPEN_FILES
     elif ch == "d":
@@ -2213,10 +2248,10 @@ def main():
             refresh_per_second=4,
         ) as live:
 
-            def open_session_log(entry: LogEntry) -> None:
-                out_path = filter_session_log(entry.get("session_id", ""))
-                if not out_path:
-                    return
+            def open_path_in_editor(path: str) -> None:
+                # Open `path` in $VISUAL/$EDITOR, else the GUI launcher. Shared by
+                # `o` (filtered command log) and `t` (session transcript). No
+                # `+<line>` arg here; only open_match jumps to a line.
                 editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
                 if editor and interactive:
                     # Terminal editor (nvim, vim, ...): suspend the live display
@@ -2225,7 +2260,7 @@ def main():
                     live.stop()
                     termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
                     try:
-                        subprocess.call(shlex.split(editor) + [out_path])
+                        subprocess.call(shlex.split(editor) + [path])
                     except (OSError, ValueError):
                         pass
                     tty.setcbreak(fd)
@@ -2234,13 +2269,18 @@ def main():
                     # No editor configured: hand off to the GUI file launcher.
                     try:
                         subprocess.Popen(
-                            [_platform_opener(), out_path],
+                            [_platform_opener(), path],
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL,
                             start_new_session=True,
                         )
                     except OSError:
                         pass
+
+            def open_session_log(entry: LogEntry) -> None:
+                out_path = filter_session_log(entry.get("session_id", ""))
+                if out_path:
+                    open_path_in_editor(out_path)
 
             def open_match(path: str, line: int) -> None:
                 # Open a search hit at its line, reusing open_session_log's
@@ -2298,6 +2338,13 @@ def main():
                                 entry = state.selected_entry()
                                 if entry:
                                     open_session_log(entry)
+                            elif action is Action.OPEN_TRANSCRIPT:
+                                entry = state.selected_entry()
+                                if entry:
+                                    path = format_session_transcript(
+                                        entry.get("session_id", ""))
+                                    if path:
+                                        open_path_in_editor(path)
                             elif action is Action.OPEN_FILES:
                                 entry = state.selected_entry()
                                 if entry:
