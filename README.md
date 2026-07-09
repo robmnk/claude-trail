@@ -83,6 +83,27 @@ python3 claude_trail.py   # if running from a clone
 | `c` | Clear display |
 | `q` | Quit |
 
+## Configuration
+
+The fixed-width columns can be resized without editing code. claude-trail reads a
+`.env` file (a tiny built-in parser, no extra dependency) from `$CLAUDE_CONFIG_DIR/.env`
+(default `~/.claude/.env`), or from the path in `$CLAUDE_TRAIL_ENV` if set. Copy
+[`.env.example`](.env.example) and uncomment the keys you want to change:
+
+| Key | Column | Default |
+|-----|--------|---------|
+| `CLAUDE_TRAIL_COL_TIME_WIDTH` | Time | 8 |
+| `CLAUDE_TRAIL_COL_SESSION_WIDTH` | Session | 13 |
+| `CLAUDE_TRAIL_COL_AGENT_WIDTH` | Agent | 24 |
+| `CLAUDE_TRAIL_COL_DIRECTORY_WIDTH` | Directory | 14 |
+| `CLAUDE_TRAIL_COL_FILES_WIDTH` | Files | 20 |
+
+Each value is a positive integer of terminal columns; a missing, non-integer, or
+`<= 0` value falls back to the default. Precedence is real environment variable >
+`.env` value > built-in default (an env var of the same name overrides the file).
+A missing `.env` file is fine (everything uses defaults). The Command column has
+no key: it takes the remaining width. Only widths are configurable, not colors.
+
 ## Dangerous Command Detection
 
 Commands matching these patterns are flagged:

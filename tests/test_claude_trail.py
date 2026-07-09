@@ -826,6 +826,145 @@ class TestConfigDir:
             self._reload_with_true_env(monkeypatch)
 
 
+class TestLoadDotenv:
+    """_load_dotenv parses CONFIG_DIR/.env (or $CLAUDE_TRAIL_ENV) into a dict."""
+
+    def test_ignores_comments_and_blank_lines(self, tmp_path):
+        env = tmp_path / ".env"
+        env.write_text(
+            "# a comment\n"
+            "\n"
+            "   \n"
+            "CLAUDE_TRAIL_COL_TIME_WIDTH=10\n"
+            "CLAUDE_TRAIL_COL_FILES_WIDTH = 30 \n"
+            "no_equals_line\n",
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {"CLAUDE_TRAIL_ENV": str(env)}):
+            out = feed._load_dotenv()
+        assert out == {
+            "CLAUDE_TRAIL_COL_TIME_WIDTH": "10",
+            "CLAUDE_TRAIL_COL_FILES_WIDTH": "30",
+        }
+
+    def test_strips_surrounding_quotes(self, tmp_path):
+        env = tmp_path / ".env"
+        env.write_text(
+            'CLAUDE_TRAIL_COL_TIME_WIDTH="12"\n'
+            "CLAUDE_TRAIL_COL_AGENT_WIDTH='9'\n",
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {"CLAUDE_TRAIL_ENV": str(env)}):
+            out = feed._load_dotenv()
+        assert out["CLAUDE_TRAIL_COL_TIME_WIDTH"] == "12"
+        assert out["CLAUDE_TRAIL_COL_AGENT_WIDTH"] == "9"
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        missing = tmp_path / "absent.env"
+        with patch.dict(os.environ, {"CLAUDE_TRAIL_ENV": str(missing)}):
+            assert feed._load_dotenv() == {}
+
+
+class TestEnvInt:
+    """_env_int layers os.environ over .env over the built-in default; a
+    non-integer or <= 0 value falls back to the default."""
+
+    KEY = "CLAUDE_TRAIL_COL_TIME_WIDTH"
+
+    def test_default_when_unset(self):
+        with patch.object(feed, "_DOTENV", {}), \
+             patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(self.KEY, None)
+            assert feed._env_int(self.KEY, 8) == 8
+
+    def test_dotenv_over_default(self):
+        with patch.object(feed, "_DOTENV", {self.KEY: "11"}), \
+             patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(self.KEY, None)
+            assert feed._env_int(self.KEY, 8) == 11
+
+    def test_environ_over_dotenv(self):
+        # A real environment variable wins over the .env value.
+        with patch.object(feed, "_DOTENV", {self.KEY: "11"}), \
+             patch.dict(os.environ, {self.KEY: "20"}):
+            assert feed._env_int(self.KEY, 8) == 20
+
+    def test_junk_value_falls_back(self):
+        with patch.object(feed, "_DOTENV", {}), \
+             patch.dict(os.environ, {self.KEY: "abc"}):
+            assert feed._env_int(self.KEY, 8) == 8
+
+    def test_zero_and_negative_fall_back(self):
+        for bad in ("0", "-5"):
+            with patch.object(feed, "_DOTENV", {}), \
+                 patch.dict(os.environ, {self.KEY: bad}):
+                assert feed._env_int(self.KEY, 8) == 8
+
+
+class TestColumnWidthWiring:
+    """The five .env width keys must actually reach COLUMNS / DIR_LABEL_WIDTH.
+
+    TestLoadDotenv / TestEnvInt cover the helpers in isolation; this reloads the
+    module end-to-end (the TestConfigDir reload pattern) so a typo in any key
+    name at the COLUMNS call sites (or in DIR_LABEL_WIDTH) is caught: such a typo
+    would silently no-op that column while every helper test still passed.
+    Columns are matched by their stable name, not a positional index, so the
+    assertions survive column reordering.
+    """
+
+    # Non-default and mutually distinct, so a swapped key name also fails.
+    _OVERRIDES = {
+        "CLAUDE_TRAIL_COL_TIME_WIDTH": "10",
+        "CLAUDE_TRAIL_COL_SESSION_WIDTH": "17",
+        "CLAUDE_TRAIL_COL_AGENT_WIDTH": "30",
+        "CLAUDE_TRAIL_COL_DIRECTORY_WIDTH": "19",
+        "CLAUDE_TRAIL_COL_FILES_WIDTH": "25",
+    }
+
+    def _cols_by_name(self):
+        return {c.name: c for c in feed.COLUMNS}
+
+    def test_env_widths_reach_columns_and_dir_label(self, tmp_path):
+        import importlib
+        env = tmp_path / ".env"
+        env.write_text(
+            "".join(f"{k}={v}\n" for k, v in self._OVERRIDES.items()),
+            encoding="utf-8",
+        )
+        try:
+            with patch.dict(os.environ, {"CLAUDE_TRAIL_ENV": str(env)}):
+                importlib.reload(feed)
+                cols = self._cols_by_name()
+                assert cols["Time"].kwargs["width"] == 10
+                assert cols["Session"].kwargs["width"] == 17
+                assert cols["Agent"].kwargs["width"] == 30
+                assert cols["Files"].kwargs["width"] == 25
+                assert feed.DIR_LABEL_WIDTH == 19
+                # Directory shares DIR_LABEL_WIDTH (its own key drives both).
+                assert cols["Directory"].kwargs["width"] == 19
+        finally:
+            # patch.dict restored CLAUDE_TRAIL_ENV to the conftest-isolated
+            # (nonexistent) path; reload so later tests see default widths again.
+            importlib.reload(feed)
+
+    def test_clean_reload_reproduces_defaults(self, tmp_path):
+        # A clean environment (no .env, no CLAUDE_TRAIL_COL_* env vars) must
+        # reproduce the pre-phase literal widths exactly.
+        import importlib
+        absent = tmp_path / "absent.env"
+        with patch.dict(os.environ, {"CLAUDE_TRAIL_ENV": str(absent)}):
+            for k in [k for k in os.environ if k.startswith("CLAUDE_TRAIL_COL_")]:
+                os.environ.pop(k)
+            importlib.reload(feed)
+            cols = self._cols_by_name()
+            assert cols["Time"].kwargs["width"] == 8
+            assert cols["Session"].kwargs["width"] == 13
+            assert cols["Agent"].kwargs["width"] == 24
+            assert feed.DIR_LABEL_WIDTH == 14
+            assert cols["Directory"].kwargs["width"] == 14
+            assert cols["Files"].kwargs["width"] == 20
+
+
 class TestHookMain:
     def _run_hook(self, tmp_path, payload):
         import io
