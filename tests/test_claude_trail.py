@@ -1136,6 +1136,33 @@ class TestRendering:
         assert "* " in out
         assert "sudo rm -rf /" in out
 
+    def test_detail_panel_shows_agent_row_for_subagent(self):
+        amap = {"af6978": {"type": "general-purpose", "description": "Implement Phase 4"}}
+        entry = self._entry(agent_id="af6978")
+        out = self._text(feed.build_detail_panel(entry, 40, agent_map=amap))
+        assert "Agent" in out
+        assert "af69 Implement Phase 4" in out  # the full agent_label
+
+    def test_detail_panel_agent_row_uses_agent_style(self):
+        from rich.text import Text
+        amap = {"af6978": {"type": "general-purpose", "description": "Implement Phase 4"}}
+        label = feed.agent_label({"agent_id": "af6978"}, amap)
+        console = Console(width=120, record=True, force_terminal=True,
+                          color_system="truecolor")
+        console.print(feed.build_detail_panel(self._entry(agent_id="af6978"), 40,
+                                              agent_map=amap))
+        styled = console.export_text(styles=True)
+        # the Agent label is tinted with AGENT_STYLE (the shared Agent-column color)
+        ref = Console(force_terminal=True, color_system="truecolor")
+        with ref.capture() as cap:
+            ref.print(Text(label, style=feed.AGENT_STYLE), end="")
+        assert cap.get() in styled
+
+    def test_detail_panel_main_agent_has_no_agent_row(self):
+        # a main-agent entry (no agent_id) omits the Agent row entirely
+        out = self._text(feed.build_detail_panel(self._entry(), 40, agent_map={}))
+        assert "Agent" not in out
+
 
 class TestCountActiveSessions:
     """count_active_sessions: distinct session_ids seen within the window."""
