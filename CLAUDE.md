@@ -26,6 +26,7 @@ Claude Code session
 - **Log file:** `~/.claude/command-log.jsonl` (`CONFIG_DIR/command-log.jsonl`)
 - **Hook config:** `~/.claude/settings.json` → `hooks.PostToolUse`
 - **Session metadata:** `~/.claude/sessions/<pid>.json` (read by the TUI to resolve session names)
+- **Column widths (`.env`):** `CONFIG_DIR/.env` (default `~/.claude/.env`, overridable via `$CLAUDE_TRAIL_ENV`) can set the fixed-width column widths without editing code. A tiny built-in parser (`_load_dotenv`, no python-dotenv dependency) reads `KEY=VALUE` lines once at import into `_DOTENV`; `_env_int(key, default)` resolves each width with precedence `os.environ` > `.env` > built-in default (a real process env var of the same name wins over the file), falling back to the default on a missing/non-integer/`<= 0` value. A missing file is fine (all defaults). Keys (all int, positive) with defaults: `CLAUDE_TRAIL_COL_TIME_WIDTH` (8), `CLAUDE_TRAIL_COL_SESSION_WIDTH` (13), `CLAUDE_TRAIL_COL_AGENT_WIDTH` (24), `CLAUDE_TRAIL_COL_DIRECTORY_WIDTH` (14, this is `DIR_LABEL_WIDTH`), `CLAUDE_TRAIL_COL_FILES_WIDTH` (20). The Command column has no key (it takes the remaining width via `ratio=1`). Colors are not configurable. See `.env.example`.
 
 ## Hook Setup
 
@@ -79,6 +80,13 @@ records is the one source of truth. A `Column` has `key` (the stable digit
 `kwargs` (passed to `Table.add_column`), and `render`. `render(entry, ctx)`
 returns that column's cell for one log entry as a `str` or `rich.text.Text`.
 Adding a column is a single entry in the list.
+
+Each fixed-width column's width is overridable from `CONFIG_DIR/.env` (see Key
+Paths): the `COLUMNS` widths (and `DIR_LABEL_WIDTH`, which the Directory column
+and `short_path`'s default share) are resolved once at import via
+`_env_int("CLAUDE_TRAIL_COL_*_WIDTH", <default>)`, so the defaults reproduce the
+current widths exactly and `COLUMNS` stays fixed for the process lifetime (never
+rebuilt per frame). Only widths are configurable, not colors.
 
 `ctx` is a frozen `RenderCtx` carrying the per-render state cells need
 (`name_map`, `color_map`, `agent_map`, plus the per-row `agent_label`/`run_first`/`run_last` the Agent column reads); render callables call the module-level helpers

@@ -56,6 +56,41 @@ CONFIG_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"
 LOG_PATH = CONFIG_DIR / "command-log.jsonl"
 SESSIONS_DIR = CONFIG_DIR / "sessions"
 PROJECTS_DIR = CONFIG_DIR / "projects"
+
+
+def _load_dotenv() -> dict[str, str]:
+    """Parse KEY=VALUE lines from CONFIG_DIR/.env ($CLAUDE_TRAIL_ENV override).
+    Blank lines and `#` comments ignored; surrounding quotes stripped. Missing
+    file -> empty. Real os.environ is not mutated; callers layer it on top."""
+    path = Path(os.environ.get("CLAUDE_TRAIL_ENV", CONFIG_DIR / ".env"))
+    out: dict[str, str] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip().strip('"').strip("'")
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+_DOTENV = _load_dotenv()
+
+
+def _env_int(key: str, default: int) -> int:
+    """os.environ wins, then .env, then default; non-int/<=0 falls back."""
+    raw = os.environ.get(key, _DOTENV.get(key))
+    if raw is None:
+        return default
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return val if val > 0 else default
+
+
 MAX_ENTRIES = 1000
 POLL_INTERVAL = 0.3
 CHROME_ROWS = 10  # title, status, padding
@@ -83,8 +118,9 @@ AGENT_TOOLUSE_BYTE_CAP = 512 * 1024  # cap per agent transcript when counting to
 AGENT_ID_LABEL_LEN = 4
 AGENT_STYLE = "cyan"  # tint of the Agent column, reused on the detail pages
 # Directory column width; short_path left-truncates the cwd to this, keeping the
-# distinctive tail (the actual dir) visible. Kept in sync with the Column below.
-DIR_LABEL_WIDTH = 14
+# distinctive tail (the actual dir) visible. Feeds both the Directory column and
+# short_path's default, so overriding it here keeps that column consistent.
+DIR_LABEL_WIDTH = _env_int("CLAUDE_TRAIL_COL_DIRECTORY_WIDTH", 14)
 ACTIVE_WINDOW_SECONDS = 300  # a session counts as active if seen within this window
 SEARCH_RESULT_LIMIT = 500  # max hits kept per search; the rest are dropped (capped)
 SEARCH_TIMEOUT = 5.0  # seconds before rg/grep is killed so a huge tree can't hang the UI
@@ -261,15 +297,20 @@ def _render_agent(entry: LogEntry, ctx: RenderCtx):
 
 
 COLUMNS = [
-    Column(1, "Time", "cyan", {"width": 8, "no_wrap": True}, _render_time),
+    Column(1, "Time", "cyan",
+           {"width": _env_int("CLAUDE_TRAIL_COL_TIME_WIDTH", 8), "no_wrap": True},
+           _render_time),
     Column(2, "Session", "magenta",
-           {"width": 13, "no_wrap": True, "overflow": "ellipsis"}, _render_session),
+           {"width": _env_int("CLAUDE_TRAIL_COL_SESSION_WIDTH", 13),
+            "no_wrap": True, "overflow": "ellipsis"}, _render_session),
     Column(6, "Agent", AGENT_STYLE,
-           {"width": 24, "no_wrap": True, "overflow": "ellipsis"}, _render_agent),
+           {"width": _env_int("CLAUDE_TRAIL_COL_AGENT_WIDTH", 24),
+            "no_wrap": True, "overflow": "ellipsis"}, _render_agent),
     Column(3, "Directory", "green", {"width": DIR_LABEL_WIDTH, "no_wrap": True},
            _render_directory),
     Column(4, "Files", "yellow",
-           {"width": 20, "no_wrap": True, "overflow": "ellipsis"}, _render_files),
+           {"width": _env_int("CLAUDE_TRAIL_COL_FILES_WIDTH", 20),
+            "no_wrap": True, "overflow": "ellipsis"}, _render_files),
     Column(5, "Command", "white",
            {"ratio": 1, "no_wrap": True, "overflow": "ellipsis"}, _render_command),
 ]

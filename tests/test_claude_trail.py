@@ -826,6 +826,81 @@ class TestConfigDir:
             self._reload_with_true_env(monkeypatch)
 
 
+class TestLoadDotenv:
+    """_load_dotenv parses CONFIG_DIR/.env (or $CLAUDE_TRAIL_ENV) into a dict."""
+
+    def test_ignores_comments_and_blank_lines(self, tmp_path):
+        env = tmp_path / ".env"
+        env.write_text(
+            "# a comment\n"
+            "\n"
+            "   \n"
+            "CLAUDE_TRAIL_COL_TIME_WIDTH=10\n"
+            "CLAUDE_TRAIL_COL_FILES_WIDTH = 30 \n"
+            "no_equals_line\n",
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {"CLAUDE_TRAIL_ENV": str(env)}):
+            out = feed._load_dotenv()
+        assert out == {
+            "CLAUDE_TRAIL_COL_TIME_WIDTH": "10",
+            "CLAUDE_TRAIL_COL_FILES_WIDTH": "30",
+        }
+
+    def test_strips_surrounding_quotes(self, tmp_path):
+        env = tmp_path / ".env"
+        env.write_text(
+            'CLAUDE_TRAIL_COL_TIME_WIDTH="12"\n'
+            "CLAUDE_TRAIL_COL_AGENT_WIDTH='9'\n",
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {"CLAUDE_TRAIL_ENV": str(env)}):
+            out = feed._load_dotenv()
+        assert out["CLAUDE_TRAIL_COL_TIME_WIDTH"] == "12"
+        assert out["CLAUDE_TRAIL_COL_AGENT_WIDTH"] == "9"
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        missing = tmp_path / "absent.env"
+        with patch.dict(os.environ, {"CLAUDE_TRAIL_ENV": str(missing)}):
+            assert feed._load_dotenv() == {}
+
+
+class TestEnvInt:
+    """_env_int layers os.environ over .env over the built-in default; a
+    non-integer or <= 0 value falls back to the default."""
+
+    KEY = "CLAUDE_TRAIL_COL_TIME_WIDTH"
+
+    def test_default_when_unset(self):
+        with patch.object(feed, "_DOTENV", {}), \
+             patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(self.KEY, None)
+            assert feed._env_int(self.KEY, 8) == 8
+
+    def test_dotenv_over_default(self):
+        with patch.object(feed, "_DOTENV", {self.KEY: "11"}), \
+             patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(self.KEY, None)
+            assert feed._env_int(self.KEY, 8) == 11
+
+    def test_environ_over_dotenv(self):
+        # A real environment variable wins over the .env value.
+        with patch.object(feed, "_DOTENV", {self.KEY: "11"}), \
+             patch.dict(os.environ, {self.KEY: "20"}):
+            assert feed._env_int(self.KEY, 8) == 20
+
+    def test_junk_value_falls_back(self):
+        with patch.object(feed, "_DOTENV", {}), \
+             patch.dict(os.environ, {self.KEY: "abc"}):
+            assert feed._env_int(self.KEY, 8) == 8
+
+    def test_zero_and_negative_fall_back(self):
+        for bad in ("0", "-5"):
+            with patch.object(feed, "_DOTENV", {}), \
+                 patch.dict(os.environ, {self.KEY: bad}):
+                assert feed._env_int(self.KEY, 8) == 8
+
+
 class TestHookMain:
     def _run_hook(self, tmp_path, payload):
         import io
