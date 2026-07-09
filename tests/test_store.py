@@ -509,6 +509,94 @@ def test_ingest_incremental_append_and_partial_line(tmp_path, monkeypatch):
         con.close()
 
 
+def test_ingest_drops_nonsnapshot_raw_payload_keeps_index(tmp_path, monkeypatch):
+    """Going-forward leanness: ingest keeps one raw_events index row per line
+    (so tailing/idempotency are unchanged) but drops the bulky verbatim `raw`
+    payload for non-snapshot lines, while every derived table is fully built."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    sid = "sess-lean-0001"
+    events = _main_transcript_events(sid)
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", events)
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        c = lambda sql: con.execute(sql).fetchone()[0]
+        assert c("SELECT count(*) FROM raw_events") == len(events)           # index kept
+        assert c("SELECT count(*) FROM raw_events WHERE raw IS NOT NULL") == 0  # payload dropped
+        assert c("SELECT count(*) FROM events") == 5                          # projection intact
+        assert c("SELECT count(*) FROM api_requests") == 1
+    finally:
+        con.close()
+
+
+def test_ingest_keeps_snapshot_raw(tmp_path, monkeypatch):
+    """The file-history-snapshot payload IS retained (the backfill reads it back),
+    even as the neighbouring user line's payload is dropped."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    sid = "sess-snap-0001"
+    events = [
+        _user_prompt("u1", sid, "hi", "2026-07-01T10:00:00.000Z"),
+        _fh_snapshot_event("m1", {"/tmp/a.txt": {
+            "backupFileName": "h1@v1", "version": 1,
+            "backupTime": "2026-07-01T10:00:00.000Z"}}),
+    ]
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", events)
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        c = lambda sql: con.execute(sql).fetchone()[0]
+        assert c("SELECT raw FROM raw_events WHERE type='file-history-snapshot'") is not None
+        assert c("SELECT count(*) FROM raw_events WHERE type<>'file-history-snapshot' AND raw IS NOT NULL") == 0
+        assert c("SELECT count(*) FROM raw_events") == 2                      # both index rows kept
+    finally:
+        con.close()
+
+
+def test_prune_raw_events_clears_payload_keeps_snapshots_and_malformed(tmp_path, monkeypatch):
+    """prune_raw_events nulls only the non-snapshot payloads: file-history-snapshot
+    (read back) and malformed (type NULL) rows keep theirs, and it is idempotent."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    con = store.connect()
+    try:
+        con.executemany(
+            "INSERT INTO raw_events(uuid,session_id,ts,type,transcript_path,raw) VALUES (?,?,?,?,?,?)",
+            [("u1", "s", None, "user", "/p", '{"big":"payload"}'),
+             ("snap", "s", None, "file-history-snapshot", "/p", '{"snapshot":1}'),
+             ("bad", "s", None, None, "/p", "not-json")])          # malformed: type NULL
+        cleared, nbytes = store.prune_raw_events(con)
+        assert cleared == 1 and nbytes > 0
+        val = lambda u: con.execute("SELECT raw FROM raw_events WHERE uuid=?", [u]).fetchone()[0]
+        assert val("u1") is None            # non-snapshot payload cleared
+        assert val("snap") is not None      # snapshot kept
+        assert val("bad") is not None       # malformed kept
+        assert con.execute("SELECT count(*) FROM raw_events").fetchone()[0] == 3  # index intact
+        assert store.prune_raw_events(con) == (0, 0)  # idempotent
+    finally:
+        con.close()
+
+
+def test_cmd_prune_raw_clears_and_compacts(tmp_path, monkeypatch, capsys):
+    """End-to-end: prune-raw -y clears a lingering old-style payload row, compacts,
+    and reports; the row's index survives with a NULL payload."""
+    sid = _build_cli_store(tmp_path, monkeypatch)
+    con = store.connect()  # inject a pre-change row that still carries a payload
+    con.execute("INSERT INTO raw_events(uuid,session_id,ts,type,transcript_path,raw) "
+                "VALUES ('manual-1',?,NULL,'user','/p','{\"big\":\"x\"}')", [sid])
+    con.close()
+    assert store.cmd_prune_raw(["prune-raw", "-y"]) == 0
+    out = capsys.readouterr().out
+    assert "cleared 1" in out and "compacted" in out
+    con = store.connect(read_only=True)
+    try:
+        assert con.execute("SELECT raw FROM raw_events WHERE uuid='manual-1'").fetchone()[0] is None
+    finally:
+        con.close()
+
+
 def test_decode_project_maps_encoded_dir_name(tmp_path, monkeypatch):
     """A leading '-' cwd-encoded dir name decodes to a slash path label."""
     monkeypatch.setattr(store, "PROJECTS_DIR", tmp_path)
