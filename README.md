@@ -138,7 +138,7 @@ Alongside the live TUI, `claude-trail` ships a DuckDB-backed audit store that in
 A single `ingest` process is the only writer; every other subcommand opens the file read-only:
 
 ```bash
-claude-trail ingest [--watch] [--compact] [--file-history-only] [-v]  # tail transcripts + file-history into the store (single writer)
+claude-trail ingest [--watch] [--detach] [--compact] [--file-history-only] [-v]  # tail transcripts + file-history into the store (single writer)
 claude-trail search <regex> [--tool T --session S --project P --since ISO --limit N -i]
 claude-trail stats                               # database properties + session / event / token / reconstruction-coverage counts
 claude-trail tokens [--session S] [--by session|command|tool|day|model] [--since ISO] [--limit N]
@@ -147,7 +147,7 @@ claude-trail diff <path> [--session S] [--all-sources]  # list a path's edits ol
 claude-trail reset-db [-y]                        # delete the store file (rebuilds from transcripts on next ingest)
 ```
 
-Run `ingest` from cron or leave one `--watch` process polling; it is idempotent (byte-offset tailing), and `--compact` reclaims free blocks with a full rewrite. On a terminal `ingest` shows a live Rich progress bar for the transcript and file-history phases; off a tty (cron/pipe) it prints timestamped progress instead (start, per-phase timing, stored-row deltas, final store size), and `-v` adds one line per changed transcript. `reset-db` deletes the store file (and its WAL) after a confirmation prompt (`-y` skips it); the store is a derived cache, so the next `ingest` rebuilds it. `tokens` reports exact per-session and per-command spend; `cat` / `diff` reconstruct edited files from content-addressed blobs plus `structuredPatch` diffs.
+Run `ingest` from cron or leave one `--watch` process polling; it is idempotent (byte-offset tailing), and `--compact` reclaims free blocks with a full rewrite. The lowest-friction option is a Claude Code `Stop` hook running `claude-trail ingest --detach`: it forks a one-shot ingest and returns at once, guarded by a `flock` singleton so concurrent turns/sessions never pile up, keeping the store fresh with no daemon or cron (pair it with a weekly-gated `SessionEnd` `ingest --detach --compact` for compaction). On a terminal `ingest` shows a live Rich progress bar for the transcript and file-history phases; off a tty (cron/pipe) it prints timestamped progress instead (start, per-phase timing, stored-row deltas, final store size), and `-v` adds one line per changed transcript. `reset-db` deletes the store file (and its WAL) after a confirmation prompt (`-y` skips it); the store is a derived cache, so the next `ingest` rebuilds it. `tokens` reports exact per-session and per-command spend; `cat` / `diff` reconstruct edited files from content-addressed blobs plus `structuredPatch` diffs.
 
 **Two content sources.** Transcripts alone carry full edit content for only ~39% of edits (the ones whose `originalFile`/`content` is present); the rest are patch-only. The `ingest` sweep also backfills `~/.claude/file-history/<session_id>/<pathhash>@vN` snapshots as a second content source, which lifts full-content `cat` coverage to ~96% of patch-only paths. Details:
 
