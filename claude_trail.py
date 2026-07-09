@@ -513,6 +513,7 @@ class SubagentInfo:
     status: str  # "running" | "done" | "stopped"
     command_count: int
     command_count_capped: bool = False
+    spawn_ts: float = 0.0  # meta-file mtime = spawn time; orders the modal list
 
 
 @dataclass(frozen=True)
@@ -674,11 +675,12 @@ def _count_tool_uses(path: Path) -> tuple[int, bool]:
     return data.count(b'"type":"tool_use"'), size > AGENT_TOOLUSE_BYTE_CAP
 
 
-_SUBAGENT_STATUS_ORDER = {"running": 0, "done": 1, "stopped": 2}
-
-
 def _load_subagents(sid: str, transcript: Path | None, live: bool) -> tuple:
-    """Build the sorted `SubagentInfo` tuple for a session (active agents first)."""
+    """Build the `SubagentInfo` tuple for a session, in execution (spawn) order.
+
+    Each `agent-<id>.meta.json` is written once when its subagent spawns, so the
+    file's mtime is the spawn time; the list is sorted by `(spawn_ts, agent_id)`
+    (id is a stable tiebreak when two metas share an mtime)."""
     subdir = _session_subdir(sid)
     if subdir is None:
         return ()
@@ -709,6 +711,10 @@ def _load_subagents(sid: str, transcript: Path | None, live: bool) -> tuple:
         else:
             status = "stopped"
         count, capped = _count_tool_uses(meta_path.parent / f"agent-{agent_id}.jsonl")
+        try:
+            spawn_ts = meta_path.stat().st_mtime
+        except OSError:
+            spawn_ts = 0.0
         infos.append(SubagentInfo(
             agent_id=agent_id,
             agent_type=data.get("agentType", ""),
@@ -716,9 +722,9 @@ def _load_subagents(sid: str, transcript: Path | None, live: bool) -> tuple:
             status=status,
             command_count=count,
             command_count_capped=capped,
+            spawn_ts=spawn_ts,
         ))
-    infos.sort(key=lambda s: (_SUBAGENT_STATUS_ORDER.get(s.status, 3),
-                              s.description, s.agent_id))
+    infos.sort(key=lambda s: (s.spawn_ts, s.agent_id))
     return tuple(infos)
 
 
