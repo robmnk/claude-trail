@@ -573,8 +573,9 @@ class TestLoadSessionModel:
         assert by_id["done1"].command_count == 3
         assert by_id["run1"].status == "running"
         assert by_id["run1"].command_count == 1
-        # active agents sort first
-        assert model.subagents[0].agent_id == "run1"
+        # subagents sort in spawn order (meta mtime); done1's meta is written
+        # first and also wins the agent_id tiebreak, so it sorts ahead of run1
+        assert model.subagents[0].agent_id == "done1"
 
     def test_ended_session_marks_incomplete_stopped(self, tmp_path):
         sid = "sid-ended"
@@ -641,6 +642,26 @@ class TestLoadSessionModel:
              patch.object(feed, "SESSION_MODEL_CACHE_TTL", 0.0):
             model = feed.load_session_model(sid)
         assert model.subagents[0].command_count_capped is True
+
+    def test_subagents_ordered_by_spawn_mtime_not_description(self, tmp_path):
+        import os
+        sid = "sid-order"
+        # "zzz-agent" spawns first; "aaa-agent" spawns second. Both its agent_id
+        # and its description ("aaa-...") sort ahead alphabetically, so a
+        # description- or id-based sort would put the later-spawned one first.
+        # Pure spawn (mtime) order must keep zzz-agent (spawned first) ahead.
+        project = _make_session(tmp_path, sid, agents={
+            "zzz-agent": ("general-purpose", "zzz-desc-earlier", 0),
+            "aaa-agent": ("general-purpose", "aaa-desc-later", 0),
+        })
+        subs = project / sid / "subagents"
+        os.utime(subs / "agent-zzz-agent.meta.json", (1000.0, 1000.0))
+        os.utime(subs / "agent-aaa-agent.meta.json", (2000.0, 2000.0))
+        transcript = project / f"{sid}.jsonl"
+        with patch.object(feed, "PROJECTS_DIR", tmp_path):
+            infos = feed._load_subagents(sid, transcript, live=True)
+        assert [s.agent_id for s in infos] == ["zzz-agent", "aaa-agent"]
+        assert [s.spawn_ts for s in infos] == [1000.0, 2000.0]
 
 
 class TestExtractFiles:
