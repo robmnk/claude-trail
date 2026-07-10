@@ -48,36 +48,38 @@ audit store fresh.
 ```
 
 **Store refresh (`Stop`).** Runs an incremental ingest when the main agent
-finishes a turn, so the TUI token modals (and `search`/`cat`) reflect
-just-run commands. `ingest --detach` forks a one-shot ingest and returns
-instantly, guarded by a per-store `flock` singleton so concurrent turns/sessions
-never pile up or contend on the write lock:
+finishes a turn, so the TUI token modals (and `search`/`cat`) reflect just-run
+commands. Point it at the `claude-trail-ingest.sh` wrapper, which backgrounds a
+**singleton, timed, logged** ingest and folds in periodic compaction:
 
 ```json
 {
   "hooks": {
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "claude-trail ingest --detach" } ] }
+      { "hooks": [ { "type": "command", "command": "bash ~/.claude/hooks/claude-trail-ingest.sh" } ] }
     ]
   }
 }
 ```
 
-**Compaction (optional, `SessionEnd`).** The frequent `--detach` ingests each
-`CHECKPOINT` but never coalesce free blocks, so the file slowly drifts above its
-packed size. A small wrapper on `SessionEnd` reclaims it at most once every 7
-days (marker-gated) via `claude-trail ingest --detach --compact` (shares the
-ingest flock; the rewrite is atomic, so a killed run leaves the store intact):
+The wrapper is `setsid sh -c "flock -n LOCK timeout 300 claude-trail ingest [--compact] >> LOG 2>&1" &`:
 
-```json
-{
-  "hooks": {
-    "SessionEnd": [
-      { "hooks": [ { "type": "command", "command": "bash ~/.claude/hooks/claude-trail-compact.sh" } ] }
-    ]
-  }
-}
-```
+- `setsid` + `&` return instantly and outlive the hook process;
+- `flock -n` makes it a singleton (a still-running ingest is skipped; ingest is
+  idempotent, so the next turn catches up);
+- `timeout 300` keeps a hung ingest from holding the lock and silently stalling
+  every future update;
+- `>> LOG` (`<store>.ingest.log`, tail-capped) makes a crash/hang **visible**
+  instead of vanishing into `/dev/null`;
+- every 2h it adds `--compact` (marker-gated on `<store>.compact-stamp`). Each
+  `CHECKPOINT` re-expands the file to ~2x its packed size, so the store
+  steady-states around 2x; compaction (an atomic `os.replace` rewrite) packs it
+  back. Bloat is bounded, not unbounded.
+
+`claude-trail ingest --detach` is the minimal, portable equivalent (it does its
+own `fork`/`flock`, needing no `setsid`/`flock`/`timeout` binaries) but sends the
+child's output to `/dev/null`; prefer the wrapper where `flock`/`timeout` exist,
+because it keeps a log and self-limits a hang.
 
 ## Running
 
