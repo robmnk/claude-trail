@@ -1412,6 +1412,26 @@ class TestFilterSessionLog:
         assert '"command": "three"' in content
         assert '"two"' not in content
 
+    def test_output_is_pretty_printed_json(self, tmp_path):
+        """`o` output is for human eyes only: entries are re-emitted indented
+        (blank-line separated blocks, like the `t` transcript), not raw JSONL."""
+        import json
+        log = tmp_path / "command-log.jsonl"
+        log.write_text(
+            json.dumps({"session_id": "aaa", "command": "one"}) + "\n"
+            + json.dumps({"session_id": "aaa", "command": "two"}) + "\n",
+            encoding="utf-8",
+        )
+        with patch.object(feed, "LOG_PATH", log), \
+             patch.object(feed.tempfile, "gettempdir", return_value=str(tmp_path)):
+            out = feed.filter_session_log("aaa")
+        assert out.endswith(".json")                      # not .jsonl anymore
+        content = Path(out).read_text(encoding="utf-8")
+        assert '\n  "command"' in content                 # indented fields
+        blocks = content.split("\n\n")
+        assert len(blocks) == 2                           # one block per entry
+        assert all(json.loads(b)["session_id"] == "aaa" for b in blocks)
+
     def test_sanitizes_session_id_in_filename(self, tmp_path):
         import json
         log = tmp_path / "command-log.jsonl"
@@ -2367,8 +2387,8 @@ class TestDatabaseModal:
 
 class TestTokenLoaders:
     """The lazy token loaders behind the command/session modals: they guard bad
-    input and degrade to None (omit the Tokens row) when the store is absent,
-    never raising into the TUI loop."""
+    input (None: no Tokens row) and degrade to the `_tokens_unavailable` hint
+    sentinel when the store has no answer, never raising into the TUI loop."""
 
     def test_command_tokens_none_entry(self):
         assert feed._load_command_tokens(None) is None
@@ -2377,23 +2397,53 @@ class TestTokenLoaders:
         assert feed._load_command_tokens({"command": "ls"}) is None       # no sid
         assert feed._load_command_tokens({"session_id": "s"}) is None      # no cmd
 
-    def test_command_tokens_missing_store_returns_none(self, tmp_path, monkeypatch):
-        # No store file: the loader must not raise; it omits the row (None). The
-        # `from claude_trail_store import STORE_PATH` inside _with_store reads the
-        # patched module attribute at call time.
+    def test_command_tokens_missing_store_hints_run_ingest(self, tmp_path, monkeypatch):
+        # No store file: the loader must not raise; it returns the sentinel whose
+        # hint says the store does not exist yet (the fix for the row silently
+        # vanishing and the feature looking broken). The `from claude_trail_store
+        # import STORE_PATH` inside reads the patched attribute at call time.
         import claude_trail_store as store
         monkeypatch.setattr(store, "STORE_PATH", tmp_path / "nope.duckdb")
         entry = {"session_id": "s", "command": "ls", "timestamp": "2026-01-01T00:00:00+00:00"}
-        assert feed._load_command_tokens(entry) is None
+        assert feed._load_command_tokens(entry) == {
+            "unavailable": "no audit store yet - run: claude-trail ingest"}
+
+    def test_command_tokens_store_lagging_hints_pending(self, tmp_path, monkeypatch):
+        # Store file exists but has no matching request (the store tails
+        # transcripts and lags the live feed): the hint says "pending ingest".
+        import claude_trail_store as store
+        db = tmp_path / "trail.duckdb"
+        db.touch()
+        monkeypatch.setattr(store, "STORE_PATH", db)
+        monkeypatch.setattr(feed, "_with_store", lambda fn: None)
+        entry = {"session_id": "s", "command": "ls", "timestamp": "2026-01-01T00:00:00+00:00"}
+        assert feed._load_command_tokens(entry) == {
+            "unavailable": "pending ingest (store lags the live feed)"}
 
     def test_session_tokens_none_sid(self):
         assert feed._load_session_tokens(None) is None
         assert feed._load_session_tokens("") is None
 
-    def test_session_tokens_missing_store_returns_none(self, tmp_path, monkeypatch):
+    def test_session_tokens_missing_store_hints_run_ingest(self, tmp_path, monkeypatch):
         import claude_trail_store as store
         monkeypatch.setattr(store, "STORE_PATH", tmp_path / "nope.duckdb")
-        assert feed._load_session_tokens("some-sid") is None
+        assert feed._load_session_tokens("some-sid") == {
+            "unavailable": "no audit store yet - run: claude-trail ingest"}
+
+    def test_unavailable_sentinel_renders_as_dim_hint(self):
+        # Both formatters render the sentinel as the hint text (not a number),
+        # and the detail panel shows the Tokens row carrying it.
+        hint = {"unavailable": "pending ingest (store lags the live feed)"}
+        assert feed._format_command_tokens(hint).plain == hint["unavailable"]
+        assert feed._format_session_tokens(hint).plain == hint["unavailable"]
+        entry = {"session_id": "s", "command": "ls",
+                 "timestamp": "2026-01-01T00:00:00+00:00", "cwd": "/tmp"}
+        panel = feed.build_detail_panel(entry, term_height=30, tokens=hint)
+        console = Console(width=120)
+        with console.capture() as cap:
+            console.print(panel)
+        assert "Tokens" in cap.get()
+        assert "pending ingest" in cap.get()
 
 
 class TestSearchRoots:

@@ -1065,17 +1065,24 @@ def build_table(
 
 
 def filter_session_log(session_id: str) -> str | None:
-    """Filter the command log down to one session, write it to a temp file, and
-    return that path (or None if there is nothing to show)."""
+    """Filter the command log down to one session, write it pretty-printed to a
+    temp `.json` file, and return that path (or None if there is nothing to show).
+
+    The output is only ever opened in an editor for a human, so each entry is
+    re-emitted indented (blocks joined by a blank line, like
+    `format_session_transcript`) instead of as raw single-line JSONL."""
     if not session_id or not LOG_PATH.exists():
         return None
     safe_id = re.sub(r"[^a-zA-Z0-9-]", "", session_id[:8]) or "unknown"
-    out_path = os.path.join(tempfile.gettempdir(), f"claude-trail-session-{safe_id}.jsonl")
-    with open(LOG_PATH, "r", encoding="utf-8") as f_in, open(out_path, "w", encoding="utf-8") as f_out:
+    out_path = os.path.join(tempfile.gettempdir(), f"claude-trail-session-{safe_id}.json")
+    blocks: list[str] = []
+    with open(LOG_PATH, "r", encoding="utf-8") as f_in:
         for line in f_in:
             entry = parse_line(line.strip())
             if entry and entry.get("session_id", "") == session_id:
-                f_out.write(line)
+                blocks.append(json.dumps(entry, indent=2, ensure_ascii=False))
+    with open(out_path, "w", encoding="utf-8") as f_out:
+        f_out.write("\n\n".join(blocks))
     return out_path
 
 
@@ -1176,7 +1183,10 @@ def _format_command_tokens(tokens: dict) -> Text:
     """The Tokens cell for the command-detail modal: the generation cost the
     audit store attributes to this command (that request's output tokens, split
     evenly when the request emitted several parallel tool calls), plus the model.
+    The `_tokens_unavailable` sentinel renders as a dim hint instead of a number.
     """
+    if "unavailable" in tokens:
+        return Text(tokens["unavailable"], style="dim italic")
     share = int(round(tokens.get("share", 0)))
     calls = tokens.get("calls_in_request", 1) or 1
     model = tokens.get("model") or ""
@@ -1202,8 +1212,9 @@ def build_detail_panel(
     untruncated command text (newlines preserved).
 
     `tokens` (loaded on Enter via the audit store) adds a Tokens row with the
-    command's generation cost; it is omitted when the store has no matching
-    request (unavailable, or the command not yet ingested)."""
+    command's generation cost, or a dim "pending ingest" / "no audit store"
+    hint (the `_tokens_unavailable` sentinel) when the store has no matching
+    request yet; the row is absent only when `tokens` is None."""
     cmd = entry.get("command", "")
     ctx = RenderCtx(name_map=name_map, color_map=color_map)
 
@@ -1285,7 +1296,10 @@ def _session_started_line(model: "SessionModel") -> str:
 def _format_session_tokens(tokens: dict) -> Text:
     """The Tokens cell for the session-detail modal: exact per-session totals
     (generation output, input, combined cache, request count) from the audit
-    store; subagent output is called out when any subagent ran."""
+    store; subagent output is called out when any subagent ran. The
+    `_tokens_unavailable` sentinel renders as a dim hint instead of totals."""
+    if "unavailable" in tokens:
+        return Text(tokens["unavailable"], style="dim italic")
     text = Text()
     text.append(f"{tokens['output_tokens']:,}", style="bold")
     text.append(" output", style="dim")
@@ -2184,9 +2198,27 @@ def _with_store(fn):
         return None
 
 
+def _tokens_unavailable() -> dict:
+    """Sentinel Tokens value for when the store has no answer: says WHY the
+    number is missing instead of silently omitting the row, which reads as a
+    broken feature (the store tails transcripts and lags the live feed, so
+    "no data yet" is the normal state right after a command runs)."""
+    try:
+        from claude_trail_store import STORE_PATH
+        missing = not STORE_PATH.exists()
+    except Exception:
+        missing = True
+    hint = ("no audit store yet - run: claude-trail ingest" if missing
+            else "pending ingest (store lags the live feed)")
+    return {"unavailable": hint}
+
+
 def _load_command_tokens(entry: LogEntry | None) -> dict | None:
-    """Token cost of `entry`'s command from the audit store, or None. Loaded once
-    when the command-detail modal opens (see Action.OPEN_DETAIL)."""
+    """Token cost of `entry`'s command from the audit store. Loaded once when
+    the command-detail modal opens (see Action.OPEN_DETAIL). Returns the
+    `_tokens_unavailable` sentinel (rendered as a dim hint) when the store has
+    no matching request, and None only for a row with no session/command (no
+    Tokens row at all)."""
     if not entry:
         return None
     sid = entry.get("session_id") or ""
@@ -2198,12 +2230,14 @@ def _load_command_tokens(entry: LogEntry | None) -> dict | None:
         from claude_trail_store import command_tokens_for
         return command_tokens_for(con, sid, cmd, entry.get("timestamp"))
 
-    return _with_store(query)
+    return _with_store(query) or _tokens_unavailable()
 
 
 def _load_session_tokens(sid: str | None) -> dict | None:
-    """Per-session token totals from the audit store, or None. Loaded once when
-    the session-detail modal opens (see Action.OPEN_SESSION_DETAIL)."""
+    """Per-session token totals from the audit store. Loaded once when the
+    session-detail modal opens (see Action.OPEN_SESSION_DETAIL). Returns the
+    `_tokens_unavailable` sentinel when the store has no ingested requests for
+    the session, and None only when there is no session id."""
     if not sid:
         return None
 
@@ -2211,7 +2245,7 @@ def _load_session_tokens(sid: str | None) -> dict | None:
         from claude_trail_store import session_token_totals
         return session_token_totals(con, sid)
 
-    return _with_store(query)
+    return _with_store(query) or _tokens_unavailable()
 
 
 def _signal_exit(signum, frame):
