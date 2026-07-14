@@ -86,7 +86,8 @@ CREATE TABLE IF NOT EXISTS file_versions(
   path       TEXT,
   pre_sha    TEXT,
   post_sha   TEXT,
-  patch      TEXT,              -- unified diff (from structuredPatch or difflib)
+  patch      TEXT,              -- structuredPatch hunks as JSON, else a difflib
+                                --   unified diff (only when pre+post both known)
   source     TEXT DEFAULT 'transcript'  -- provenance: 'transcript' | 'file-history' (B2; must be stamped, see _FV_COLS)
 );
 CREATE INDEX IF NOT EXISTS fv_path ON file_versions(path, ts);
@@ -641,6 +642,64 @@ def _render_patch(structured, pre, post, path):
             pre.splitlines(True), post.splitlines(True),
             fromfile=path, tofile=path))
     return None
+
+
+def _apply_structured_patch(content, patch_json):
+    """Apply stored structuredPatch hunks (the JSON `_render_patch` writes) to
+    `content`, STRICTLY: every context (' ') and deletion ('-') line must match
+    the file at the hunk's stated position. Returns the patched text, or None on
+    ANY mismatch (difflib-text/unknown format, wrong context, overlapping or
+    out-of-range hunks) -- never a half-applied file. Strictness is the safety
+    property: `cat` uses this to roll patch-only edits forward, and a patch that
+    no longer applies (file changed outside Claude, interleaved session) must
+    degrade to stale-but-consistent output, not a silently corrupted mix.
+
+    Line model: split('\\n'), so a trailing newline appears as a final '' element
+    that hunks never consume (jsdiff's structuredPatch uses the same convention;
+    the untouched tail is re-joined verbatim, preserving the final newline)."""
+    try:
+        hunks = json.loads(patch_json)
+    except (TypeError, ValueError):
+        return None                       # difflib fallback text or garbage
+    if not isinstance(hunks, list) or not all(isinstance(h, dict) for h in hunks):
+        return None
+    lines = content.split("\n")
+    out = []
+    pos = 0                               # next unconsumed index into `lines`
+    for h in hunks:
+        try:
+            old_start, old_lines = int(h["oldStart"]), int(h["oldLines"])
+            hunk_lines = h["lines"]
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not isinstance(hunk_lines, list):
+            return None
+        # 1-based first old line -> 0-based index; a pure-insertion hunk
+        # (oldLines == 0) inserts AFTER old line `oldStart`, i.e. at index
+        # oldStart itself (unified-diff convention for zero-length ranges).
+        start = old_start if old_lines == 0 else old_start - 1
+        if start < pos or start > len(lines):
+            return None                   # overlapping / out-of-order / past EOF
+        out.extend(lines[pos:start])
+        pos = start
+        for hl in hunk_lines:
+            if not isinstance(hl, str) or not hl:
+                return None
+            tag, text = hl[0], hl[1:]
+            if tag in (" ", "-"):
+                if pos >= len(lines) or lines[pos] != text:
+                    return None           # context/deletion mismatch: refuse
+                if tag == " ":
+                    out.append(text)
+                pos += 1
+            elif tag == "+":
+                out.append(text)
+            elif tag == "\\":
+                continue                  # "\ No newline at end of file" marker
+            else:
+                return None
+    out.extend(lines[pos:])
+    return "\n".join(out)
 
 
 def file_version_from_event(con, ev):
@@ -1774,8 +1833,14 @@ def cmd_stats(argv):
 
 def cmd_cat(argv):
     # usage: cat <path> [--session S] [--at ISO]  -> latest content at/before --at.
-    # The JOIN on post_sha naturally skips patch-only versions (null post_sha), so
-    # this returns the latest version that actually has reconstructable bytes.
+    # Two steps. (1) The newest version with reconstructable bytes: the JOIN on
+    # post_sha skips patch-only versions (null post_sha). (2) Any NEWER patch-only
+    # edits are rolled forward on top via strict structuredPatch application --
+    # file-history snapshots checkpoint the PRE-turn state, so a file last edited
+    # in a session's final turn had no snapshot of its final bytes and `cat` used
+    # to be one turn stale here. A patch that no longer applies cleanly (file
+    # changed outside Claude, interleaved session) stops the roll-forward:
+    # stale-but-consistent bytes plus a stderr warning, never a corrupted mix.
     args = argv[1:]
     path = args[0]
     def opt(n):
@@ -1783,17 +1848,37 @@ def cmd_cat(argv):
     where, params = ["fv.path = ?"], [path]
     if opt("--session"): where.append("fv.session_id LIKE ?"); params.append(opt("--session") + "%")
     if opt("--at"):      where.append("fv.ts <= ?");           params.append(opt("--at"))
-    sql = (f"SELECT b.content FROM file_versions fv JOIN blobs b ON b.sha = fv.post_sha "
-           f"WHERE {' AND '.join(where)} ORDER BY fv.ts DESC LIMIT 1")
+    # epoch_ms + rowid anchor the tail strictly after the base row (rowid breaks
+    # same-millisecond ties in insertion = transcript order); the raw TIMESTAMPTZ
+    # is never fetched because materializing it needs the optional pytz package.
+    sql = (f"SELECT b.content, epoch_ms(fv.ts), fv.rowid "
+           f"FROM file_versions fv JOIN blobs b ON b.sha = fv.post_sha "
+           f"WHERE {' AND '.join(where)} ORDER BY fv.ts DESC, fv.rowid DESC LIMIT 1")
     con = connect(read_only=True)
     try:
         row = con.execute(sql, params).fetchone()
+        if not row:
+            print("no stored version for that path/time")
+            return 1
+        content, base_ms, base_rowid = row
+        # The patch-only tail: same filters, strictly after the base row, oldest
+        # first. Every row here has a null post_sha by construction (a later row
+        # WITH bytes would itself have been picked as the base above).
+        tail_sql = (f"SELECT fv.patch FROM file_versions fv "
+                    f"WHERE {' AND '.join(where)} AND (epoch_ms(fv.ts) > ? OR "
+                    f"(epoch_ms(fv.ts) = ? AND fv.rowid > ?)) "
+                    f"ORDER BY fv.ts, fv.rowid")
+        tail = con.execute(tail_sql, params + [base_ms, base_ms, base_rowid]).fetchall()
     finally:
         con.close()
-    if not row:
-        print("no stored version for that path/time")
-        return 1
-    print(row[0], end="")
+    for i, (patch,) in enumerate(tail):
+        patched = _apply_structured_patch(content, patch) if patch else None
+        if patched is None:
+            print(f"warning: output is stale by {len(tail) - i} edit(s): "
+                  f"a later patch no longer applies cleanly", file=sys.stderr)
+            break
+        content = patched
+    print(content, end="")
     return 0
 
 

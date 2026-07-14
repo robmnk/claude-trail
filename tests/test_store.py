@@ -1294,6 +1294,133 @@ def test_cmd_cat_patch_only_returns_1_but_diff_shows_patch(tmp_path, monkeypatch
     assert "(no patch)" not in out                       # it HAS a patch
 
 
+# --- cat roll-forward: patch-only tail applied on top of newest bytes ----------
+#
+# file-history snapshots checkpoint the PRE-turn state, so a file last edited in
+# a session's final turn had no snapshot of its final bytes and `cat` was one
+# turn stale. cmd_cat now rolls trailing patch-only edits forward with
+# _apply_structured_patch, strictly: a mismatching patch degrades to the old
+# stale-but-consistent output plus a stderr warning, never a corrupted mix.
+
+
+def test_apply_structured_patch_clean_context_and_multi_hunk():
+    """Strict application: context lines verified, deletions consumed, additions
+    inserted, and the untouched tail (incl. the trailing-newline '' element)
+    re-joined verbatim."""
+    base = "one\ntwo\nthree\nfour\n"
+    single = json.dumps([{"oldStart": 2, "oldLines": 1, "newStart": 2, "newLines": 1,
+                          "lines": ["-two", "+TWO"]}])
+    assert store._apply_structured_patch(base, single) == "one\nTWO\nthree\nfour\n"
+    multi = json.dumps([
+        {"oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1,
+         "lines": ["-one", "+ONE"]},
+        {"oldStart": 4, "oldLines": 1, "newStart": 4, "newLines": 2,
+         "lines": [" four", "+five"]},
+    ])
+    assert store._apply_structured_patch(base, multi) == "ONE\ntwo\nthree\nfour\nfive\n"
+
+
+def test_apply_structured_patch_insertion_only_hunk():
+    """oldLines == 0 inserts AFTER old line oldStart (the unified-diff
+    zero-length-range convention), touching nothing else."""
+    base = "a\nb\n"
+    ins = json.dumps([{"oldStart": 1, "oldLines": 0, "newStart": 2, "newLines": 1,
+                       "lines": ["+a2"]}])
+    assert store._apply_structured_patch(base, ins) == "a\na2\nb\n"
+
+
+def test_apply_structured_patch_refuses_mismatch_and_garbage():
+    """Any context/deletion mismatch, out-of-range hunk, non-JSON payload (the
+    difflib fallback text), or non-hunk shape returns None: never half-applied."""
+    base = "one\ntwo\n"
+    wrong_ctx = json.dumps([{"oldStart": 1, "oldLines": 1, "newStart": 1,
+                             "newLines": 1, "lines": ["-NOT THERE", "+x"]}])
+    assert store._apply_structured_patch(base, wrong_ctx) is None
+    assert store._apply_structured_patch(
+        base, "--- a\n+++ b\n@@ -1 +1 @@\n-one\n+x\n") is None
+    past_eof = json.dumps([{"oldStart": 99, "oldLines": 1, "newStart": 1,
+                            "newLines": 1, "lines": ["-one", "+x"]}])
+    assert store._apply_structured_patch(base, past_eof) is None
+    assert store._apply_structured_patch(base, json.dumps({"not": "a list"})) is None
+
+
+def _patch_only_edit_event(sid, uuid, path, ts, hunks):
+    """A user Edit tool_result with originalFile null and no oldString/newString:
+    post is NOT reconstructable (null post_sha, patch-only row) but the
+    structuredPatch is stored -- the shape of the ~61% of transcript edits that
+    carry no full content."""
+    return {
+        "type": "user", "uuid": uuid, "sessionId": sid, "timestamp": ts,
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": f"toolu-{uuid}",
+             "content": f"The file {path} has been updated."}]},
+        "toolUseResult": {
+            "filePath": path, "originalFile": None,
+            "structuredPatch": hunks, "userModified": False,
+        },
+    }
+
+
+def test_cmd_cat_rolls_patch_only_tail_forward(tmp_path, monkeypatch, capsys):
+    """A Write(create) followed by TWO patch-only Edits: cat applies both patches
+    on top of the Write's bytes oldest-first (the second patch's context only
+    matches the FIRST patch's output, proving the chain order), no warning."""
+    sid = "sess-cat-tail-01"
+    events = [
+        _write_create_event(sid, "ct-w", CATDIFF_PATH, "alpha\nbeta\n"),
+        _patch_only_edit_event(
+            sid, "ct-p1", CATDIFF_PATH, "2026-06-30T04:00:02.000Z",
+            [{"oldStart": 2, "oldLines": 1, "newStart": 2, "newLines": 1,
+              "lines": ["-beta", "+BETA"]}]),
+        _patch_only_edit_event(
+            sid, "ct-p2", CATDIFF_PATH, "2026-06-30T04:00:03.000Z",
+            [{"oldStart": 1, "oldLines": 2, "newStart": 1, "newLines": 3,
+              "lines": [" alpha", " BETA", "+gamma"]}]),
+    ]
+    _build_reconstruction_store(tmp_path, monkeypatch, sid, events)
+    assert store.cmd_cat(["cat", CATDIFF_PATH]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "alpha\nBETA\ngamma\n"
+    assert captured.err == ""
+
+
+def test_cmd_cat_tail_mismatch_falls_back_stale_with_warning(tmp_path, monkeypatch, capsys):
+    """A trailing patch whose context does not match (file changed outside
+    Claude) stops the roll-forward: the base bytes print unchanged, a staleness
+    warning lands on stderr, and the exit code stays 0."""
+    sid = "sess-cat-tail-02"
+    events = [
+        _write_create_event(sid, "cm-w", CATDIFF_PATH, "alpha\nbeta\n"),
+        _patch_only_edit_event(
+            sid, "cm-p1", CATDIFF_PATH, "2026-06-30T04:00:02.000Z",
+            [{"oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1,
+              "lines": ["-SOMETHING ELSE", "+x"]}]),
+    ]
+    _build_reconstruction_store(tmp_path, monkeypatch, sid, events)
+    assert store.cmd_cat(["cat", CATDIFF_PATH]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "alpha\nbeta\n"               # stale but consistent
+    assert "stale by 1 edit" in captured.err
+
+
+def test_cmd_cat_at_excludes_later_patch_tail(tmp_path, monkeypatch, capsys):
+    """--at between the Write and a later patch-only Edit rolls nothing forward:
+    the cutoff windows the tail exactly like the base row."""
+    sid = "sess-cat-tail-03"
+    events = [
+        _write_create_event(sid, "cw-w", CATDIFF_PATH, "alpha\nbeta\n"),
+        _patch_only_edit_event(
+            sid, "cw-p1", CATDIFF_PATH, "2026-06-30T04:00:02.000Z",
+            [{"oldStart": 2, "oldLines": 1, "newStart": 2, "newLines": 1,
+              "lines": ["-beta", "+BETA"]}]),
+    ]
+    _build_reconstruction_store(tmp_path, monkeypatch, sid, events)
+    assert store.cmd_cat(["cat", CATDIFF_PATH, "--at", "2026-06-30T04:00:01.000Z"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "alpha\nbeta\n"
+    assert captured.err == ""
+
+
 def test_cmd_diff_without_pytz(tmp_path, monkeypatch, capsys):
     """diff must not require the optional `pytz` package.
 

@@ -1671,7 +1671,7 @@ def build_panel(
 
     status2 = Text.from_markup(
         f"  [dim italic]cols:[/dim italic] {col_toggles}"
-        "  [dim italic]\u00b7  j/k:nav  \u21b5:view  s:session  d:db  o:log  f:folder  q:quit  c:clear[/dim italic]"
+        "  [dim italic]\u00b7  j/k:nav  \u21b5:view  s:session  d:db  o:log  t:transcript  /:search  f:folder  q:quit  c:clear[/dim italic]"
     )
 
     body = Group(content, Text(""), status, status2)

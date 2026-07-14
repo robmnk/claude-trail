@@ -154,7 +154,7 @@ Run `ingest` from cron or leave one `--watch` process polling; it is idempotent 
 - Snapshot bytes are preserved as content-addressed blobs **even when the path is not yet resolvable** (file-history is the one store input not rebuildable from `raw_events`; deferred resolution fills the path as more edits are seen).
 - `cat` reads all sources, so a formerly patch-only file reconstructs. `diff` stays transcript-only by default (a snapshot spans a whole user turn, so including it would double-list every edit); `--all-sources` opts the file-history deltas in.
 - `--file-history-only` runs just the backfill pass (does not touch the transcript offsets).
-- **`cat` staleness caveat:** snapshots are per-user-turn checkpoints of the pre-message state, so a file last edited in a session's final turn has no snapshot of its final bytes; `cat` can be one turn stale. (Applying the last transcript `structuredPatch` on top of the newest snapshot for exactness is deliberate future work.)
+- **`cat` roll-forward:** snapshots are per-user-turn checkpoints of the pre-message state, so a file last edited in a session's final turn has no snapshot of its final bytes. `cat` therefore applies any newer patch-only `structuredPatch` edits on top of the newest stored bytes, strictly (context must match exactly); if a patch no longer applies (the file changed outside Claude), it prints the last consistent version and warns `stale by N edit(s)` on stderr instead of emitting a half-patched mix.
 
 ## Notes
 
