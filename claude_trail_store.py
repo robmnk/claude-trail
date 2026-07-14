@@ -1149,6 +1149,14 @@ def _ingest_lock_path():
     return os.path.join(os.path.dirname(str(STORE_PATH)) or ".", "trail-ingest.lock")
 
 
+def _ingest_log_path():
+    """Where a detached ingest child sends its stdout/stderr: one shared log
+    right next to the store (the hook wrapper appends to the same file), so a
+    crashing or hanging detached ingest leaves evidence instead of vanishing
+    into /dev/null. Derived from STORE_PATH at call time, like the lock."""
+    return str(STORE_PATH) + ".ingest.log"
+
+
 def _acquire_ingest_lock():
     """Try to grab the singleton ingest lock without blocking.
 
@@ -1217,9 +1225,11 @@ def _ingest_detach(argv):
     """
     if not hasattr(os, "fork"):
         # os.fork is POSIX-only (absent on e.g. Windows). This tool targets
-        # Linux + macOS; return cleanly rather than crash the hook.
+        # Linux + macOS; return 0 (a logged no-op) rather than 1, because a hook
+        # runs this every turn and a nonzero exit would surface as a hook error
+        # each time on such a platform.
         _log("--detach requires os.fork (POSIX only); nothing ingested")
-        return 1
+        return 0
 
     fd = _acquire_ingest_lock()
     if fd is None:
@@ -1240,6 +1250,11 @@ def _ingest_detach(argv):
         # closed, so closing here does NOT drop the child's lock -- it only
         # relinquishes the parent's reference to it.
         os.close(fd)
+        # Reap the intermediate child: it _exits right after the second fork
+        # (below), so this cannot block. Without it, a long-lived caller (say
+        # the TUI one day) would accumulate one zombie per detach; the CLI
+        # parent exits so fast it never noticed.
+        os.waitpid(pid, 0)
         return 0
 
     # Child: fully detach so it outlives the hook process that spawned it.
@@ -1247,19 +1262,35 @@ def _ingest_detach(argv):
         # New session + process group: no controlling tty, and no longer in the
         # hook's process group, so the hook exiting cannot signal us.
         os.setsid()
-        # Redirect std streams to /dev/null: the parent has already returned and
-        # the tty may be gone, so ingest's stdout/stderr must not touch the hook's
-        # fds. (sys.stdout.isatty() now sees /dev/null -> the Rich bar stays off.)
+        # Double-fork: this intermediate child exits at once so (a) the parent's
+        # waitpid above returns immediately and the worker is reparented to init
+        # (no zombie ever), and (b) the worker is not a session leader, so it can
+        # never accidentally reacquire a controlling tty.
+        if os.fork() > 0:
+            os._exit(0)
+        # Worker (grandchild): stdin from /dev/null; stdout/stderr APPEND to the
+        # shared ingest log next to the store (the hook wrapper writes the same
+        # file), so a crashing or stalling detached ingest is diagnosable. An
+        # unwritable log falls back to /dev/null: silence over dying. isatty()
+        # is False on both, so the Rich progress bar stays off either way.
         devnull = os.open(os.devnull, os.O_RDWR)
-        for stdfd in (0, 1, 2):
-            os.dup2(devnull, stdfd)
-        # Only close devnull when it is above the std range: if a std fd was
-        # closed at launch, os.open may have handed us devnull AS 0/1/2, which we
-        # just dup2'd onto -- closing it would drop a std stream we mean to keep.
+        os.dup2(devnull, 0)
+        try:
+            logfd = os.open(_ingest_log_path(),
+                            os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o644)
+        except OSError:
+            logfd = devnull
+        os.dup2(logfd, 1)
+        os.dup2(logfd, 2)
+        # Only close fds above the std range: if a std fd was closed at launch,
+        # os.open may have handed us 0/1/2, which we just dup2'd onto -- closing
+        # would drop a stream we mean to keep (same guard as the lock fd's).
+        if logfd > 2 and logfd != devnull:
+            os.close(logfd)
         if devnull > 2:
             os.close(devnull)
         # Keep `fd` open for the whole run: it is what holds the flock, releasing
-        # only when this child exits and all fds on the description finally close.
+        # only when this worker exits and all fds on the description finally close.
         cmd_ingest(child_argv)
     except BaseException:
         # _exit (not sys.exit): skip atexit handlers / buffer flushes in the

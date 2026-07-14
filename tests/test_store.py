@@ -1867,19 +1867,23 @@ def test_ingest_detach_skips_without_forking_when_lock_held(tmp_path, monkeypatc
     assert not (tmp_path / "trail.duckdb").exists()    # nothing ingested/written
 
 
-def test_ingest_detach_parent_branch_closes_fd_and_returns(tmp_path, monkeypatch):
+def test_ingest_detach_parent_branch_closes_fd_reaps_and_returns(tmp_path, monkeypatch):
     """Lock-acquired path, parent branch simulated: os.fork returns a positive pid
     (as it does in the real parent) so no child runs; the parent closes its lock
-    fd, returns 0, and ingests nothing itself. Closing the fd here also releases
-    the lock, which a follow-up acquire confirms."""
+    fd, reaps the intermediate child via waitpid (no zombie for a long-lived
+    caller), returns 0, and ingests nothing itself. Closing the fd here also
+    releases the lock, which a follow-up acquire confirms."""
     monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
     monkeypatch.setattr(os, "fork", lambda: 4242)      # pretend to be the parent
+    reaped = []
+    monkeypatch.setattr(os, "waitpid", lambda pid, opts: reaped.append(pid) or (pid, 0))
     closed = []
     real_close = os.close
     monkeypatch.setattr(os, "close", lambda fd: (closed.append(fd), real_close(fd))[1])
 
     assert store.cmd_ingest(["ingest", "--detach"]) == 0
     assert closed                                      # parent closed its lock fd
+    assert reaped == [4242]                            # intermediate child reaped
     assert not (tmp_path / "trail.duckdb").exists()    # parent does not ingest
     # The lock is free again (all fds on the description closed).
     monkeypatch.setattr(os, "close", real_close)
@@ -1900,10 +1904,11 @@ def test_detach_child_argv_strips_detach_and_watch_keeps_rest():
 
 
 def test_ingest_detach_returns_cleanly_without_os_fork(tmp_path, monkeypatch):
-    """On a platform without os.fork (non-POSIX), `ingest --detach` returns 1
-    cleanly rather than crashing the hook, and never reaches lock acquisition
+    """On a platform without os.fork (non-POSIX), `ingest --detach` returns 0 (a
+    logged no-op, NOT an error: a hook runs this every turn and a nonzero exit
+    would surface as a hook error each time), and never reaches lock acquisition
     (no lock file is created under STORE_PATH's dir)."""
     monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
     monkeypatch.delattr(os, "fork", raising=False)
-    assert store.cmd_ingest(["ingest", "--detach"]) == 1
+    assert store.cmd_ingest(["ingest", "--detach"]) == 0
     assert not (tmp_path / "trail-ingest.lock").exists()  # _acquire_ingest_lock never reached
