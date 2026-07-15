@@ -30,6 +30,9 @@ pipx install git+https://github.com/robmnk/claude-trail
 # uv
 uv tool install git+https://github.com/robmnk/claude-trail
 
+# mise (via its pipx backend)
+mise use -g pipx:robmnk/claude-trail
+
 # from a local clone, no install
 pip install -r requirements.txt
 ```
@@ -53,7 +56,7 @@ Add this to the `hooks` section of `~/.claude/settings.json` (merge with any exi
 }
 ```
 
-The hook is built into the `claude-trail` binary, so no path is needed as long as `claude-trail` is on your `PATH` (which `pipx` and `uv tool install` set up automatically).
+The hook is built into the `claude-trail` binary, so no path is needed as long as `claude-trail` is on your `PATH` (which `pipx` and `uv tool install` set up automatically; with `mise`, make sure its shims are on your `PATH`).
 
 > Running from a clone instead of installing? Use the absolute path:
 > `"command": "python3 /absolute/path/to/claude_trail.py hook"`
