@@ -1314,6 +1314,35 @@ class TestRendering:
         out = self._text(feed.build_detail_panel(self._entry(), 40, tokens=None))
         assert "Tokens" not in out
 
+    def test_detail_panel_previews_prompt_and_counts_hidden_lines(self):
+        # The prompt panel shows the first PROMPT_PREVIEW_LINES lines and says how
+        # many are left, so a long prompt never looks truncated-by-accident.
+        prompt = {"text": "\n".join(f"line {i}" for i in range(1, 15)), "ts": ""}
+        out = self._text(feed.build_detail_panel(self._entry(), 60, prompt=prompt))
+        assert "prompt" in out
+        assert "line 10" in out            # last previewed line
+        assert "line 11" not in out        # first hidden line
+        assert "+4 more lines" in out
+        assert "↵ : full prompt" in out
+
+    def test_detail_panel_short_prompt_has_no_more_lines_footer(self):
+        prompt = {"text": "just one line", "ts": ""}
+        out = self._text(feed.build_detail_panel(self._entry(), 40, prompt=prompt))
+        assert "just one line" in out
+        assert "more line" not in out
+
+    def test_detail_panel_omits_prompt_when_none(self):
+        out = self._text(feed.build_detail_panel(self._entry(), 40, prompt=None))
+        assert "prompt" not in out
+        assert "esc / q / ↵ : back" in out   # Enter still just closes
+
+    def test_detail_panel_prompt_unavailable_shows_hint(self):
+        hint = {"unavailable": "pending ingest (store lags the live feed)"}
+        out = self._text(feed.build_detail_panel(self._entry(), 40, prompt=hint))
+        assert "pending ingest" in out
+        # nothing to drill into: Enter keeps its close meaning
+        assert "esc / q / ↵ : back" in out
+
     def test_detail_panel_notes_shared_request(self):
         # A request that emitted 2 parallel tool calls: the share is half, and the
         # panel says so rather than implying the command cost the whole request.
@@ -1914,6 +1943,8 @@ class TestApplyKey:
         assert state.detail_entry is None
 
     def test_detail_mode_enter_closes_not_reopens(self):
+        # With no prompt loaded there is nothing to drill into, so Enter keeps
+        # its original one-key exit (see TestPromptView for the drill-in path).
         entries = self._entries(3)
         state = feed.AppState(entries=entries, detail_entry=entries[0])
         result = feed.apply_key(state, "\r", 10)
@@ -1933,6 +1964,111 @@ class TestApplyKey:
         assert state.entries == []
         assert state.cursor == 0
         assert state.scroll_offset == 0
+
+
+class TestPromptView:
+    """The full-prompt view drilled into from the command modal with Enter:
+    key handling (drill in, step back, close) and build_prompt_panel windowing."""
+
+    PROMPT = {"text": "\n".join(f"line {i}" for i in range(1, 41)), "ts": "2026-06-30 09:00:00-03"}
+
+    def _open_detail(self, prompt=None):
+        entries = [{"command": "ls", "session_id": "sid-0", "cwd": "/work",
+                    "timestamp": "2026-06-30T12:00:00+00:00"}]
+        return feed.AppState(entries=entries, detail_entry=entries[0],
+                             detail_prompt=prompt if prompt is not None else self.PROMPT)
+
+    def _text(self, panel, width=120):
+        console = Console(width=width, record=True)
+        console.print(panel)
+        return console.export_text()
+
+    def test_enter_opens_full_prompt_instead_of_closing(self):
+        state = self._open_detail()
+        assert feed.apply_key(state, "\r", 10) is feed.Action.NONE
+        assert state.detail_prompt_open is True
+        assert state.detail_entry is not None       # the command modal stays under it
+
+    def test_enter_still_closes_when_prompt_unavailable(self):
+        # The dim hint sentinel is not a prompt: Enter must not open an empty view.
+        state = self._open_detail(prompt={"unavailable": "pending ingest"})
+        assert feed.apply_key(state, "\r", 10) is feed.Action.NONE
+        assert state.detail_prompt_open is False
+        assert state.detail_entry is None
+
+    def test_esc_steps_back_to_the_command_modal(self):
+        state = self._open_detail()
+        feed.apply_key(state, "\r", 10)
+        feed.apply_key(state, "\x1b", 10)
+        assert state.detail_prompt_open is False
+        assert state.detail_entry is not None       # back one level, not closed
+
+    def test_enter_steps_back_from_the_full_prompt(self):
+        state = self._open_detail()
+        feed.apply_key(state, "\r", 10)
+        feed.apply_key(state, "\r", 10)
+        assert state.detail_prompt_open is False
+        assert state.detail_entry is not None
+
+    def test_q_closes_everything_from_the_full_prompt(self):
+        # q is the one-key exit from any depth, so a deep view is never a trap.
+        state = self._open_detail()
+        feed.apply_key(state, "\r", 10)
+        assert feed.apply_key(state, "q", 10) is feed.Action.NONE
+        assert state.detail_prompt_open is False
+        assert state.detail_entry is None
+        assert state.detail_prompt is None
+
+    def test_ctrl_c_still_quits_from_the_full_prompt(self):
+        state = self._open_detail()
+        feed.apply_key(state, "\r", 10)
+        assert feed.apply_key(state, "\x03", 10) is feed.Action.QUIT
+
+    def test_scroll_keys_move_and_never_go_negative(self):
+        state = self._open_detail()
+        feed.apply_key(state, "\r", 10)
+        feed.apply_key(state, "j", 10)
+        feed.apply_key(state, "j", 10)
+        assert state.detail_prompt_scroll == 2
+        feed.apply_key(state, "k", 10)
+        assert state.detail_prompt_scroll == 1
+        feed.apply_key(state, "k", 10)
+        feed.apply_key(state, "k", 10)
+        assert state.detail_prompt_scroll == 0      # clamped at the top
+        feed.apply_key(state, "G", 10)
+        assert state.detail_prompt_scroll == 10**9  # sentinel, clamped at render
+
+    def test_scroll_resets_when_the_view_reopens(self):
+        state = self._open_detail()
+        feed.apply_key(state, "\r", 10)
+        feed.apply_key(state, "j", 10)
+        feed.apply_key(state, "\x1b", 10)           # back to the command modal
+        feed.apply_key(state, "\r", 10)             # and in again
+        assert state.detail_prompt_scroll == 0
+
+    def test_panel_windows_the_body_and_reports_the_range(self):
+        entry = {"command": "ls", "session_id": "sid-0", "cwd": "/work",
+                 "timestamp": "2026-06-30T12:00:00+00:00"}
+        out = self._text(feed.build_prompt_panel(entry, 30, self.PROMPT, scroll=5))
+        capacity = feed._prompt_capacity(30)
+        assert "line 6" in out                       # window starts at the offset
+        assert f"6-{5 + capacity} of 40" in out
+        assert "line 1\n" not in out                 # scrolled past
+        assert "40 lines" in out
+        assert "2026-06-30 09:00:00" in out          # Sent row, offset sliced off
+
+    def test_panel_shows_whole_prompt_when_it_fits(self):
+        short = {"text": "a\nb\nc", "ts": ""}
+        out = self._text(feed.build_prompt_panel({"session_id": "s"}, 40, short))
+        assert "a" in out and "b" in out and "c" in out
+        assert "of 3" not in out                     # no range chip when unwindowed
+        assert "Sent" not in out                     # no ts, no row
+
+    def test_clamp_bounds_the_scroll_to_the_last_screenful(self):
+        capacity = feed._prompt_capacity(30)
+        assert feed._clamp_prompt_scroll(10**9, 40, 30) == 40 - capacity
+        assert feed._clamp_prompt_scroll(-5, 40, 30) == 0
+        assert feed._clamp_prompt_scroll(3, 2, 30) == 0   # fewer lines than fit
 
 
 class TestSessionModal:
@@ -2386,29 +2522,31 @@ class TestDatabaseModal:
 
 
 class TestTokenLoaders:
-    """The lazy token loaders behind the command/session modals: they guard bad
-    input (None: no Tokens row) and degrade to the `_tokens_unavailable` hint
-    sentinel when the store has no answer, never raising into the TUI loop."""
+    """The lazy store loaders behind the command/session modals: they guard bad
+    input (None: no Tokens row, no prompt panel) and degrade to the
+    `_tokens_unavailable` hint sentinel when the store has no answer, never
+    raising into the TUI loop."""
 
-    def test_command_tokens_none_entry(self):
-        assert feed._load_command_tokens(None) is None
+    def test_command_detail_none_entry(self):
+        assert feed._load_command_detail(None) == (None, None)
 
-    def test_command_tokens_missing_session_or_command(self):
-        assert feed._load_command_tokens({"command": "ls"}) is None       # no sid
-        assert feed._load_command_tokens({"session_id": "s"}) is None      # no cmd
+    def test_command_detail_missing_session_or_command(self):
+        assert feed._load_command_detail({"command": "ls"}) == (None, None)      # no sid
+        assert feed._load_command_detail({"session_id": "s"}) == (None, None)    # no cmd
 
-    def test_command_tokens_missing_store_hints_run_ingest(self, tmp_path, monkeypatch):
-        # No store file: the loader must not raise; it returns the sentinel whose
-        # hint says the store does not exist yet (the fix for the row silently
-        # vanishing and the feature looking broken). The `from claude_trail_store
-        # import STORE_PATH` inside reads the patched attribute at call time.
+    def test_command_detail_missing_store_hints_run_ingest(self, tmp_path, monkeypatch):
+        # No store file: the loader must not raise; both pieces return the
+        # sentinel whose hint says the store does not exist yet (the fix for a
+        # row silently vanishing and the feature looking broken). The `from
+        # claude_trail_store import STORE_PATH` inside reads the patched
+        # attribute at call time.
         import claude_trail_store as store
         monkeypatch.setattr(store, "STORE_PATH", tmp_path / "nope.duckdb")
         entry = {"session_id": "s", "command": "ls", "timestamp": "2026-01-01T00:00:00+00:00"}
-        assert feed._load_command_tokens(entry) == {
-            "unavailable": "no audit store yet - run: claude-trail ingest"}
+        hint = {"unavailable": "no audit store yet - run: claude-trail ingest"}
+        assert feed._load_command_detail(entry) == (hint, hint)
 
-    def test_command_tokens_store_lagging_hints_pending(self, tmp_path, monkeypatch):
+    def test_command_detail_store_lagging_hints_pending(self, tmp_path, monkeypatch):
         # Store file exists but has no matching request (the store tails
         # transcripts and lags the live feed): the hint says "pending ingest".
         import claude_trail_store as store
@@ -2417,8 +2555,50 @@ class TestTokenLoaders:
         monkeypatch.setattr(store, "STORE_PATH", db)
         monkeypatch.setattr(feed, "_with_store", lambda fn: None)
         entry = {"session_id": "s", "command": "ls", "timestamp": "2026-01-01T00:00:00+00:00"}
-        assert feed._load_command_tokens(entry) == {
-            "unavailable": "pending ingest (store lags the live feed)"}
+        hint = {"unavailable": "pending ingest (store lags the live feed)"}
+        assert feed._load_command_detail(entry) == (hint, hint)
+
+    def test_command_detail_opens_the_store_once_for_both_rows(self, tmp_path, monkeypatch):
+        # One store open serves the Tokens row and the prompt panel; a second
+        # open per modal would double the cost of every Enter.
+        import claude_trail_store as store
+        db = tmp_path / "trail.duckdb"
+        db.touch()
+        monkeypatch.setattr(store, "STORE_PATH", db)
+        opens = []
+
+        def fake_with_store(fn):
+            opens.append(fn)
+            return ({"output_tokens": 5, "calls_in_request": 1, "share": 5.0,
+                     "model": "m"}, {"text": "the ask", "ts": ""})
+
+        monkeypatch.setattr(feed, "_with_store", fake_with_store)
+        entry = {"session_id": "s", "command": "ls", "timestamp": "2026-01-01T00:00:00+00:00"}
+        tokens, prompt = feed._load_command_detail(entry)
+        assert len(opens) == 1
+        assert tokens["output_tokens"] == 5
+        assert prompt["text"] == "the ask"
+
+    def test_command_detail_passes_the_row_agent_thread(self, tmp_path, monkeypatch):
+        # A subagent row must look up ITS thread's prompt, not the parent's.
+        import claude_trail_store as store
+        db = tmp_path / "trail.duckdb"
+        db.touch()
+        monkeypatch.setattr(store, "STORE_PATH", db)
+        seen = {}
+
+        def fake_prompt_for_command(con, sid, ts=None, agent_id=None):
+            seen.update(sid=sid, ts=ts, agent_id=agent_id)
+            return {"text": "agent ask", "ts": ""}
+
+        monkeypatch.setattr(store, "prompt_for_command", fake_prompt_for_command)
+        monkeypatch.setattr(store, "command_tokens_for", lambda *a, **k: None)
+        monkeypatch.setattr(feed, "_with_store", lambda fn: fn(None))
+        entry = {"session_id": "s", "command": "ls", "agent_id": "ag1",
+                 "timestamp": "2026-01-01T00:00:00+00:00"}
+        _, prompt = feed._load_command_detail(entry)
+        assert seen == {"sid": "s", "ts": "2026-01-01T00:00:00+00:00", "agent_id": "ag1"}
+        assert prompt["text"] == "agent ask"
 
     def test_session_tokens_none_sid(self):
         assert feed._load_session_tokens(None) is None

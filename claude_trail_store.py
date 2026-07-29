@@ -178,6 +178,37 @@ def connect(read_only: bool = False):
     return con
 
 
+def is_lock_conflict(exc):
+    """True when `exc` is DuckDB refusing the store because another process holds
+    it. DuckDB's file lock is exclusive in BOTH directions: a writer cannot open
+    a reader-held store any more than the reverse, so at a short ingest cadence
+    an interactive TUI read and the timer's ingest collide routinely. It is a
+    transient, expected condition, not a fault - callers skip and retry rather
+    than crash. Matched on the message because duckdb raises a plain IOException
+    for it."""
+    msg = str(exc)
+    return "Could not set lock" in msg or "Conflicting lock" in msg
+
+
+def connect_writer(attempts=3, delay=2.0):
+    """`connect()` for the single writer, tolerating a reader holding the store.
+
+    Returns None instead of raising when every attempt hits a lock conflict: the
+    ingest is idempotent and runs on a timer, so skipping this cycle costs at
+    most one interval, while a traceback would look like a broken store in the
+    log. Any other error still propagates."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return connect()
+        except Exception as e:
+            if not is_lock_conflict(e):
+                raise
+            if attempt == attempts:
+                return None
+            time.sleep(delay)
+    return None
+
+
 _COMMAND_FIELD = {  # representative `text` per tool when there is no command
     "Bash": "command",
     "Read": "file_path", "Edit": "file_path", "Write": "file_path",
@@ -481,6 +512,42 @@ def _table_counts(con):
         "WHERE table_schema='main'").fetchall()}
     return {t: con.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
             for t in _INGEST_COUNT_TABLES if t in present}
+
+
+# A CHECKPOINT on a multi-GB store takes seconds (~3.5s at 1 GB) and runs while
+# the write lock is held, which no reader can share: a read-only open fails
+# outright against a held lock, so every second of it is a second the TUI's
+# Tokens / prompt / database reads degrade to their "pending ingest" hint. At a
+# 30s ingest cadence that window dominates. So flush on a schedule instead of
+# after every sweep: the WAL is durable (an unflushed store replays it on the
+# next open) and DuckDB auto-checkpoints on its own WAL-size threshold, so a
+# skipped flush costs a slightly larger `.wal`, never data.
+CHECKPOINT_MIN_INTERVAL = 300.0  # seconds between ingest-driven flushes
+
+
+def _checkpoint_stamp():
+    """Marker whose mtime is the last ingest-driven CHECKPOINT (per store)."""
+    return Path(str(STORE_PATH) + ".checkpoint-stamp")
+
+
+def _checkpoint_due(stored_anything, force=False):
+    """`(should_flush, reason)` for the end-of-run CHECKPOINT.
+
+    `force` covers the two runs that must land on a flushed store: `--compact`
+    (a full rewrite follows) and `--watch` (its one flush is at shutdown). A
+    sweep that stored nothing has nothing to flush, so it never pays the lock.
+    """
+    if force:
+        return True, "forced"
+    if not stored_anything:
+        return False, "nothing stored"
+    try:
+        age = time.time() - _checkpoint_stamp().stat().st_mtime
+    except OSError:
+        return True, "no flush recorded yet"
+    if age >= CHECKPOINT_MIN_INTERVAL:
+        return True, f"{age:.0f}s since last flush"
+    return False, f"last flush {age:.0f}s ago (min {CHECKPOINT_MIN_INTERVAL:.0f}s)"
 
 
 def _store_size():
@@ -1379,7 +1446,13 @@ def cmd_ingest(argv):
     if "--compact" in argv and watch:
         _log("note: --compact is ignored with --watch (never compact inside the poll loop)")
     interval = 5.0
-    con = connect()
+    con = connect_writer()
+    if con is None:
+        # A reader (the TUI's Tokens/prompt/database lookups, or an ad-hoc
+        # query) holds the store. Idempotent + on a timer, so skipping is right;
+        # exit 0 so systemd does not record a routine collision as a failure.
+        _log("skipped: store is held by a reader; the next run catches up")
+        return 0
     mode = "watch" if watch else ("file-history-only" if fh_only else "one-shot")
     # The live bar needs a tty; off a tty (cron/pipe) it is disabled and the
     # per-file verbose logs (safe with no bar to corrupt) carry the detail.
@@ -1387,6 +1460,7 @@ def cmd_ingest(argv):
     file_verbose = verbose and not bar_enabled
     _log(f"ingest start: {STORE_PATH} (mode {mode})")
     sweep = 0
+    stored_anything = False   # drives the end-of-run CHECKPOINT (see _checkpoint_due)
     try:
         while True:
             sweep += 1
@@ -1409,6 +1483,7 @@ def cmd_ingest(argv):
                 t_fh = time.monotonic() - s
             after = _table_counts(con)
             delta = {k: after.get(k, 0) - before.get(k, 0) for k in after}
+            stored_anything = stored_anything or any(delta.values())
             elapsed = time.monotonic() - t0
             # Under --watch, stay quiet on an idle sweep (nothing new) so the poll
             # loop does not spam; always report a changed sweep and any one-shot run.
@@ -1425,12 +1500,23 @@ def cmd_ingest(argv):
             time.sleep(interval)
     finally:
         # Flush the WAL into the main file on exit (one-shot end, or --watch
-        # shutdown), never per-iteration. Note: CHECKPOINT does NOT reclaim
-        # DuckDB's interspersed free blocks, so the file stays ~2x its packed
-        # size after a bulk ingest; the full rewrite that does reclaim them is
-        # compact_db(), run below (non-watch only) after the write lock is freed.
-        _log("checkpoint: flushing WAL to disk")
-        con.execute("CHECKPOINT")
+        # shutdown), never per-iteration, and only when it is due: at a short
+        # ingest cadence the flush is the bulk of the write-lock window every
+        # reader collides with (see _checkpoint_due). Note: CHECKPOINT does NOT
+        # reclaim DuckDB's interspersed free blocks, so the file stays ~2x its
+        # packed size after a bulk ingest; the full rewrite that does reclaim
+        # them is compact_db(), run below (non-watch only) after the write lock
+        # is freed - which is why --compact forces the flush first.
+        due, why = _checkpoint_due(stored_anything, force=compact or watch)
+        if due:
+            _log(f"checkpoint: flushing WAL to disk ({why})")
+            con.execute("CHECKPOINT")
+            try:
+                _checkpoint_stamp().touch()
+            except OSError:
+                pass   # a stamp we cannot write just means the next run flushes
+        else:
+            _log(f"checkpoint: skipped ({why})")
         con.close()
     if compact:  # after con.close(), so the store file is unlocked for the rewrite
         old, new = compact_db()
@@ -1682,6 +1768,85 @@ def command_tokens_for(con, session_id, command, ts=None):
     }
 
 
+# A user turn's stored text can carry wrappers Claude Code injected around what
+# the user actually typed. `<system-reminder>` blocks are context the harness
+# adds, not prompt, so they are stripped for display. Slash-command blocks
+# (`<command-name>` ...) are NOT stripped: invoking a command IS what the user
+# did, so hiding it would misreport the turn.
+_SYSTEM_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+# Turns the harness generated rather than the user: a subagent finishing, the
+# framing around a local command, output echoed back, an interrupt marker. They
+# are skipped so a command reports the instruction a human actually gave. What a
+# human authored or invoked is kept, including slash commands (`<command-name>`)
+# and `!` bash-mode input (`<bash-input>`): running one IS the user's turn.
+_AUTO_TURN_RE = re.compile(
+    r"^(\[Request interrupted|<task-notification>|<local-command-caveat>"
+    r"|<local-command-stdout>|<bash-stdout>)")
+# User turns examined per lookup, newest-first: enough to step over a run of
+# auto-turns (several parallel subagents can finish back to back) without
+# scanning the whole session.
+PROMPT_LOOKBACK_TURNS = 16
+
+
+def clean_prompt_text(text):
+    """A user turn's text with the harness-injected wrappers removed (see
+    `_SYSTEM_REMINDER_RE`). Returns "" for a turn that was nothing else."""
+    if not text:
+        return ""
+    return _SYSTEM_REMINDER_RE.sub("", text).strip()
+
+
+def prompt_for_command(con, session_id, ts=None, agent_id=None):
+    """The prompt that led to a command: the newest `user` turn at or before `ts`
+    in the same (session, agent) thread. Used by the TUI command-detail modal.
+
+    One rule covers both cases the modal shows. For a main-agent row
+    (``agent_id`` None) the match is the user turn that triggered the command;
+    for a subagent row it is that subagent's own turn, which on its first turn is
+    the task prompt it was spawned with (a subagent transcript opens with the
+    spawn prompt as a user message). Threads are kept apart so a subagent's
+    command never reports the parent's turn, and vice versa. Harness-generated
+    turns (`_AUTO_TURN_RE`) are stepped over, so the answer is the last thing a
+    human actually asked rather than a task-notification blob.
+
+    Matching needs only what the live hook entry already carries
+    ``(session_id, ts, agent_id)``, not the command's own `tool_use` row, so it
+    still answers while ingest lags on the command itself. Returns
+    ``{"text", "ts"}`` (text cleaned by `clean_prompt_text`, ts as a string so no
+    `pytz` is needed to materialize it) or None when the thread has no prompt
+    turn yet. Read-only; never raises for a caller that already guarded the
+    connection.
+    """
+    if not session_id:
+        return None
+    where = ["e.type = 'user'", "e.session_id = ?"]
+    params = [session_id]
+    # Bind the thread explicitly rather than `IS NOT DISTINCT FROM ?`: a NULL
+    # parameter has no inferable type in a prepared statement.
+    if agent_id:
+        where.append("e.agent_id = ?")
+        params.append(agent_id)
+    else:
+        where.append("e.agent_id IS NULL")
+    if ts:
+        # try_cast so a malformed hook timestamp degrades to "newest turn in the
+        # thread" instead of comparing against NULL and matching nothing.
+        where.append("(try_cast(? AS TIMESTAMPTZ) IS NULL"
+                     " OR e.ts <= try_cast(? AS TIMESTAMPTZ))")
+        params += [ts, ts]
+    rows = con.execute(
+        f"""SELECT e.ts::VARCHAR, e.text FROM events e
+            WHERE {' AND '.join(where)}
+            ORDER BY e.ts DESC LIMIT {PROMPT_LOOKBACK_TURNS}""",
+        params,
+    ).fetchall()
+    for row_ts, text in rows:
+        cleaned = clean_prompt_text(text)
+        if cleaned and not _AUTO_TURN_RE.match(cleaned):
+            return {"text": cleaned, "ts": row_ts or ""}
+    return None
+
+
 def session_token_totals(con, session_id):
     """Exact per-session token totals from the `session_tokens` view (subagent
     spend included, since subagent transcripts ingest under the parent sessionId).
@@ -1925,6 +2090,18 @@ def cmd_diff(argv):
 
 def cli_main(argv):
     cmd = argv[0]
-    return {"ingest": cmd_ingest, "search": cmd_search, "stats": cmd_stats,
-            "tokens": cmd_tokens, "cat": cmd_cat, "diff": cmd_diff,
-            "reset-db": cmd_reset_db, "prune-raw": cmd_prune_raw}[cmd](argv)
+    fn = {"ingest": cmd_ingest, "search": cmd_search, "stats": cmd_stats,
+          "tokens": cmd_tokens, "cat": cmd_cat, "diff": cmd_diff,
+          "reset-db": cmd_reset_db, "prune-raw": cmd_prune_raw}[cmd]
+    try:
+        return fn(argv)
+    except Exception as e:
+        # The ingest holds the store for its run, and DuckDB's lock excludes
+        # readers outright. With an ingest every 30s a read command lands on one
+        # often enough that a raw traceback would read as a broken store; say
+        # what happened and let the caller retry. Non-lock errors still raise.
+        if not is_lock_conflict(e):
+            raise
+        print(f"store busy: an ingest is writing {STORE_PATH}; try again in a moment",
+              file=sys.stderr)
+        return 1

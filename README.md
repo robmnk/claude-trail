@@ -7,6 +7,7 @@ Observability tool for Claude Code: a real-time TUI dashboard that shows every B
 - **Live command trail** - watches all Claude Code Bash tool calls in real-time
 - **Multi-session aware** - tracks commands across concurrent sessions with color-coded IDs
 - **Dangerous command highlighting** - flags risky operations (`rm`, `sudo`, `git reset`, etc.) with red markers
+- **Prompt behind each command** - the detail view shows the turn that led to the command (the user's ask for a main-agent row, the subagent's own task prompt for an agent row); `Enter` opens it in full
 - **Subagent attribution** - tags each command with the subagent that ran it and draws a tree gutter attributing rows to subagent runs; `s` opens a per-session modal listing every subagent with live status
 - **Active session indicator** - shows how many sessions have been active in the last 5 minutes
 - **Minimal footprint** - single Python file, one dependency (`rich`)
@@ -71,10 +72,10 @@ python3 claude_trail.py   # if running from a clone
 |-----|--------|
 | `j` / `k` or `↓` / `↑` | Move cursor down / up |
 | `g` / `G` | Jump to top / bottom |
-| `Enter` | Open the full-command detail view for the selected command |
+| `Enter` | Open the full-command detail view for the selected command: the whole command, its token cost, and the first 10 lines of the prompt that led to it. `Enter` again opens the full prompt (`j` / `k` / `g` / `G` to scroll, `Esc` back to the command, `q` to close) |
 | `s` | Open the session-detail modal for the selected row's session (identity header + subagent list with live status) |
 | `d` | Open the audit-store database modal: connection string, DuckDB / schema version, on-disk sizes, block accounting, and per-table row counts (opens the DuckDB store read-only, on demand) |
-| `Esc` | Close the open modal (command detail, session detail, or database) (also `q` or `Enter` while it is open) |
+| `Esc` | Close the open modal (command detail, session detail, or database) (also `q` or `Enter` while it is open; in the full-prompt view `Esc` / `Enter` step back one level and `q` closes outright) |
 | `o` | Open the selected session's commands (pretty-printed, filtered to the session) in `$VISUAL` / `$EDITOR`, else the platform launcher (`xdg-open` on Linux, `open` on macOS) |
 | `t` | Open a pretty-printed copy of the selected session's transcript (`<sid>.jsonl`) in `$VISUAL` / `$EDITOR`, else the platform launcher |
 | `f` | Open the file manager on the folder of files referenced in the selected command |

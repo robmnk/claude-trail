@@ -106,7 +106,15 @@ SEARCH_CHROME_ROWS = 11
 # regardless of which optional meta rows are present (a few rows go unused when
 # they are absent, same trade-off SEARCH_CHROME_ROWS accepts).
 SESSION_CHROME_ROWS = 17
+# Same idea for the full-prompt view drilled into from the command modal:
+# 2 outer borders + 2 outer padding + 3 max meta rows + 1 blank + 1 header row +
+# the body panel's own 2 borders + 2 padding. Prompt lines wrap, so a windowful
+# can still outgrow its rows; the crop then eats body lines, never the header.
+PROMPT_CHROME_ROWS = 14
 MIN_VISIBLE_ROWS = 3
+# Lines of the triggering prompt shown in the command modal before it says how
+# many are hidden; `Enter` opens the rest in the scrollable full-prompt view.
+PROMPT_PREVIEW_LINES = 10
 SESSION_NAME_CACHE_TTL = 2.0  # seconds
 SESSION_COLOR_CACHE_TTL = 5.0  # seconds
 AGENT_LABEL_CACHE_TTL = 2.0  # seconds
@@ -1200,6 +1208,47 @@ def _format_command_tokens(tokens: dict) -> Text:
     return text
 
 
+def _prompt_lines(prompt: dict | None) -> list[str]:
+    """The prompt's text as display lines ([] when there is nothing to show)."""
+    if not prompt or "unavailable" in prompt:
+        return []
+    return (prompt.get("text") or "").splitlines()
+
+
+def _prompt_preview(prompt: dict, limit: int = PROMPT_PREVIEW_LINES) -> tuple[list[str], int]:
+    """`(first `limit` lines, how many were left out)` for the command modal's
+    prompt panel. The remainder is reachable with Enter, so the count is shown
+    rather than dropped silently."""
+    lines = _prompt_lines(prompt)
+    return lines[:limit], max(0, len(lines) - limit)
+
+
+def _build_prompt_preview(prompt: dict) -> Panel:
+    """The command modal's `prompt` panel: the opening PROMPT_PREVIEW_LINES lines
+    of the turn that led to this command, with a dim footer counting the hidden
+    lines. The `_tokens_unavailable` sentinel renders as its dim hint instead,
+    so a lagging store explains itself rather than showing an empty box."""
+    if "unavailable" in prompt:
+        body: Text | Group = Text(prompt["unavailable"], style="dim italic")
+    else:
+        lines, hidden = _prompt_preview(prompt)
+        text = Text("\n".join(lines)) if lines else Text("(empty)", style="dim italic")
+        if hidden:
+            plural = "" if hidden == 1 else "s"
+            body = Group(text, Text(""), Text.from_markup(
+                f"[dim italic]+{hidden} more line{plural}  ·  ↵ : full prompt[/dim italic]"))
+        else:
+            body = text
+    return Panel(
+        body,
+        title="[dim]prompt[/dim]",
+        title_align="left",
+        border_style="grey50",
+        box=box.ROUNDED,
+        padding=(1, 2),
+    )
+
+
 def build_detail_panel(
     entry: LogEntry,
     term_height: int,
@@ -1207,6 +1256,7 @@ def build_detail_panel(
     color_map: dict[str, str] | None = None,
     agent_map: dict[str, dict] | None = None,
     tokens: dict | None = None,
+    prompt: dict | None = None,
 ) -> Panel:
     """Full-screen view of a single command: metadata header plus the complete,
     untruncated command text (newlines preserved).
@@ -1214,7 +1264,11 @@ def build_detail_panel(
     `tokens` (loaded on Enter via the audit store) adds a Tokens row with the
     command's generation cost, or a dim "pending ingest" / "no audit store"
     hint (the `_tokens_unavailable` sentinel) when the store has no matching
-    request yet; the row is absent only when `tokens` is None."""
+    request yet; the row is absent only when `tokens` is None.
+
+    `prompt` (loaded in the same store open) adds a `prompt` panel under the
+    command showing the first PROMPT_PREVIEW_LINES lines of the turn that led to
+    it; Enter then opens the whole thing (`build_prompt_panel`)."""
     cmd = entry.get("command", "")
     ctx = RenderCtx(name_map=name_map, color_map=color_map)
 
@@ -1247,12 +1301,105 @@ def build_detail_panel(
         padding=(1, 2),
     )
 
-    hint = Text.from_markup("[dim italic]esc / q / ↵ : back[/dim italic]")
-    body = Group(meta, Text(""), cmd_panel, Text(""), hint)
+    parts = [meta, Text(""), cmd_panel]
+    if prompt:
+        parts += [Text(""), _build_prompt_preview(prompt)]
+    # Enter drills into the full prompt when there is one, so it only doubles as
+    # "back" when there is nothing to open.
+    keys = ("esc / q : back    ↵ : full prompt" if _prompt_lines(prompt)
+            else "esc / q / ↵ : back")
+    parts += [Text(""), Text.from_markup(f"[dim italic]{keys}[/dim italic]")]
+    body = Group(*parts)
 
     return Panel(
         body,
         title=_panel_title("· command"),
+        subtitle=f"[dim]{LOG_PATH}[/dim]",
+        box=box.ROUNDED,
+        padding=(1, 2),
+        height=term_height,
+    )
+
+
+def _prompt_capacity(term_height: int) -> int:
+    """Prompt lines that fit in the full-prompt view once its chrome is
+    accounted for (mirrors `_session_capacity`)."""
+    return max(term_height - PROMPT_CHROME_ROWS, MIN_VISIBLE_ROWS)
+
+
+def _clamp_prompt_scroll(scroll: int, line_count: int, term_height: int) -> int:
+    """Clamp a full-prompt scroll offset to `[0, line_count - capacity]`.
+
+    Shared by `build_prompt_panel` (display safety) and `render_panel`, which
+    writes the clamped value back so `G`'s sentinel settles on the true bottom
+    and `k` then steps up one line at a time (same contract as
+    `_clamp_session_scroll`)."""
+    capacity = _prompt_capacity(term_height)
+    return max(0, min(scroll, max(0, line_count - capacity)))
+
+
+def build_prompt_panel(
+    entry: LogEntry,
+    term_height: int,
+    prompt: dict,
+    name_map: dict[str, str] | None = None,
+    color_map: dict[str, str] | None = None,
+    agent_map: dict[str, dict] | None = None,
+    scroll: int = 0,
+) -> Panel:
+    """Full-screen view of the whole prompt behind a command (Enter from the
+    command modal).
+
+    A prompt runs to thousands of characters, so the body is windowed around
+    `scroll` (j/k/g/G) exactly like the session modal's subagent list rather than
+    being cropped by the panel height. The header keeps the row's identity
+    (session, subagent, prompt time) visible so it is clear WHICH turn this is.
+    """
+    ctx = RenderCtx(name_map=name_map, color_map=color_map)
+    lines = _prompt_lines(prompt)
+
+    meta = Table.grid(padding=(0, 2))
+    meta.add_column(style="dim", justify="right", no_wrap=True)
+    meta.add_column(ratio=1)
+    meta.add_row("Session", _render_session(entry, ctx))
+    label = agent_label(entry, agent_map or {})
+    if label is not None:
+        meta.add_row("Agent", Text(label, style=AGENT_STYLE))
+    # The store hands back its own timestamp string; slice off the sub-second and
+    # offset tail rather than parsing it (no fromisoformat, no pytz).
+    when = (prompt.get("ts") or "")[:19]
+    if when:
+        meta.add_row("Sent", when)
+
+    n = len(lines)
+    scroll = _clamp_prompt_scroll(scroll, n, term_height)
+    win_start = scroll
+    win_end = min(n, scroll + _prompt_capacity(term_height))
+
+    # The keys live in the header, not under the body: prompt lines wrap, so a
+    # windowful can outgrow its rows and a footer hint would be the first thing
+    # the panel's height crop ate - exactly when the reader needs the way out.
+    header = Text.from_markup(
+        f"[bold]Prompt[/bold] [dim]({n} line{'' if n == 1 else 's'})[/dim]")
+    if (win_start, win_end) != (0, n):
+        header.append(f"  {win_start + 1}-{win_end} of {n}", style="dim")
+    header.append("    esc / ↵ : back    q : close    j/k g/G : scroll",
+                  style="dim italic")
+
+    body = (Text("\n".join(lines[win_start:win_end])) if lines
+            else Text("(empty)", style="dim italic"))
+    prompt_panel = Panel(
+        body,
+        title="[dim]prompt[/dim]",
+        title_align="left",
+        border_style="grey50",
+        box=box.ROUNDED,
+        padding=(1, 2),
+    )
+
+    return Panel(
+        Group(meta, Text(""), header, prompt_panel),
+        title=_panel_title("· prompt"),
         subtitle=f"[dim]{LOG_PATH}[/dim]",
         box=box.ROUNDED,
         padding=(1, 2),
@@ -1866,7 +2013,7 @@ class Action(enum.Enum):
     OPEN_MATCH = enum.auto()        # open the selected search hit at its line
     OPEN_MATCH_FOLDER = enum.auto()  # open the folder containing the selected hit
     LOAD_DB_INFO = enum.auto()      # load the audit-store properties for the `d` modal
-    OPEN_DETAIL = enum.auto()       # command modal just opened; load its token cost
+    OPEN_DETAIL = enum.auto()       # command modal just opened; load its token cost + prompt
     OPEN_SESSION_DETAIL = enum.auto()  # session modal just opened; load its token total
     NONE = enum.auto()
 
@@ -1918,6 +2065,9 @@ class AppState:
     db_info: list | None = None  # (label, value) pairs while the database modal is open
     detail_tokens: dict | None = None   # token cost for the open command modal (loaded on Enter)
     session_tokens: dict | None = None  # token total for the open session modal (loaded on `s`)
+    detail_prompt: dict | None = None   # prompt behind the open command modal (loaded on Enter)
+    detail_prompt_open: bool = False    # the nested full-prompt view is open
+    detail_prompt_scroll: int = 0       # scroll offset over the full prompt's lines
 
     def modal_open(self) -> bool:
         """True while a full-screen modal (command detail, session detail, or the
@@ -1925,6 +2075,28 @@ class AppState:
         navigation/column/clear keys are ignored (only Ctrl-C still quits)."""
         return (self.detail_entry is not None or self.session_detail is not None
                 or self.db_info is not None)
+
+    def prompt_available(self) -> bool:
+        """True when the open command modal has a real prompt to drill into.
+        The `_tokens_unavailable` sentinel is a dim hint, not a prompt, so Enter
+        keeps its old close-the-modal meaning when there is nothing to open."""
+        return bool(self.detail_prompt) and bool(_prompt_lines(self.detail_prompt))
+
+    def close_modals(self) -> None:
+        """Drop every modal's state at once, back to the table.
+
+        One place to reset keeps the modals mutually exclusive: leaving any
+        field set would render a stale panel over the feed."""
+        self.detail_entry = None
+        self.session_detail = None
+        self.session_agent_id = None
+        self.session_scroll = 0
+        self.db_info = None
+        self.detail_tokens = None
+        self.session_tokens = None
+        self.detail_prompt = None
+        self.detail_prompt_open = False
+        self.detail_prompt_scroll = 0
 
     def selected_entry(self) -> LogEntry | None:
         """The entry the cursor points at in the newest-first view, or None."""
@@ -2052,18 +2224,36 @@ def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
         return _apply_search_key(state, state.search, ch)
     if state.modal_open():
         # Modal view (command detail or session detail): esc / q / enter return
-        # to the table; Ctrl-C still quits. Clearing both fields keeps the two
-        # modals mutually exclusive.
+        # to the table; Ctrl-C still quits. close_modals() clears every modal
+        # field, which keeps them mutually exclusive.
         if ch == "\x03":
             return Action.QUIT
+        if state.detail_prompt_open:
+            # The full-prompt view (drilled into from the command modal) owns its
+            # keys: esc / enter step back one level to the command, `q` still
+            # closes everything in one key, and j/k/g/G scroll the prompt body.
+            if ch in ("\x1b", "\r", "\n"):
+                state.detail_prompt_open = False
+                state.detail_prompt_scroll = 0
+            elif ch == "q":
+                state.close_modals()
+            elif ch in ("j", "down"):
+                state.detail_prompt_scroll += 1
+            elif ch in ("k", "up"):
+                state.detail_prompt_scroll = max(0, state.detail_prompt_scroll - 1)
+            elif ch == "g":
+                state.detail_prompt_scroll = 0
+            elif ch == "G":
+                state.detail_prompt_scroll = 10**9  # clamped in build_prompt_panel
+            return Action.NONE
+        if ch in ("\r", "\n") and state.detail_entry is not None and state.prompt_available():
+            # Enter on a command modal that HAS a prompt opens it in full instead
+            # of closing; with no prompt to open it keeps the old one-key exit.
+            state.detail_prompt_open = True
+            state.detail_prompt_scroll = 0
+            return Action.NONE
         if ch in ("\x1b", "q", "\r", "\n"):
-            state.detail_entry = None
-            state.session_detail = None
-            state.session_agent_id = None
-            state.session_scroll = 0
-            state.db_info = None
-            state.detail_tokens = None
-            state.session_tokens = None
+            state.close_modals()
             return Action.NONE
         # In the session modal only, the nav keys scroll the subagent list
         # instead of being swallowed. G's sentinel and every offset are clamped
@@ -2099,8 +2289,8 @@ def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
     elif ch.isdigit() and int(ch) in state.visible_cols:
         state.toggle_col(int(ch))
     elif ch in ("\r", "\n"):
-        # Open the command-detail modal; main() loads its token cost (OPEN_DETAIL)
-        # so apply_key stays pure and never touches duckdb itself.
+        # Open the command-detail modal; main() loads its token cost and prompt
+        # (OPEN_DETAIL) so apply_key stays pure and never touches duckdb itself.
         state.detail_entry = state.selected_entry()
         return Action.OPEN_DETAIL
     elif ch == "s":
@@ -2199,10 +2389,11 @@ def _with_store(fn):
 
 
 def _tokens_unavailable() -> dict:
-    """Sentinel Tokens value for when the store has no answer: says WHY the
-    number is missing instead of silently omitting the row, which reads as a
-    broken feature (the store tails transcripts and lags the live feed, so
-    "no data yet" is the normal state right after a command runs)."""
+    """Sentinel value for when the store has no answer (shared by the Tokens
+    rows and the prompt panel): says WHY the data is missing instead of silently
+    omitting it, which reads as a broken feature (the store tails transcripts and
+    lags the live feed, so "no data yet" is the normal state right after a
+    command runs)."""
     try:
         from claude_trail_store import STORE_PATH
         missing = not STORE_PATH.exists()
@@ -2213,24 +2404,31 @@ def _tokens_unavailable() -> dict:
     return {"unavailable": hint}
 
 
-def _load_command_tokens(entry: LogEntry | None) -> dict | None:
-    """Token cost of `entry`'s command from the audit store. Loaded once when
-    the command-detail modal opens (see Action.OPEN_DETAIL). Returns the
-    `_tokens_unavailable` sentinel (rendered as a dim hint) when the store has
-    no matching request, and None only for a row with no session/command (no
-    Tokens row at all)."""
+def _load_command_detail(entry: LogEntry | None) -> tuple[dict | None, dict | None]:
+    """`(tokens, prompt)` for `entry`'s command, in ONE read-only store open.
+
+    Loaded once when the command-detail modal opens (see Action.OPEN_DETAIL);
+    both rows come from the same connection so opening the modal costs a single
+    store open rather than one per row. Each degrades independently to the
+    `_tokens_unavailable` sentinel (rendered as a dim hint) when the store has no
+    answer; both are None only for a row with no session/command, which omits the
+    Tokens row and the prompt panel entirely."""
     if not entry:
-        return None
+        return None, None
     sid = entry.get("session_id") or ""
     cmd = entry.get("command") or ""
     if not sid or not cmd:
-        return None
+        return None, None
 
     def query(con):
-        from claude_trail_store import command_tokens_for
-        return command_tokens_for(con, sid, cmd, entry.get("timestamp"))
+        from claude_trail_store import command_tokens_for, prompt_for_command
+        return (
+            command_tokens_for(con, sid, cmd, entry.get("timestamp")),
+            prompt_for_command(con, sid, entry.get("timestamp"), entry_agent_id(entry)),
+        )
 
-    return _with_store(query) or _tokens_unavailable()
+    tokens, prompt = _with_store(query) or (None, None)
+    return (tokens or _tokens_unavailable(), prompt or _tokens_unavailable())
 
 
 def _load_session_tokens(sid: str | None) -> dict | None:
@@ -2305,9 +2503,23 @@ def main():
                 scroll=state.session_scroll,
             )
         if state.detail_entry is not None:
+            if state.detail_prompt_open and state.detail_prompt is not None:
+                # Write the clamped scroll back so `G`'s sentinel settles on the
+                # true bottom and `k` then steps up one line (same contract as
+                # the session modal's scroll).
+                state.detail_prompt_scroll = _clamp_prompt_scroll(
+                    state.detail_prompt_scroll,
+                    len(_prompt_lines(state.detail_prompt)),
+                    console.height,
+                )
+                return build_prompt_panel(
+                    state.detail_entry, console.height, state.detail_prompt,
+                    name_map, color_map, agent_map,
+                    scroll=state.detail_prompt_scroll,
+                )
             return build_detail_panel(
                 state.detail_entry, console.height, name_map, color_map, agent_map,
-                tokens=state.detail_tokens,
+                tokens=state.detail_tokens, prompt=state.detail_prompt,
             )
         if state.db_info is not None:
             return build_db_panel(state.db_info, console.height)
@@ -2445,8 +2657,8 @@ def main():
                             elif action is Action.LOAD_DB_INFO:
                                 state.db_info = _load_db_info()
                             elif action is Action.OPEN_DETAIL:
-                                state.detail_tokens = _load_command_tokens(
-                                    state.detail_entry)
+                                state.detail_tokens, state.detail_prompt = (
+                                    _load_command_detail(state.detail_entry))
                             elif action is Action.OPEN_SESSION_DETAIL:
                                 state.session_tokens = _load_session_tokens(
                                     state.session_detail)

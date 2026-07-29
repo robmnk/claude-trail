@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -786,6 +787,187 @@ def test_command_tokens_for_no_match_returns_none(tmp_path, monkeypatch):
         con.close()
 
 
+def _prompt_transcript_events(sid):
+    """A main thread whose turns exercise every prompt-lookup rule: a first user
+    prompt, a Bash tool_use after it, then a reminder-only turn, an interrupt
+    marker, and a second prompt carrying a system-reminder block, followed by a
+    second Bash tool_use."""
+    return [
+        {"type": "user", "uuid": "p-u1", "sessionId": sid,
+         "timestamp": "2026-06-30T02:00:00.000Z",
+         "message": {"role": "user", "content": "first ask\nsecond line"}},
+        {"type": "assistant", "uuid": "p-a1", "requestId": "req-P1",
+         "sessionId": sid, "timestamp": "2026-06-30T02:00:01.000Z",
+         "message": {"role": "assistant", "model": "claude-opus-4-8", "id": "msg-P1",
+                     "content": [{"type": "tool_use", "id": "toolu-p1", "name": "Bash",
+                                  "input": {"command": "echo one"}}]}},
+        {"type": "user", "uuid": "p-u2", "sessionId": sid,
+         "timestamp": "2026-06-30T02:00:02.000Z",
+         "message": {"role": "user",
+                     "content": "<system-reminder>\nbackground note\n</system-reminder>"}},
+        {"type": "user", "uuid": "p-u3", "sessionId": sid,
+         "timestamp": "2026-06-30T02:00:03.000Z",
+         "message": {"role": "user", "content": "[Request interrupted by user]"}},
+        {"type": "user", "uuid": "p-u3b", "sessionId": sid,
+         "timestamp": "2026-06-30T02:00:03.200Z",
+         "message": {"role": "user",
+                     "content": "<task-notification>agent bp8 done</task-notification>"}},
+        {"type": "user", "uuid": "p-u3c", "sessionId": sid,
+         "timestamp": "2026-06-30T02:00:03.400Z",
+         "message": {"role": "user",
+                     "content": "<local-command-stdout>Resume cancelled</local-command-stdout>"}},
+        {"type": "user", "uuid": "p-u4", "sessionId": sid,
+         "timestamp": "2026-06-30T02:00:04.000Z",
+         "message": {"role": "user",
+                     "content": "second ask<system-reminder>noise</system-reminder>"}},
+        {"type": "assistant", "uuid": "p-a2", "requestId": "req-P2",
+         "sessionId": sid, "timestamp": "2026-06-30T02:00:05.000Z",
+         "message": {"role": "assistant", "model": "claude-opus-4-8", "id": "msg-P2",
+                     "content": [{"type": "tool_use", "id": "toolu-p2", "name": "Bash",
+                                  "input": {"command": "echo two"}}]}},
+    ]
+
+
+def _build_prompt_store(tmp_path, monkeypatch, sid="sess-prompt-01"):
+    """Ingest `_prompt_transcript_events` plus a subagent transcript whose first
+    user turn is the task prompt it was spawned with."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", _prompt_transcript_events(sid))
+    _write_jsonl(
+        projects / "-fake-proj" / sid / "subagents" / "agent-ag1.jsonl",
+        [{"type": "user", "uuid": "s-u1", "sessionId": sid,
+          "timestamp": "2026-06-30T02:00:06.000Z",
+          "message": {"role": "user", "content": "task prompt for the subagent"}},
+         {"type": "assistant", "uuid": "s-a1", "requestId": "req-S1", "sessionId": sid,
+          "timestamp": "2026-06-30T02:00:07.000Z",
+          "message": {"role": "assistant", "model": "claude-opus-4-8", "id": "msg-S1",
+                      "content": [{"type": "tool_use", "id": "toolu-s1", "name": "Bash",
+                                   "input": {"command": "echo agent"}}]}}],
+    )
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+    finally:
+        con.close()
+    return sid
+
+
+def test_prompt_for_command_picks_turn_before_the_command(tmp_path, monkeypatch):
+    """The prompt for a command is the newest user turn at or before its
+    timestamp: the first Bash call reports the first ask, the second reports the
+    later one (not the first)."""
+    sid = _build_prompt_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        first = store.prompt_for_command(con, sid, ts="2026-06-30T02:00:01.000Z")
+        second = store.prompt_for_command(con, sid, ts="2026-06-30T02:00:05.000Z")
+    finally:
+        con.close()
+    assert first["text"] == "first ask\nsecond line"
+    # ts::VARCHAR renders a TIMESTAMPTZ in the machine's local tz, so the UTC
+    # 02:00 fixture lands on 2026-06-29 or -30: assert the tz-stable year-month.
+    assert first["ts"].startswith("2026-06")
+    assert second["text"] == "second ask"
+
+
+def test_prompt_for_command_skips_harness_generated_turns(tmp_path, monkeypatch):
+    """A reminder-only turn, an interrupt marker, a task-notification and a
+    local-command stdout are all harness plumbing, not prompts: a lookup landing
+    on them steps back to the last thing the user actually asked."""
+    sid = _build_prompt_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        # ts sits after all four auto-turns but before the second ask
+        p = store.prompt_for_command(con, sid, ts="2026-06-30T02:00:03.500Z")
+    finally:
+        con.close()
+    assert p["text"] == "first ask\nsecond line"
+
+
+def test_prompt_for_command_keeps_user_invoked_commands(tmp_path, monkeypatch):
+    """Running a slash command or a `!` bash line IS the user's turn, so those
+    are shown rather than skipped like the harness's own turns."""
+    sid = "sess-prompt-cmd"
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", [
+        {"type": "user", "uuid": "c-u1", "sessionId": sid,
+         "timestamp": "2026-06-30T02:00:00.000Z",
+         "message": {"role": "user", "content": "an older ask"}},
+        {"type": "user", "uuid": "c-u2", "sessionId": sid,
+         "timestamp": "2026-06-30T02:00:01.000Z",
+         "message": {"role": "user",
+                     "content": "<command-name>/resume</command-name>"}},
+    ])
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+    finally:
+        con.close()
+    con = store.connect(read_only=True)
+    try:
+        p = store.prompt_for_command(con, sid, ts="2026-06-30T02:00:02.000Z")
+    finally:
+        con.close()
+    assert p["text"] == "<command-name>/resume</command-name>"
+
+
+def test_prompt_for_command_separates_agent_threads(tmp_path, monkeypatch):
+    """A subagent's command reports that subagent's own turn (its task prompt),
+    and the main thread never reports a subagent turn."""
+    sid = _build_prompt_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        agent = store.prompt_for_command(
+            con, sid, ts="2026-06-30T02:00:07.000Z", agent_id="ag1")
+        main = store.prompt_for_command(con, sid, ts="2026-06-30T02:00:07.000Z")
+    finally:
+        con.close()
+    assert agent["text"] == "task prompt for the subagent"
+    assert main["text"] == "second ask"   # the subagent turn is not visible here
+
+
+def test_prompt_for_command_no_match_returns_none(tmp_path, monkeypatch):
+    """No session, an unknown session, an unknown agent thread, or a timestamp
+    before the first turn all yield None (the TUI then shows its dim hint)."""
+    sid = _build_prompt_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        assert store.prompt_for_command(con, "") is None
+        assert store.prompt_for_command(con, "no-such-session") is None
+        assert store.prompt_for_command(con, sid, agent_id="no-such-agent") is None
+        assert store.prompt_for_command(con, sid, ts="2020-01-01T00:00:00.000Z") is None
+    finally:
+        con.close()
+
+
+def test_prompt_for_command_malformed_ts_falls_back_to_newest(tmp_path, monkeypatch):
+    """A hook timestamp that will not cast degrades to the newest turn in the
+    thread rather than comparing against NULL and matching nothing."""
+    sid = _build_prompt_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        p = store.prompt_for_command(con, sid, ts="not-a-timestamp")
+    finally:
+        con.close()
+    assert p["text"] == "second ask"
+
+
+def test_clean_prompt_text_strips_reminders_but_keeps_commands():
+    """Reminder blocks are harness context and go; a slash-command block is what
+    the user actually did and stays."""
+    assert store.clean_prompt_text(
+        "hello <system-reminder>x</system-reminder>world") == "hello world"
+    assert store.clean_prompt_text("<system-reminder>only</system-reminder>") == ""
+    assert store.clean_prompt_text("") == ""
+    assert store.clean_prompt_text(None) == ""
+    cmd = "<command-name>/resume</command-name>"
+    assert store.clean_prompt_text(cmd) == cmd
+
+
 def test_session_token_totals(tmp_path, monkeypatch):
     """session_token_totals returns the exact per-session totals (one request:
     50 out / 100 in / 200 cache-read / 30 cache-create, no subagent spend)."""
@@ -808,6 +990,125 @@ def test_session_token_totals_no_match_returns_none(tmp_path, monkeypatch):
         assert store.session_token_totals(con, "") is None
     finally:
         con.close()
+
+
+def test_checkpoint_due_skips_when_nothing_stored(tmp_path, monkeypatch):
+    """An idle sweep has nothing to flush, so it never pays the write-lock cost
+    of a CHECKPOINT."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    due, why = store._checkpoint_due(False)
+    assert due is False
+    assert "nothing stored" in why
+
+
+def test_checkpoint_due_flushes_when_no_stamp_yet(tmp_path, monkeypatch):
+    """First run after a fresh store (no stamp): flush, so the WAL is not carried
+    indefinitely."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    due, why = store._checkpoint_due(True)
+    assert due is True
+    assert "no flush recorded yet" in why
+
+
+def test_checkpoint_due_throttles_on_a_fresh_stamp(tmp_path, monkeypatch):
+    """A flush minutes ago means this run skips: at a 30s cadence the flush, not
+    the sweep, is what holds the lock against readers."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    store._checkpoint_stamp().touch()
+    due, why = store._checkpoint_due(True)
+    assert due is False
+    assert "min 300s" in why
+
+
+def test_checkpoint_due_flushes_once_the_interval_passes(tmp_path, monkeypatch):
+    """An old stamp lets the next storing run flush again."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    stamp = store._checkpoint_stamp()
+    stamp.touch()
+    old = time.time() - store.CHECKPOINT_MIN_INTERVAL - 60
+    os.utime(stamp, (old, old))
+    due, why = store._checkpoint_due(True)
+    assert due is True
+    assert "since last flush" in why
+
+
+def test_checkpoint_due_force_overrides_every_skip(tmp_path, monkeypatch):
+    """--compact (a rewrite follows) and --watch (its one flush is at shutdown)
+    must land on a flushed store, even on an idle sweep with a fresh stamp."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    store._checkpoint_stamp().touch()
+    assert store._checkpoint_due(False, force=True) == (True, "forced")
+
+
+def test_ingest_skips_the_checkpoint_on_an_idle_rerun(tmp_path, monkeypatch, capsys):
+    """End to end: the first ingest stores rows and flushes; an immediate re-run
+    has nothing new, so it reports a skipped checkpoint instead of taking the
+    multi-second lock again."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    sid = "sess-ckpt-0001"
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", _main_transcript_events(sid))
+
+    assert store.cmd_ingest(["ingest"]) == 0
+    first = capsys.readouterr().out
+    assert "checkpoint: flushing WAL to disk" in first
+    assert store.cmd_ingest(["ingest"]) == 0
+    second = capsys.readouterr().out
+    assert "checkpoint: skipped (nothing stored)" in second
+
+
+def test_is_lock_conflict_matches_duckdb_lock_errors_only():
+    """The lock check keys off DuckDB's message; unrelated failures must still
+    surface as themselves."""
+    assert store.is_lock_conflict(Exception(
+        'IO Error: Could not set lock on file "/x/trail.duckdb": Conflicting '
+        'lock is held in /usr/bin/python3.14 (PID 264087) by user naka.'))
+    assert store.is_lock_conflict(Exception("Conflicting lock is held"))
+    assert not store.is_lock_conflict(Exception("Catalog Error: Table not found"))
+    assert not store.is_lock_conflict(ValueError("bad input"))
+
+
+def test_connect_writer_returns_none_after_retrying_a_lock_conflict(monkeypatch):
+    """A reader holding the store makes the writer give up quietly (None), after
+    retrying, instead of raising: the ingest is idempotent and runs on a timer."""
+    calls = []
+
+    def fake_connect(read_only=False):
+        calls.append(read_only)
+        raise Exception('IO Error: Could not set lock on file "x": Conflicting lock')
+
+    monkeypatch.setattr(store, "connect", fake_connect)
+    monkeypatch.setattr(store.time, "sleep", lambda s: None)
+    assert store.connect_writer(attempts=3, delay=0) is None
+    assert len(calls) == 3          # retried, not one-and-done
+
+
+def test_connect_writer_reraises_other_errors(monkeypatch):
+    def fake_connect(read_only=False):
+        raise RuntimeError("disk on fire")
+    monkeypatch.setattr(store, "connect", fake_connect)
+    with pytest.raises(RuntimeError):
+        store.connect_writer(attempts=2, delay=0)
+
+
+def test_ingest_skips_cleanly_when_a_reader_holds_the_store(monkeypatch, capsys):
+    """The whole run degrades to one log line and exit 0, so a routine collision
+    with the TUI's store reads is not recorded as a unit failure."""
+    monkeypatch.setattr(store, "connect_writer", lambda *a, **k: None)
+    assert store.cmd_ingest(["ingest"]) == 0
+    assert "skipped: store is held by a reader" in capsys.readouterr().out
+
+
+def test_cli_main_reports_a_busy_store_instead_of_a_traceback(monkeypatch, capsys):
+    """A read command that lands on the ingest's write lock explains itself and
+    exits 1; anything else still propagates."""
+    def busy(argv):
+        raise Exception('IO Error: Could not set lock on file "x": Conflicting lock')
+    monkeypatch.setitem(
+        store.cli_main.__globals__, "cmd_search", busy)
+    assert store.cli_main(["search", "anything"]) == 1
+    assert "store busy" in capsys.readouterr().err
 
 
 def test_cmd_stats_prints_counts_including_output_tokens(tmp_path, monkeypatch, capsys):

@@ -50,7 +50,12 @@ audit store fresh.
 **Store refresh (`Stop`).** Runs an incremental ingest when the main agent
 finishes a turn, so the TUI token modals (and `search`/`cat`) reflect just-run
 commands. Point it at the `claude-trail-ingest.sh` wrapper, which backgrounds a
-**singleton, timed, logged** ingest and folds in periodic compaction:
+**singleton, timed, logged** ingest and folds in periodic compaction.
+
+> The Stop hook only fires **between** turns, so during a long turn the store
+> falls minutes behind (measured: a 13m gap on one turn, and 3m24s of live lag
+> mid-turn). A systemd user timer runs the same wrapper every 30s to cover the
+> inside of a turn - see [Ingest cadence](#ingest-cadence).
 
 ```json
 {
@@ -71,17 +76,70 @@ The wrapper is `setsid sh -c "flock -n LOCK timeout 300 claude-trail ingest [--c
   every future update;
 - `>> LOG` (`<store>.ingest.log`, tail-capped) makes a crash/hang **visible**
   instead of vanishing into `/dev/null`;
-- every 2h it adds `--compact` (marker-gated on `<store>.compact-stamp`; the
+- every 1h it adds `--compact` (marker-gated on `<store>.compact-stamp`; the
   stamp is touched inside the flock, only when the compacting run actually
   starts, so a lock-busy skip is not recorded as a compaction). Each
   `CHECKPOINT` re-expands the file to ~2x its packed size, so the store
   steady-states around 2x; compaction (an atomic `os.replace` rewrite) packs it
   back. Bloat is bounded, not unbounded.
+- `--foreground` (or `CLAUDE_TRAIL_INGEST_FG=1`) skips the `setsid`/`&` and runs
+  the ingest inline. The systemd timer needs this: under `Type=oneshot` systemd
+  tears the cgroup down when the main process exits, which would kill a
+  backgrounded ingest mid-run. It exits 0 even on a `flock` skip, so a busy lock
+  is never reported as a unit failure.
 
 `claude-trail ingest --detach` is the minimal, portable equivalent (it does its
 own `fork`/`flock`, needing no `setsid`/`flock`/`timeout` binaries) and appends
 its output to the same `<store>.ingest.log`; the wrapper still adds the hang
 `timeout` and the log tail-capping, so prefer it where those binaries exist.
+
+### Ingest cadence
+
+Two triggers drive the same wrapper, and the `flock` singleton keeps them from
+overlapping:
+
+| Trigger | Covers |
+|---------|--------|
+| `Stop` hook | the moment a turn ends (immediate refresh) |
+| `claude-trail-ingest.timer` (30s) | the **inside** of a long turn, where the Stop hook alone left the store minutes stale |
+
+The units are `~/.config/systemd/user/claude-trail-ingest.{service,timer}`
+(`OnUnitActiveSec=30s`, `AccuracySec=1s`, `Nice=10`, `IOSchedulingClass=idle`).
+
+**Why not `ingest --watch`.** It opens one read-write connection and holds it for
+its whole life, and DuckDB does not let a reader share a held write lock: another
+process opening the store read-only fails outright (`IO Error: Could not set lock
+on file ... Conflicting lock is held`). A `--watch` daemon would therefore make
+the TUI's `Tokens` rows, prompt panel, and `d` modal permanently unavailable.
+Periodic one-shots hold the lock only for their own run.
+
+**Why the CHECKPOINT is throttled.** That lock window is the whole cost of a
+short cadence: a one-shot run on a 1 GB store measured 6.0s wall, of which ~1.8s
+was the sweep and ~3.5s the closing `CHECKPOINT`. At 6s per 30s the store would
+be locked ~20% of the time and roughly one modal open in five would show the dim
+hint for data that is actually there. So `cmd_ingest` flushes only when it is due
+(`_checkpoint_due`): never on a sweep that stored nothing, otherwise at most once
+per `CHECKPOINT_MIN_INTERVAL` (300s), tracked by `<store>.checkpoint-stamp`.
+`--compact` and `--watch` force the flush (a rewrite follows; a shutdown flush is
+the point). Skipping is safe: the WAL is durable and replays on the next open,
+and DuckDB auto-checkpoints on its own WAL-size threshold, so a skipped flush
+costs a slightly larger `.wal`, never data.
+
+**Lock collisions are routine, not faults.** DuckDB's file lock excludes in BOTH
+directions: an ingest cannot open a reader-held store any more than a reader can
+open a writer-held one. At 30s that happens regularly against an open TUI, and it
+used to end the ingest with an unhandled `IOException` traceback in the log
+(observed 04:52:47, which cost that cycle). `is_lock_conflict(exc)` identifies it
+by message, and:
+
+- `connect_writer()` (used by `cmd_ingest`) retries a few times, then returns
+  None; the run logs `skipped: store is held by a reader; the next run catches
+  up` and **exits 0**, so a routine collision is never recorded as a unit failure
+  and the idempotent next run covers it;
+- `cli_main` turns the reverse case into `store busy: an ingest is writing ...`
+  on stderr with exit 1, instead of a traceback out of `search` / `cat` / `stats`.
+
+Any non-lock error still propagates unchanged.
 
 ## Running
 
@@ -96,10 +154,10 @@ python3 claude_trail.py   # if running from a clone
 |-----|--------|
 | `j`/`k` or `↓`/`↑` | Move cursor down/up |
 | `g`/`G` | Jump to top/bottom |
-| `Enter` | Open the full-command detail view for the selected command (includes the command's token cost from the audit store when available) |
+| `Enter` | Open the full-command detail view for the selected command (includes the command's token cost and the first `PROMPT_PREVIEW_LINES` lines of the prompt that led to it, from the audit store when available). `Enter` again opens the whole prompt in a scrollable view (`j`/`k`/`g`/`G`); `Esc` steps back to the command, `q` closes both |
 | `s` | Open the session-detail modal for the selected row's session (identity header + token total + subagent list with live status) |
 | `d` | Open the audit-store database modal: connection string, DuckDB / schema version, on-disk sizes, block accounting, and per-table row counts (opens the DuckDB store read-only, on demand) |
-| `Esc` | Close the open modal, command detail, session detail, or database (also `q` or `Enter` while it is open) |
+| `Esc` | Close the open modal, command detail, session detail, or database (also `q` or `Enter` while it is open; in the full-prompt view `Esc`/`Enter` step back one level and `q` closes outright) |
 | `o` | Open selected session's commands (pretty-printed, filtered to the session) in `$VISUAL` or the platform default launcher |
 | `t` | Open a pretty-printed copy of the selected session's transcript (`<sid>.jsonl`) in `$VISUAL` or the platform default launcher |
 | `f` | Open file manager on folder of files referenced in selected command |
@@ -147,6 +205,8 @@ rebuilt per frame). Only widths are configurable, not colors.
 - Poll interval: 300ms
 - File paths extracted by `find_paths(cmd)` (regex matching absolute `/...`, home `~/...`, relative `./...`; order-preserving dedupe via `dict.fromkeys`). `extract_files()` is a thin basename formatter over it and `open_file_folder()` reuses it.
 - `Enter` opens an in-TUI detail view (`build_detail_panel()`) showing the selected command in full: untruncated, newlines preserved, with the danger `*` marker and a metadata header (time, session, directory, files, and a `Tokens` row when the audit store has data). `Esc`/`q`/`Enter` close it. The view is modal: while open, navigation/column/clear keys are ignored (only `Ctrl-C` still quits). The `Tokens` row is the command's generation cost: `Enter` returns `Action.OPEN_DETAIL`, which makes `main()` call `_load_command_tokens(entry)` once (opening the store read-only via `_with_store`, so the feed/hook still never load duckdb); it maps the row to `claude_trail_store.command_tokens_for(session_id, command, ts)`. When there is no match the row shows a dim hint instead of vanishing (`pending ingest (store lags the live feed)` when the store exists but has not caught up, `no audit store yet - run: claude-trail ingest` when the file is absent; the `_tokens_unavailable` sentinel) so the feature never looks silently broken. When the emitting request made several parallel tool calls the row shows the even per-call share and says so.
+- The detail view also carries a `prompt` panel: the first `PROMPT_PREVIEW_LINES` (10) lines of the turn that led to the command, with a dim `+N more lines` footer. `Action.OPEN_DETAIL` loads it in the SAME read-only store open as the Tokens row (`_load_command_detail(entry)` returns `(tokens, prompt)`), so opening the modal costs one store open, not two; a missing answer reuses the `_tokens_unavailable` sentinel. The prompt comes from `claude_trail_store.prompt_for_command(con, session_id, ts, agent_id)`: the newest `type='user'` event at or before the row's timestamp **in the same `(session_id, agent_id)` thread**, so a main-agent row reports the user's turn and a subagent row reports that subagent's own turn (its task prompt on the first turn). It needs only what the hook entry already carries, not the command's own `tool_use` row, so it answers even while ingest lags the command. `<system-reminder>` blocks are stripped (`clean_prompt_text`) and harness-generated turns are stepped over (`_AUTO_TURN_RE`: task notifications, local-command caveat/stdout, interrupt markers) so the panel shows what a human actually asked; slash commands and `!` bash input are kept, since invoking one IS the user's turn.
+- `Enter` on a detail view that has a prompt drills into the full-prompt view (`build_prompt_panel()`) instead of closing: identity header (session, subagent, `Sent` time), then the whole prompt windowed around `AppState.detail_prompt_scroll` with `j`/`k`/`g`/`G` (same clamp-and-write-back contract as the session modal, via `_clamp_prompt_scroll`). `Esc`/`Enter` step back to the command detail, `q` closes everything from any depth (`AppState.close_modals()`), `Ctrl-C` still quits. With no prompt to open (the dim sentinel), `Enter` keeps its original close-the-modal meaning. The key hints live in that view's header rather than under the body: prompt lines wrap, so a footer would be the first thing the panel's height crop removed.
 - `s` opens the session-detail modal (`build_session_panel()`) for the selected row's session: an identity header (id, name tinted by the session `/color` plus its live status, `~`-abbreviated folder, transcript path, version, start time) and a table of the session's subagents (status glyph `●` running / `✓` done / `✗` stopped, description, agent type, tool-call count shown as `N+` when byte-capped). It reads `load_session_model(sid)` (cached `SESSION_MODEL_CACHE_TTL` = 2s), which assembles the model from the live `sessions/<pid>.json`, the parent transcript's `<task-notification>` completion events, and each `subagents/**/agent-*.meta.json`; status is derived (completed task-id -> `done`, failed/killed -> `stopped`, else `running` when the session is live else `stopped`). The header also carries a `Tokens` total (exact per-session output / input / cache / request count, subagent output called out when any subagent ran): pressing `s` returns `Action.OPEN_SESSION_DETAIL`, which makes `main()` call `_load_session_tokens(sid)` once against `claude_trail_store.session_token_totals(sid)` (same read-only `_with_store` path); when the store has no ingested requests for the session the row shows the same dim `_tokens_unavailable` hint as the command modal. Both modals are mutually exclusive: `AppState.modal_open()` is true while either is open, `apply_key` swallows everything but `Esc`/`q`/`Enter` (which clear both fields) and `Ctrl-C` (quit), and `render_panel` shows the session modal in precedence over the command modal.
 - `/` opens the per-session search modal (`SearchState` on `AppState.search`, rendered by `build_search_panel`). Roots come from `search_roots(sid, entry, model)`: `"transcript"` = the `<sid>.jsonl` file plus its sibling `<sid>/` dir (`subagents/**`), `"cwd"` = the live session's launch dir (pid.json) or, for an ended session, the row's cwd; a non-existent path is dropped and `Tab` switches the active root. `run_search(query, paths)` shells out to `rg` when present (`-S` smart-case) else `grep -rInE`, passing the query as argv (never through a shell), capped at `SEARCH_RESULT_LIMIT` (500) with a `SEARCH_TIMEOUT` (5s) so a huge tree can't hang the UI; rg/grep exit 1 (no match) is empty, exit >= 2 (bad regex) returns an `error` string, never raises. The modal has two sub-modes (`INPUT` types the query, `RESULTS` browses hits) so letters and `j`/`k` never conflict, and it is mutually exclusive with (and takes precedence over) the command/session modals: `apply_key` checks `state.search` first and stays pure, returning `RUN_SEARCH`/`OPEN_MATCH`/`OPEN_MATCH_FOLDER` for `main()` to perform. `OPEN_MATCH` reuses `open_session_log`'s suspend-`Live` editor pattern (with a `+<line>` arg for vi-family editors); `OPEN_MATCH_FOLDER` reuses `open_file_folder`'s detached `Popen(_platform_opener())` via `open_containing_folder`.
 - Session commands written pretty-printed (indented JSON blocks, blank-line separated, same shape as the `t` transcript) under `tempfile.gettempdir()` (default `/tmp`) as `claude-trail-session-{sanitized-id}.json` on `o`; the output is only ever read by a human in an editor, so there is no raw-JSONL variant. If `$VISUAL`/`$EDITOR` is set, `open_session_log()` suspends the `Live` display, restores the terminal, runs that editor in the foreground (so terminal editors like nvim get the tty), then resumes; otherwise it hands the file to the GUI launcher detached.
@@ -160,7 +220,7 @@ rebuilt per frame). Only widths are configurable, not colors.
 
 ## Audit store
 
-`claude_trail_store.py` is a separate, DuckDB-backed audit trail. It ingests the Claude Code transcripts (`~/.claude/projects/**/*.jsonl`, including `subagents/agent-<id>.jsonl`) into one local file and answers search / token / file-reconstruction queries over the full history. It is independent of the live TUI: `claude_trail.py main()` only lazily imports it when the first argument is one of the store subcommands (so the TUI and hook never load `duckdb`). The interactive exceptions are the TUI `d` (database) modal, whose `_load_db_info()` imports the store and opens it read-only on demand (`db_info(con)` returns the (label, value) rows shared by that modal and the `stats` CLI section: connection string, DuckDB / schema version, on-disk sizes, block accounting, per-table counts), and the `Enter` / `s` modals' `Tokens` rows, which open the store read-only via `_with_store` and read `command_tokens_for(con, session_id, command, ts)` / `session_token_totals(con, session_id)` (both read-only, both return None to omit the row when there is no match).
+`claude_trail_store.py` is a separate, DuckDB-backed audit trail. It ingests the Claude Code transcripts (`~/.claude/projects/**/*.jsonl`, including `subagents/agent-<id>.jsonl`) into one local file and answers search / token / file-reconstruction queries over the full history. It is independent of the live TUI: `claude_trail.py main()` only lazily imports it when the first argument is one of the store subcommands (so the TUI and hook never load `duckdb`). The interactive exceptions are the TUI `d` (database) modal, whose `_load_db_info()` imports the store and opens it read-only on demand (`db_info(con)` returns the (label, value) rows shared by that modal and the `stats` CLI section: connection string, DuckDB / schema version, on-disk sizes, block accounting, per-table counts), and the `Enter` / `s` modals' `Tokens` rows and prompt panel, which open the store read-only via `_with_store` and read `command_tokens_for(con, session_id, command, ts)` / `prompt_for_command(con, session_id, ts, agent_id)` / `session_token_totals(con, session_id)` (all read-only, all return None to omit the row when there is no match).
 
 - **Store file:** `~/.claude/trail.duckdb`, overridable via `$CLAUDE_TRAIL_DB` (constant `STORE_PATH`). `connect(read_only=...)` opens it; the parent dir is created on demand.
 - **Reads transcripts, not the hook.** The store ingests transcripts, so it covers every tool (Read, Edit, Write, Grep, Task, ...) and gets each call's result and edit patch for free. The live TUI is unchanged and still tails `command-log.jsonl`, which the PostToolUse hook writes and which is Bash-only. Two independent data paths: the hook feeds the TUI, the transcripts feed the store.
