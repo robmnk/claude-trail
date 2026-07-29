@@ -1820,8 +1820,15 @@ PROMPT_LOOKBACK_TURNS = 16
 
 # The block a slash command is stored as, e.g.
 #   <command-name>/model</command-name> ... <command-args>opus</command-args>
-# (the TUI's COLOR_CMD_RE parses the same shape for /color).
-_SLASH_NAME_RE = re.compile(r"<command-name>\s*([^<]+?)\s*</command-name>")
+# (the TUI's COLOR_CMD_RE parses the same shape for /color). Matched at the HEAD
+# of the turn (`.match`, group 1 = the name) and only across the leading run of
+# `<command-*>` elements: a `<command-name>` quoted mid-prose is a user ASKING
+# about a command, not invoking one, and swallowing the whole turn into `/compact`
+# would misreport it. `<command-args>` is then read from that head run only
+# (group 0), so a later block cannot contribute the args of this one.
+_SLASH_HEAD_RE = re.compile(
+    r"\s*<command-name>\s*([^<]+?)\s*</command-name>"
+    r"(?:\s*<command-[a-z-]+>[^<]*</command-[a-z-]+>)*")
 _SLASH_ARGS_RE = re.compile(r"<command-args>\s*([^<]*?)\s*</command-args>")
 
 
@@ -1833,9 +1840,28 @@ def clean_prompt_text(text):
     return _SYSTEM_REMINDER_RE.sub("", text).strip()
 
 
+# The SQL twin of `clean_prompt_text`, bound into `prompt_turns` so both sides of
+# the store clean a turn the same way. The trim charset is explicit because
+# DuckDB's `trim()` strips ONLY spaces where Python's `.strip()` strips all
+# whitespace; leaving it implicit made the two disagree on every turn padded with
+# a newline or a tab - an unstripped `preview` (which renders as a blank first
+# line), a surviving leading `\n` defeating the `^` of TURN_NOISE_PATTERN so a
+# noise turn became a row, and a reminder-only turn surviving as `preview='\n'`
+# instead of being dropped by `clean <> ''`.
+#
+# ASCII whitespace is all the two engines can be made to share: a turn padded
+# with Unicode-only whitespace (NBSP, U+2028) would still differ by exactly those
+# characters, since `str.strip()` removes them and no fixed `trim()` charset can
+# enumerate them. None exists in the corpus.
+PROMPT_TRIM_CHARS = " \t\n\r\v\f"                 # == string.whitespace
+PROMPT_CLEAN_SQL = "trim(regexp_replace(text, ?, '', 'sg'), ?)"
+PROMPT_CLEAN_PARAMS = (_SYSTEM_REMINDER_RE.pattern, PROMPT_TRIM_CHARS)
+
+
 def slash_label(text):
-    """`/compact` (or `/model opus`) for a turn that is a slash-command block;
-    `text` unchanged when there is no such block.
+    """`/compact` (or `/model opus`) for a turn that STARTS with a slash-command
+    block; `text` unchanged for anything else, including prose that merely quotes
+    a `<command-name>` block (see `_SLASH_HEAD_RE`).
 
     Display only, applied by the CALLERS that render a one-line label (TUI
     prompts list, CLI print) and deliberately NOT baked into the query results:
@@ -1844,13 +1870,13 @@ def slash_label(text):
     """
     if not text:
         return text
-    m = _SLASH_NAME_RE.search(text)
+    m = _SLASH_HEAD_RE.match(text)
     if not m:
         return text
     name = m.group(1).strip()
     if not name.startswith("/"):
         name = "/" + name          # stored with the slash today; tolerate either
-    args = _SLASH_ARGS_RE.search(text)
+    args = _SLASH_ARGS_RE.search(m.group(0))
     arg = args.group(1).strip() if args else ""
     return f"{name} {arg}" if arg else name
 
@@ -1917,8 +1943,11 @@ def prompt_for_command(con, session_id, ts=None, agent_id=None):
 # agent_id, and they are timestamped while the turn runs.
 
 # Preview length in the list query. The full text is fetched per turn by
-# turn_prompt_text only when a detail view opens (longest real turn measured:
-# 21,697 chars, so carrying every full text in the list would be wasteful).
+# turn_prompt_text only when a detail view opens: the longest turn measured in one
+# PROMPT_TURN_RAW_SCAN-sized window was 21,696 chars, and the longest anywhere in
+# that store 646,245 (a hook prompt, pasted three times), so carrying every full
+# text in the list would be wasteful. turn_prompt_text itself is uncapped - a
+# caller that renders it needs its own bound.
 PROMPT_PREVIEW_CHARS = 400
 # User turns cleaned per prompt_turns call, newest-first. This bound is load-
 # bearing, not a micro-optimization: cleaning EVERY main-thread user turn of a
@@ -1926,7 +1955,12 @@ PROMPT_PREVIEW_CHARS = 400
 # 400. It is safe because the newest-N set is suffix-closed per session - the
 # next prompt of any fetched turn is itself fetched, so every window is bounded
 # correctly - except each session's newest turn, which has no next prompt at all
-# and correctly gets next_ts NULL (an open-ended window, by design).
+# and correctly gets next_ts NULL (an open-ended window, by design). The
+# `ORDER BY ts DESC LIMIT` edge can also split a group of turns sharing one
+# (session_id, ts), in which case the oldest turn in the scan collapses over
+# whichever of its texts was fetched and may keep the shorter one. That costs a
+# preview, never a row, and is only reachable once the kept set reaches the raw
+# edge (i.e. most of the scan was noise).
 PROMPT_TURN_RAW_SCAN = 400
 PROMPT_TURN_LIMIT = 200
 TURN_ACTION_LIMIT = 500
@@ -1966,17 +2000,19 @@ def prompt_turns(con, limit=PROMPT_TURN_LIMIT, session_id=None,
     if session_id:
         where.append("session_id = ?")
         params.append(session_id)
-    # Both regexes are bound from their Python source (see _prefix_alternation),
-    # so the reminder-stripping and noise rules have one definition each.
-    params += [_SYSTEM_REMINDER_RE.pattern, TURN_NOISE_PATTERN]
+    # Reminder regex, trim charset and noise regex are each bound from their one
+    # Python definition (`PROMPT_CLEAN_PARAMS`, `_prefix_alternation`), so the SQL
+    # clean cannot drift from `clean_prompt_text`: `preview` is always a prefix of
+    # `turn_prompt_text` for the same turn, and the `^` noise anchor sees the same
+    # string in both engines.
+    params += [*PROMPT_CLEAN_PARAMS, TURN_NOISE_PATTERN]
     rows = con.execute(
         f"""WITH raw AS (
                 SELECT session_id, ts, event_id, text FROM events
                 WHERE {' AND '.join(where)}
                 ORDER BY ts DESC LIMIT {int(raw_scan)}),
             kept AS (
-                SELECT session_id, ts, event_id,
-                       trim(regexp_replace(text, ?, '', 'sg')) AS clean
+                SELECT session_id, ts, event_id, {PROMPT_CLEAN_SQL} AS clean
                 FROM raw),
             -- Collapse turns sharing one (session_id, ts), keeping the longest
             -- text. Both aggregates order by the SAME (length, event_id) pair,
@@ -2045,28 +2081,35 @@ def turn_actions(con, session_id, ts, next_ts=None, limit=TURN_ACTION_LIMIT):
     is_error`: `agent_id` splits main-thread from subagent calls, `is_error`
     comes from the joined `tool_result` so the detail can mark failed calls, and
     `text` is NULL for tools with no `_COMMAND_FIELD` entry (Agent, Skill, MCP,
-    ...), which the caller labels from `tool_input` at render time. Read-only;
-    never raises for a caller that already guarded the connection.
+    ...), which the caller labels from `tool_input` at render time. A falsy
+    `session_id` or `ts` returns [] rather than an unbounded list: without a lower
+    bound this is not one turn but the session's whole history. Read-only; never
+    raises for a caller that already guarded the connection.
     """
-    if not session_id:
+    if not session_id or not ts:
         return []
-    where = ["u.type = 'tool_use'", "u.session_id = ?"]
-    params = [session_id]
-    # Build each bound conditionally instead of `(?::TIMESTAMPTZ IS NULL OR ...)`:
-    # a NULL parameter has no inferable type in a prepared statement. try_cast so
-    # an unparseable bound degrades to an empty window rather than raising.
-    if ts:
-        where.append("u.ts >= try_cast(? AS TIMESTAMPTZ)")
-        params.append(ts)
+    # try_cast so an unparseable bound degrades to an empty window rather than
+    # raising. `next_ts` is bound conditionally instead of
+    # `(?::TIMESTAMPTZ IS NULL OR ...)`: a NULL parameter has no inferable type in
+    # a prepared statement.
+    where = ["u.type = 'tool_use'", "u.session_id = ?",
+             "u.ts >= try_cast(? AS TIMESTAMPTZ)"]
+    params = [session_id, ts]
     if next_ts:
         where.append("u.ts < try_cast(? AS TIMESTAMPTZ)")
         params.append(next_ts)
+    # Join a result set already collapsed to one row per tool_use_id: a call can
+    # carry more than one `tool_result` row (34 tool_use_ids in a real store do),
+    # and a plain join would list that call twice, spend two `limit` slots on it
+    # and disagree with `prompt_turns.tools`, which counts `events` unjoined.
+    # `max(is_error)` reads the duplicates as "any result failed".
     rows = con.execute(
         f"""SELECT u.ts::VARCHAR, u.agent_id, u.tool_name, u.text, u.tool_input,
                    r.is_error
             FROM events u
-            LEFT JOIN events r ON r.tool_use_id = u.tool_use_id
-                              AND r.type = 'tool_result'
+            LEFT JOIN (SELECT tool_use_id, max(is_error) AS is_error
+                       FROM events WHERE type = 'tool_result'
+                       GROUP BY tool_use_id) r ON r.tool_use_id = u.tool_use_id
             WHERE {' AND '.join(where)}
             ORDER BY u.ts, u.event_id LIMIT {int(limit)}""",
         params,
