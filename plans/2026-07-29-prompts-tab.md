@@ -317,7 +317,7 @@ depend on the TUI.
 
 ## Phases
 
-- [ ] 1. Store: turn model + queries
+- [x] 1. Store: turn model + queries
   - `TURN_NOISE_RE` (rename + widen `_AUTO_TURN_RE`), `slash_label`, `prompt_turns`,
     `turn_actions`, `turn_prompt_text`.
   - `prompt_for_command` switches to the shared noise regex.
