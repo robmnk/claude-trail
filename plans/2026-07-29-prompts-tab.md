@@ -244,7 +244,7 @@ A second data-driven list, same `Column` record, whose `render` callables take a
 |---|------|---------|
 | 1 | Time | `HH:MM:SS` of the prompt |
 | 2 | Session | `session_label` + `/color` tint (reuses `_render_session`'s logic on a sid) |
-| 3 | Project | `short_path` of `sessions.project` (falls back to `cwd`) |
+| 3 | Project | `short_path` of `sessions.project`. NOT `cwd`: `_upsert_session` never writes that column, so `sessions.cwd` is always NULL (phase 1 review, pinned by a test). `prompt_turns` still returns the key, which documents the gap |
 | 4 | Calls | `23` total, dim `(14 bash)` |
 | 5 | Agents | subagent count, blank when 0 |
 | 6 | Tokens | `24.2k` output, dim `+3.1k sub` when a subagent ran |
@@ -272,7 +272,7 @@ one global dict.
 ```
 ╭─ claude-trail v0.7.0 - prompt ─────────────────────────────────────────╮
 │ Session   4be5769  claude-trail   Sent  18:58:55   Turn  6m 12s        │
-│ Work      23 tool calls (14 Bash) - 2 subagents, 41 of their calls     │
+│ Work      64 tool calls: 23 main (14 Bash), 41 across 2 subagents      │
 │ Tokens    24.2k output (3.1k subagent) - 15 requests                   │
 │                                                                        │
 │ ╭─ prompt ───────────────────────────────────────────────── +14 lines ╮│
@@ -288,6 +288,12 @@ one global dict.
 ╰────────────────────────────────────────────────────────────────────────╯
 ```
 
+- `prompt_turns.tools` is INCLUSIVE of `subcalls` (phase 1 review, measured on a fixture: 1
+  main-thread Bash plus 2 subagent calls gives `tools=3, subcalls=2`). The header must subtract
+  rather than add, as the mock above does.
+- `turn_prompt_text` has no length cap and the store-wide longest main-thread turn is 646,245
+  chars (a summarization hook prompt), well past the 21,697 max of the newest-400 scan window. The
+  full-prompt view caps what it materializes and says how much it dropped.
 - The Agent gutter reuses `_render_agent`'s glyph rules (`─`/`┌`/`│`/`└`, label once per
   run) over the time-ordered action list, and `load_agent_labels` for the descriptions, so
   attribution here is retroactive (disk-derived), not forward-only like the feed.
@@ -341,6 +347,12 @@ depend on the TUI.
 - [ ] 5. CLI `prompts` subcommand + dispatch wiring, with tests.
 - [ ] 6. Docs + release: CLAUDE.md (Controls, Columns, Conventions, Audit store), README,
       `.env.example` widths, version bump.
+
+## Conventions for this run
+
+Review docs are plan-scoped: `reviews/REVIEW-prompts-tab-phase-N.md`. The bare
+`reviews/REVIEW-phase-N.md` names belong to the 2026-06-30 audit-store plan and must not be
+reused (phase 1's reviewer overwrote `REVIEW-phase-1.md`; it was restored from `df3953c`).
 
 ## Verify
 
