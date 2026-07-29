@@ -968,6 +968,599 @@ def test_clean_prompt_text_strips_reminders_but_keeps_commands():
     assert store.clean_prompt_text(cmd) == cmd
 
 
+# --- Turn model: prompt_turns / turn_actions / turn_prompt_text ----------------
+#
+# Hermetic, same shape as the fixtures above: a synthetic main transcript plus a
+# subagent transcript under a fake ~/.claude/projects in tmp_path, ingested once
+# and then queried through a read-only reopen (the store's own contract for every
+# reader). The main session holds four main-thread turns whose windows are known
+# by construction:
+#
+#   02:00:00  "first ask"       -> Bash echo one (main) + Read/Grep (subagent ag1)
+#   02:00:05  "mid-turn nudge"  -> Bash echo two, whose tool_result is an error
+#   02:00:10  "third ask"       -> nothing at all (a real, zero-call turn)
+#   02:00:20  <510-char text>   -> nothing, and long enough to truncate `preview`
+#
+# plus a second session with one turn, so session filtering has something to
+# exclude.
+
+_LONG_TURN_TEXT = "long turn " + "x" * 500          # 510 chars: preview truncates
+
+
+def _tool_use_line(uuid, sid, ts, request_id, blocks, out_tokens):
+    """One assistant transcript line carrying `blocks` tool_use dicts under a
+    single requestId, so parallel calls share one api_requests row."""
+    return {"type": "assistant", "uuid": uuid, "requestId": request_id,
+            "sessionId": sid, "timestamp": ts,
+            "message": {"role": "assistant", "model": "claude-opus-4-8",
+                        "id": f"msg-{request_id}", "content": blocks,
+                        "usage": {"input_tokens": 10, "output_tokens": out_tokens,
+                                  "cache_read_input_tokens": 0,
+                                  "cache_creation_input_tokens": 0,
+                                  "service_tier": "standard"}}}
+
+
+def _tool_result_line(uuid, sid, ts, tool_use_id, is_error=False):
+    """The user line carrying one tool_use's result (joined in by turn_actions)."""
+    return {"type": "user", "uuid": uuid, "sessionId": sid, "timestamp": ts,
+            "message": {"role": "user",
+                        "content": [{"type": "tool_result",
+                                     "tool_use_id": tool_use_id,
+                                     "content": "out", "is_error": is_error}]},
+            "toolUseResult": {"stdout": "out", "stderr": "", "interrupted": False}}
+
+
+def _turn_transcript_events(sid):
+    """The main thread of the turn fixture (see the section comment)."""
+    return [
+        _user_prompt("t-u1", sid, "first ask", "2026-06-30T02:00:00.000Z"),
+        _tool_use_line("t-a1", sid, "2026-06-30T02:00:01.000Z", "req-T1",
+                       [{"type": "tool_use", "id": "toolu-t1", "name": "Bash",
+                         "input": {"command": "echo one"}}], 30),
+        _tool_result_line("t-r1", sid, "2026-06-30T02:00:02.000Z", "toolu-t1"),
+        # a mid-turn user message: documented to START A NEW GROUP, not to extend
+        # the turn above it
+        _user_prompt("t-u2", sid, "mid-turn nudge", "2026-06-30T02:00:05.000Z"),
+        _tool_use_line("t-a2", sid, "2026-06-30T02:00:06.000Z", "req-T2",
+                       [{"type": "tool_use", "id": "toolu-t2", "name": "Bash",
+                         "input": {"command": "echo two"}}], 11),
+        _tool_result_line("t-r2", sid, "2026-06-30T02:00:07.000Z", "toolu-t2",
+                          is_error=True),
+        _user_prompt("t-u3", sid, "third ask", "2026-06-30T02:00:10.000Z"),
+        _user_prompt("t-u4", sid, _LONG_TURN_TEXT, "2026-06-30T02:00:20.000Z"),
+    ]
+
+
+def _build_turn_store(tmp_path, monkeypatch, sid="sess-turns-01",
+                      sid2="sess-turns-02"):
+    """Ingest the turn fixture: main thread, a subagent whose two parallel calls
+    land inside the FIRST turn's window, and a second session with one turn."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl",
+                 _turn_transcript_events(sid))
+    _write_jsonl(
+        projects / "-fake-proj" / sid / "subagents" / "agent-ag1.jsonl",
+        # The subagent's own user turn is its task prompt: it must NOT become a
+        # row of its own (only main-thread turns do), and its tool calls carry the
+        # PARENT session_id, so they fall inside the parent turn's window.
+        [_user_prompt("t-s-u1", sid, "task prompt for ag1",
+                      "2026-06-30T02:00:02.500Z"),
+         _tool_use_line("t-s-a1", sid, "2026-06-30T02:00:03.000Z", "req-S1",
+                        [{"type": "tool_use", "id": "toolu-sub-a", "name": "Read",
+                          "input": {"file_path": "/tmp/read-me.py"}},
+                         {"type": "tool_use", "id": "toolu-sub-b", "name": "Grep",
+                          "input": {"pattern": "def build_"}}], 7)],
+    )
+    _write_jsonl(projects / "-fake-proj" / f"{sid2}.jsonl", [
+        _user_prompt("o-u1", sid2, "other session ask", "2026-06-30T03:00:00.000Z"),
+        _tool_use_line("o-a1", sid2, "2026-06-30T03:00:01.000Z", "req-O1",
+                       [{"type": "tool_use", "id": "toolu-o1", "name": "Bash",
+                         "input": {"command": "echo other"}}], 5),
+    ])
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+    finally:
+        con.close()   # release the write lock for the read-only reopen
+    return sid, sid2
+
+
+def _turn(rows, prefix):
+    """The single turn row whose preview starts with `prefix`."""
+    hits = [r for r in rows if r["preview"].startswith(prefix)]
+    assert len(hits) == 1, f"expected 1 turn starting {prefix!r}, got {len(hits)}"
+    return hits[0]
+
+
+def test_prompt_turns_one_row_per_main_thread_prompt_newest_first(tmp_path, monkeypatch):
+    """Every main-thread prompt becomes exactly one row, newest-first, and the
+    subagent's own turn (its task prompt) is not one of them."""
+    sid, sid2 = _build_turn_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        rows = store.prompt_turns(con)
+    finally:
+        con.close()
+    assert [r["preview"][:17] for r in rows] == [
+        "other session ask", "long turn xxxxxxx", "third ask",
+        "mid-turn nudge", "first ask"]
+    assert [r["ts"] for r in rows] == sorted((r["ts"] for r in rows), reverse=True)
+    assert not any("task prompt for ag1" in r["preview"] for r in rows)
+    assert {r["session_id"] for r in rows} == {sid, sid2}
+    # sessions.project is decoded from the transcript dir; cwd is not populated by
+    # the ingester today, so the key is present and None (the TUI falls back).
+    assert _turn(rows, "first ask")["project"] == "/fake/proj"
+    assert _turn(rows, "first ask")["cwd"] is None
+
+
+def test_prompt_turns_window_ends_at_the_next_prompt(tmp_path, monkeypatch):
+    """A mid-turn user message starts a NEW group (documented semantics), so the
+    first turn's window closes at its timestamp and its counts stop there. Nothing
+    in this fixture sits ON a bound; the test below pins those."""
+    _build_turn_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        rows = store.prompt_turns(con)
+    finally:
+        con.close()
+    first, nudge = _turn(rows, "first ask"), _turn(rows, "mid-turn nudge")
+    assert first["next_ts"] == nudge["ts"]          # bounded by the next prompt
+    assert first["tools"] == 3                     # echo one + the 2 subagent calls
+    assert nudge["tools"] == 1                     # echo two belongs to ITS turn
+    assert nudge["bash"] == 1
+    # the newest turn of each session keeps an open-ended window
+    assert _turn(rows, "long turn")["next_ts"] is None
+    assert _turn(rows, "other session ask")["next_ts"] is None
+
+
+def test_prompt_turns_window_bounds_are_lower_inclusive_upper_exclusive(tmp_path, monkeypatch):
+    """The window is [ts, next_ts): a call at exactly the prompt's timestamp counts
+    in that turn, one at exactly the next prompt's timestamp counts in the NEXT
+    turn. Its own fixture, so the shared one's documented arithmetic stays intact.
+    Pinned on both sides (prompt_turns' counts and turn_actions' list), so flipping
+    `>=` to `>` or `<` to `<=` fails."""
+    sid = "sess-turn-bounds"
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", [
+        _user_prompt("b-u1", sid, "first ask", "2026-06-30T02:00:00.000Z"),
+        # exactly ON the lower bound: belongs to "first ask"
+        _tool_use_line("b-lower", sid, "2026-06-30T02:00:00.000Z", "req-B1",
+                       [{"type": "tool_use", "id": "toolu-b1", "name": "Bash",
+                         "input": {"command": "echo on-lower-bound"}}], 3),
+        _tool_use_line("b-mid", sid, "2026-06-30T02:00:01.000Z", "req-B2",
+                       [{"type": "tool_use", "id": "toolu-b2", "name": "Bash",
+                         "input": {"command": "echo inside"}}], 3),
+        _user_prompt("b-u2", sid, "second ask", "2026-06-30T02:00:05.000Z"),
+        # exactly ON the upper bound: belongs to "second ask", not to "first ask"
+        _tool_use_line("b-upper", sid, "2026-06-30T02:00:05.000Z", "req-B3",
+                       [{"type": "tool_use", "id": "toolu-b3", "name": "Bash",
+                         "input": {"command": "echo on-upper-bound"}}], 3),
+    ])
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+    finally:
+        con.close()
+    con = store.connect(read_only=True)
+    try:
+        rows = store.prompt_turns(con)
+        first, second = _turn(rows, "first ask"), _turn(rows, "second ask")
+        first_acts = store.turn_actions(con, sid, first["ts"], first["next_ts"])
+        second_acts = store.turn_actions(con, sid, second["ts"], second["next_ts"])
+    finally:
+        con.close()
+    assert (first["tools"], second["tools"]) == (2, 1)
+    assert [a["text"] for a in first_acts] == ["echo on-lower-bound", "echo inside"]
+    assert [a["text"] for a in second_acts] == ["echo on-upper-bound"]
+
+
+def test_prompt_turns_attributes_subagent_calls_to_the_parent_turn(tmp_path, monkeypatch):
+    """A subagent's tool calls carry the parent session_id and a non-null
+    agent_id, so they count under the parent turn that spawned it."""
+    _build_turn_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        first = _turn(store.prompt_turns(con), "first ask")
+    finally:
+        con.close()
+    assert (first["tools"], first["bash"]) == (3, 1)
+    assert first["agents"] == 1                    # one distinct subagent
+    assert first["subcalls"] == 2                  # both of its calls
+
+
+def test_prompt_turns_token_split_main_vs_subagent(tmp_path, monkeypatch):
+    """Token numbers are the window's requests: 30 output on the main thread plus
+    7 on the subagent, with the subagent share called out separately."""
+    _build_turn_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        rows = store.prompt_turns(con)
+    finally:
+        con.close()
+    first = _turn(rows, "first ask")
+    assert first["output_tokens"] == 37
+    assert first["subagent_output_tokens"] == 7
+    assert first["requests"] == 2
+    assert first["last_ts"] and first["last_ts"].startswith("2026-06")
+    nudge = _turn(rows, "mid-turn nudge")
+    assert (nudge["output_tokens"], nudge["subagent_output_tokens"]) == (11, 0)
+
+
+def test_prompt_turns_zero_call_turn_reports_zero_not_none(tmp_path, monkeypatch):
+    """A turn that ran nothing (a question, a resumed session) is real and must
+    report 0 for every count rather than NULL, so callers need no None handling."""
+    _build_turn_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        third = _turn(store.prompt_turns(con), "third ask")
+    finally:
+        con.close()
+    for key in ("tools", "bash", "agents", "subcalls",
+                "output_tokens", "subagent_output_tokens", "requests"):
+        assert third[key] == 0, key
+    assert third["last_ts"] is None                # no request, so no last activity
+
+
+def test_prompt_turns_excludes_every_noise_prefix(tmp_path, monkeypatch):
+    """Each harness-generated prefix in TURN_NOISE_PREFIXES is plumbing, not a
+    prompt, so none of them becomes a row - only the one real turn does."""
+    sid = "sess-turn-noise"
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    events = [_user_prompt("n-real", sid, "a real ask", "2026-06-30T02:00:00.000Z")]
+    for i, prefix in enumerate(store.TURN_NOISE_PREFIXES, start=1):
+        events.append(_user_prompt(f"n-{i}", sid, prefix + " trailing detail",
+                                   f"2026-06-30T02:10:{i:02d}.000Z"))
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", events)
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+    finally:
+        con.close()
+    con = store.connect(read_only=True)
+    try:
+        rows = store.prompt_turns(con)
+    finally:
+        con.close()
+    assert [r["preview"] for r in rows] == ["a real ask"]
+
+
+def test_prompt_turns_collapses_turns_sharing_one_timestamp(tmp_path, monkeypatch):
+    """Two kept turns can share one (session_id, ts) - an image and its caption,
+    a <command-name> block and a bare /compact. Left alone they would produce a
+    phantom zero-width window, so they collapse to one row keeping the longest
+    cleaned text."""
+    sid = "sess-turn-samets"
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    ts = "2026-06-30T02:00:00.000Z"
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", [
+        _user_prompt("s-short", sid, "/compact", ts),
+        _user_prompt("s-long", sid, "<command-name>/compact</command-name>", ts),
+    ])
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+    finally:
+        con.close()
+    con = store.connect(read_only=True)
+    try:
+        rows = store.prompt_turns(con)
+        # the surviving event_id must be the row the text came from, or the detail
+        # view would open a different (shorter) turn than the list showed
+        full = store.turn_prompt_text(con, rows[0]["event_id"])
+    finally:
+        con.close()
+    assert len(rows) == 1
+    assert rows[0]["preview"] == "<command-name>/compact</command-name>"
+    assert rows[0]["next_ts"] is None              # no phantom zero-width window
+    assert full == rows[0]["preview"]
+    assert store.slash_label(rows[0]["preview"]) == "/compact"
+
+
+def test_prompt_turns_collapse_tie_break_keeps_one_row_whole(tmp_path, monkeypatch):
+    """Two kept turns at one (session_id, ts) whose cleaned texts are the SAME
+    length: `(length(clean), event_id)` breaks the tie on event_id, and BOTH
+    aggregates order by it, so the surviving preview and event_id still come from
+    one row (the detail view opens the turn the list showed)."""
+    sid = "sess-turn-tie"
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    ts = "2026-06-30T02:00:00.000Z"
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", [
+        _user_prompt("tie-a", sid, "same length text A", ts),
+        _user_prompt("tie-b", sid, "same length text B", ts),
+    ])
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+    finally:
+        con.close()
+    con = store.connect(read_only=True)
+    try:
+        rows = store.prompt_turns(con)
+        full = store.turn_prompt_text(con, rows[0]["event_id"])
+    finally:
+        con.close()
+    assert len(rows) == 1
+    assert rows[0]["event_id"] == "tie-b"          # the higher event_id wins
+    assert rows[0]["preview"] == full == "same length text B"
+
+
+def test_prompt_turns_clean_agrees_with_clean_prompt_text(tmp_path, monkeypatch):
+    """Regression: DuckDB's `trim()` strips only spaces, so the SQL clean must name
+    the charset Python's `.strip()` removes (PROMPT_TRIM_CHARS). Without it a
+    reminder-suffixed turn kept its trailing newline (a `preview` whose first line
+    the detail view disagreed with, blank when the newline led), a noise turn behind
+    a reminder survived because the leading `\\n` defeated the `^` anchor, and a
+    reminder-only turn became a phantom row with preview='\\n'."""
+    sid = "sess-turn-trim"
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    reminder = "<system-reminder>ctx</system-reminder>"
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", [
+        _user_prompt("tr-real", sid, f"fix the bug\n{reminder}",
+                     "2026-06-30T02:00:00.000Z"),
+        _user_prompt("tr-noise", sid,
+                     f"{reminder}\n<task-notification>agent done</task-notification>",
+                     "2026-06-30T02:00:01.000Z"),
+        _user_prompt("tr-empty", sid, reminder + "\n", "2026-06-30T02:00:02.000Z"),
+    ])
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+    finally:
+        con.close()
+    con = store.connect(read_only=True)
+    try:
+        rows = store.prompt_turns(con)
+        full = store.turn_prompt_text(con, rows[0]["event_id"])
+    finally:
+        con.close()
+    # only the real turn survives: the other two are noise and nothing at all
+    assert [r["event_id"] for r in rows] == ["tr-real"]
+    assert rows[0]["preview"] == full == "fix the bug"
+    assert rows[0]["full_len"] == len(full) == 11
+
+
+def test_prompt_turns_session_filter_and_limit(tmp_path, monkeypatch):
+    """`session_id=` scopes the list to one session, `limit` caps it to the newest
+    rows, and an unknown session yields an empty list."""
+    sid, sid2 = _build_turn_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        mine = store.prompt_turns(con, session_id=sid)
+        other = store.prompt_turns(con, session_id=sid2)
+        capped = store.prompt_turns(con, limit=2)
+        missing = store.prompt_turns(con, session_id="no-such-session")
+    finally:
+        con.close()
+    assert len(mine) == 4 and {r["session_id"] for r in mine} == {sid}
+    assert [r["preview"] for r in other] == ["other session ask"]
+    assert [r["preview"][:17] for r in capped] == ["other session ask",
+                                                   "long turn xxxxxxx"]
+    assert missing == []
+
+
+def test_prompt_turns_raw_scan_bounds_the_cleaned_set(tmp_path, monkeypatch):
+    """raw_scan caps how many raw user turns are cleaned (74ms vs 1.96s on the
+    real store): the newest ones survive, older turns are simply not fetched."""
+    _build_turn_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        rows = store.prompt_turns(con, raw_scan=1)
+    finally:
+        con.close()
+    assert [r["preview"] for r in rows] == ["other session ask"]
+
+
+def test_prompt_turns_preview_truncates_and_full_text_loads_on_demand(tmp_path, monkeypatch):
+    """`preview` is capped at PROMPT_PREVIEW_CHARS with `full_len` reporting the
+    real size, and turn_prompt_text returns the whole cleaned text for that turn."""
+    _build_turn_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        row = _turn(store.prompt_turns(con), "long turn")
+        full = store.turn_prompt_text(con, row["event_id"])
+        unknown = store.turn_prompt_text(con, "no-such-event")
+        empty = store.turn_prompt_text(con, "")
+    finally:
+        con.close()
+    assert len(row["preview"]) == store.PROMPT_PREVIEW_CHARS
+    assert row["full_len"] == len(_LONG_TURN_TEXT)
+    assert full == _LONG_TURN_TEXT
+    assert unknown is None and empty is None
+
+
+def test_turn_actions_oldest_first_with_agent_and_error(tmp_path, monkeypatch):
+    """The detail list is every tool call in the window, oldest-first, with the
+    subagent's agent_id and the joined tool_result's is_error."""
+    sid, _sid2 = _build_turn_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        rows = store.prompt_turns(con)
+        first, nudge = _turn(rows, "first ask"), _turn(rows, "mid-turn nudge")
+        acts = store.turn_actions(con, sid, first["ts"], first["next_ts"])
+        nudge_acts = store.turn_actions(con, sid, nudge["ts"], nudge["next_ts"])
+    finally:
+        con.close()
+    assert [(a["tool_name"], a["agent_id"]) for a in acts] == [
+        ("Bash", None), ("Read", "ag1"), ("Grep", "ag1")]
+    assert [a["ts"] for a in acts] == sorted(a["ts"] for a in acts)
+    assert acts[0]["text"] == "echo one"
+    assert acts[1]["text"] == "/tmp/read-me.py"        # Read's repr field
+    assert "def build_" in acts[2]["tool_input"]       # JSON comes back as text
+    assert acts[0]["is_error"] is False
+    # the next turn's window holds only its own call, whose result failed
+    assert [(a["text"], a["is_error"]) for a in nudge_acts] == [("echo two", True)]
+
+
+def test_turn_actions_open_ended_window_and_no_match(tmp_path, monkeypatch):
+    """next_ts None is the open-ended window of a session's newest turn (so it
+    sees every later call), and a missing session or unparseable bound returns []
+    rather than raising. A falsy `ts` is refused too: with no lower bound the
+    result would be the session's whole history rather than one turn."""
+    sid, _sid2 = _build_turn_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        first_ts = _turn(store.prompt_turns(con), "first ask")["ts"]
+        open_ended = store.turn_actions(con, sid, first_ts)
+        no_session = store.turn_actions(con, "", first_ts)
+        unknown = store.turn_actions(con, "no-such-session", first_ts)
+        bad_ts = store.turn_actions(con, sid, "not-a-timestamp")
+        no_ts = store.turn_actions(con, sid, None)
+        empty_ts = store.turn_actions(con, sid, "", "2026-06-30T02:00:05.000Z")
+    finally:
+        con.close()
+    assert [a["text"] for a in open_ended] == [
+        "echo one", "/tmp/read-me.py", "def build_", "echo two"]
+    assert no_session == [] and unknown == [] and bad_ts == []
+    assert no_ts == [] and empty_ts == []
+
+
+def test_turn_actions_lists_a_call_once_when_its_result_repeats(tmp_path, monkeypatch):
+    """A tool_use can carry more than one `tool_result` row (34 tool_use_ids do in
+    a real store). The call is still listed once - a fanned-out join would show it
+    twice, spend two `limit` slots on it and disagree with prompt_turns' `tools`,
+    which counts events unjoined - and `is_error` reads as "any result failed"."""
+    sid = "sess-turn-dup-result"
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", [
+        _user_prompt("d-u1", sid, "run it", "2026-06-30T02:00:00.000Z"),
+        _tool_use_line("d-a1", sid, "2026-06-30T02:00:01.000Z", "req-D1",
+                       [{"type": "tool_use", "id": "toolu-d1", "name": "Bash",
+                         "input": {"command": "echo dup"}}], 4),
+        _tool_result_line("d-r1", sid, "2026-06-30T02:00:02.000Z", "toolu-d1"),
+        _tool_result_line("d-r2", sid, "2026-06-30T02:00:03.000Z", "toolu-d1",
+                          is_error=True),
+    ])
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+    finally:
+        con.close()
+    con = store.connect(read_only=True)
+    try:
+        row = store.prompt_turns(con)[0]
+        acts = store.turn_actions(con, sid, row["ts"], row["next_ts"])
+    finally:
+        con.close()
+    assert row["tools"] == 1
+    assert [(a["text"], a["is_error"]) for a in acts] == [("echo dup", True)]
+
+
+def test_turn_actions_limit_caps_the_list(tmp_path, monkeypatch):
+    """`limit` caps the detail list, keeping the oldest calls of the window."""
+    sid, _sid2 = _build_turn_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        first_ts = _turn(store.prompt_turns(con), "first ask")["ts"]
+        acts = store.turn_actions(con, sid, first_ts, limit=2)
+    finally:
+        con.close()
+    assert [a["tool_name"] for a in acts] == ["Bash", "Read"]
+
+
+def test_sql_clean_pipeline_agrees_with_the_python_one(tmp_path, monkeypatch):
+    """`prompt_turns` cleans and classifies a turn in SQL; every other consumer
+    (turn_prompt_text, prompt_for_command) does it in Python. The two must agree on
+    the same text, so this runs the REAL SQL pipeline - PROMPT_CLEAN_SQL with its
+    bound params, then regexp_matches on TURN_NOISE_PATTERN, in the shape
+    prompt_turns uses - against clean_prompt_text + TURN_NOISE_RE.
+
+    Every input is padded with whitespace DuckDB's `trim()` does not strip by
+    default, which is where the two engines diverged. As a side effect it still
+    proves _prefix_alternation's hand-rolled escaping parses identically in
+    Python's `re` and DuckDB's RE2."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    reminder = "<system-reminder>ctx\nmore ctx</system-reminder>"
+    texts = [
+        "please refactor this, it is not noise",
+        "\nfix the bug\t",
+        f"fix the bug\n{reminder}",
+        f"{reminder}\n",                      # nothing left: not a turn
+        f" {reminder}\r\n<task-notification>done</task-notification>\v",
+        "\n\t<bash-stdout>ok</bash-stdout>",
+        "\r\n \t\v\f", "",
+    ]
+    texts += [f"\n{p} and some trailing detail\t" for p in store.TURN_NOISE_PREFIXES]
+    con = store.connect()
+    try:
+        for text in texts:
+            sql_clean, sql_noise = con.execute(
+                f"""WITH raw AS (SELECT ? AS text),
+                        kept AS (SELECT {store.PROMPT_CLEAN_SQL} AS clean FROM raw)
+                    SELECT clean, regexp_matches(clean, ?) FROM kept""",
+                [text, *store.PROMPT_CLEAN_PARAMS, store.TURN_NOISE_PATTERN],
+            ).fetchone()
+            py_clean = store.clean_prompt_text(text)
+            assert sql_clean == py_clean, repr(text)
+            assert sql_noise == bool(store.TURN_NOISE_RE.match(py_clean)), repr(text)
+    finally:
+        con.close()
+
+
+def test_slash_label_renders_the_command_block_and_leaves_prose_alone():
+    """A slash-command turn renders as `/name` (plus its args when it has any);
+    anything that does not START with a command block comes back untouched."""
+    assert store.slash_label("<command-name>/compact</command-name>") == "/compact"
+    assert store.slash_label(
+        "<command-name>/model</command-name>\n<command-message>model</command-message>"
+        "\n<command-args>opus</command-args>") == "/model opus"
+    assert store.slash_label(
+        "<command-name>/clear</command-name><command-args></command-args>") == "/clear"
+    assert store.slash_label("<command-name>compact</command-name>") == "/compact"
+    assert store.slash_label("  <command-name>/compact</command-name>") == "/compact"
+    plain = "lets plan a new feature"
+    assert store.slash_label(plain) == plain
+    assert store.slash_label("") == ""
+    assert store.slash_label(None) is None
+    # a block quoted mid-prose is a question ABOUT the command, not an invocation:
+    # collapsing the turn to `/compact` would throw the question away
+    prose = ("how does <command-name>/compact</command-name> behave when I ask "
+             "this long question?")
+    assert store.slash_label(prose) == prose
+    # and the args must belong to the head block, not to a later one
+    assert store.slash_label("<command-name>/clear</command-name>\n"
+                             "then <command-args>opus</command-args>") == "/clear"
+
+
+def test_prompt_for_command_skips_an_image_echo_sharing_the_timestamp(tmp_path, monkeypatch):
+    """Regression: an `[Image: source: ...]` echo is emitted at the SAME timestamp
+    as the text the user typed, so `ORDER BY ts DESC LIMIT 1` could return the
+    echo as the prompt. The shared noise filter drops it either way."""
+    sid = "sess-image-echo"
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    ts = "2026-06-30T02:00:00.000Z"
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", [
+        _user_prompt("i-typed", sid, "look at this screenshot", ts),
+        _user_prompt("i-echo", sid, "[Image: source: /tmp/shot.png]", ts),
+    ])
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+    finally:
+        con.close()
+    con = store.connect(read_only=True)
+    try:
+        p = store.prompt_for_command(con, sid, ts="2026-06-30T02:00:01.000Z")
+    finally:
+        con.close()
+    assert p["text"] == "look at this screenshot"
+
+
 def test_session_token_totals(tmp_path, monkeypatch):
     """session_token_totals returns the exact per-session totals (one request:
     50 out / 100 in / 200 cache-read / 30 cache-create, no subagent spend)."""

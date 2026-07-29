@@ -1775,17 +1775,61 @@ def command_tokens_for(con, session_id, command, ts=None):
 # did, so hiding it would misreport the turn.
 _SYSTEM_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 # Turns the harness generated rather than the user: a subagent finishing, the
-# framing around a local command, output echoed back, an interrupt marker. They
-# are skipped so a command reports the instruction a human actually gave. What a
-# human authored or invoked is kept, including slash commands (`<command-name>`)
-# and `!` bash-mode input (`<bash-input>`): running one IS the user's turn.
-_AUTO_TURN_RE = re.compile(
-    r"^(\[Request interrupted|<task-notification>|<local-command-caveat>"
-    r"|<local-command-stdout>|<bash-stdout>)")
+# framing around a local command, output echoed back, an interrupt marker, an
+# attachment echo, a skill body injected as a turn of its own after the /slash
+# turn that loaded it, and the carry-over blob a compaction opens with. They are
+# skipped so a turn reports the instruction a human actually gave. What a human
+# authored or invoked is kept, including slash commands (`<command-name>`) and
+# `!` bash-mode input (`<bash-input>`): running one IS the user's turn.
+TURN_NOISE_PREFIXES = (
+    "[Request interrupted",
+    "<task-notification>",
+    "<local-command-caveat>",
+    "<local-command-stdout>",
+    "<bash-stdout>",
+    "[Image: source:",                  # attachment echo, same ts as the typed text
+    "Base directory for this skill:",   # skill body, a turn after the /slash turn
+    "This session is being continued from a previous conversation",   # compaction
+)
+
+
+def _prefix_alternation(prefixes):
+    """`^(p1|p2|...)` over literal prefixes, escaping only the metacharacters
+    Python's `re` and DuckDB's RE2 read identically.
+
+    One definition feeds both `TURN_NOISE_RE` (the per-lookup Python filter) and
+    the SQL `regexp_matches` in `prompt_turns`, so the two engines can never
+    drift apart. Hand-rolled rather than `re.escape`, which also emits `\\ ` for
+    the spaces in these prefixes - accepted by RE2 today, but required by
+    neither engine's grammar.
+    """
+    meta = r"\.^$|()[]{}*+?"
+
+    def esc(prefix):
+        return "".join(("\\" + c if c in meta else c) for c in prefix)
+
+    return "^(" + "|".join(esc(p) for p in prefixes) + ")"
+
+
+TURN_NOISE_PATTERN = _prefix_alternation(TURN_NOISE_PREFIXES)   # bound into SQL too
+TURN_NOISE_RE = re.compile(TURN_NOISE_PATTERN)
 # User turns examined per lookup, newest-first: enough to step over a run of
 # auto-turns (several parallel subagents can finish back to back) without
 # scanning the whole session.
 PROMPT_LOOKBACK_TURNS = 16
+
+# The block a slash command is stored as, e.g.
+#   <command-name>/model</command-name> ... <command-args>opus</command-args>
+# (the TUI's COLOR_CMD_RE parses the same shape for /color). Matched at the HEAD
+# of the turn (`.match`, group 1 = the name) and only across the leading run of
+# `<command-*>` elements: a `<command-name>` quoted mid-prose is a user ASKING
+# about a command, not invoking one, and swallowing the whole turn into `/compact`
+# would misreport it. `<command-args>` is then read from that head run only
+# (group 0), so a later block cannot contribute the args of this one.
+_SLASH_HEAD_RE = re.compile(
+    r"\s*<command-name>\s*([^<]+?)\s*</command-name>"
+    r"(?:\s*<command-[a-z-]+>[^<]*</command-[a-z-]+>)*")
+_SLASH_ARGS_RE = re.compile(r"<command-args>\s*([^<]*?)\s*</command-args>")
 
 
 def clean_prompt_text(text):
@@ -1794,6 +1838,47 @@ def clean_prompt_text(text):
     if not text:
         return ""
     return _SYSTEM_REMINDER_RE.sub("", text).strip()
+
+
+# The SQL twin of `clean_prompt_text`, bound into `prompt_turns` so both sides of
+# the store clean a turn the same way. The trim charset is explicit because
+# DuckDB's `trim()` strips ONLY spaces where Python's `.strip()` strips all
+# whitespace; leaving it implicit made the two disagree on every turn padded with
+# a newline or a tab - an unstripped `preview` (which renders as a blank first
+# line), a surviving leading `\n` defeating the `^` of TURN_NOISE_PATTERN so a
+# noise turn became a row, and a reminder-only turn surviving as `preview='\n'`
+# instead of being dropped by `clean <> ''`.
+#
+# ASCII whitespace is all the two engines can be made to share: a turn padded
+# with Unicode-only whitespace (NBSP, U+2028) would still differ by exactly those
+# characters, since `str.strip()` removes them and no fixed `trim()` charset can
+# enumerate them. None exists in the corpus.
+PROMPT_TRIM_CHARS = " \t\n\r\v\f"                 # == string.whitespace
+PROMPT_CLEAN_SQL = "trim(regexp_replace(text, ?, '', 'sg'), ?)"
+PROMPT_CLEAN_PARAMS = (_SYSTEM_REMINDER_RE.pattern, PROMPT_TRIM_CHARS)
+
+
+def slash_label(text):
+    """`/compact` (or `/model opus`) for a turn that STARTS with a slash-command
+    block; `text` unchanged for anything else, including prose that merely quotes
+    a `<command-name>` block (see `_SLASH_HEAD_RE`).
+
+    Display only, applied by the CALLERS that render a one-line label (TUI
+    prompts list, CLI print) and deliberately NOT baked into the query results:
+    the full-prompt view shows the raw cleaned text, and collapsing it here would
+    throw away the rest of the turn.
+    """
+    if not text:
+        return text
+    m = _SLASH_HEAD_RE.match(text)
+    if not m:
+        return text
+    name = m.group(1).strip()
+    if not name.startswith("/"):
+        name = "/" + name          # stored with the slash today; tolerate either
+    args = _SLASH_ARGS_RE.search(m.group(0))
+    arg = args.group(1).strip() if args else ""
+    return f"{name} {arg}" if arg else name
 
 
 def prompt_for_command(con, session_id, ts=None, agent_id=None):
@@ -1806,8 +1891,10 @@ def prompt_for_command(con, session_id, ts=None, agent_id=None):
     the task prompt it was spawned with (a subagent transcript opens with the
     spawn prompt as a user message). Threads are kept apart so a subagent's
     command never reports the parent's turn, and vice versa. Harness-generated
-    turns (`_AUTO_TURN_RE`) are stepped over, so the answer is the last thing a
-    human actually asked rather than a task-notification blob.
+    turns (`TURN_NOISE_RE`) are stepped over, so the answer is the last thing a
+    human actually asked rather than a task-notification blob - including an
+    `[Image: source: ...]` attachment echo, which shares its timestamp with the
+    text the human typed and could otherwise win the `ORDER BY ts DESC` tie.
 
     Matching needs only what the live hook entry already carries
     ``(session_id, ts, agent_id)``, not the command's own `tool_use` row, so it
@@ -1842,9 +1929,211 @@ def prompt_for_command(con, session_id, ts=None, agent_id=None):
     ).fetchall()
     for row_ts, text in rows:
         cleaned = clean_prompt_text(text)
-        if cleaned and not _AUTO_TURN_RE.match(cleaned):
+        if cleaned and not TURN_NOISE_RE.match(cleaned):
             return {"text": cleaned, "ts": row_ts or ""}
     return None
+
+
+# --- Turn model: one row per user prompt, plus what the turn did ---------------
+#
+# A turn is a main-thread user prompt (agent_id IS NULL) plus every event in the
+# same session from that prompt's ts up to the next prompt's ts (lead(ts)), open-
+# ended for the newest prompt of each session. Subagent work lands inside the
+# window for free: a subagent's rows carry the PARENT session_id and a non-null
+# agent_id, and they are timestamped while the turn runs.
+
+# Preview length in the list query. The full text is fetched per turn by
+# turn_prompt_text only when a detail view opens: the longest turn measured in one
+# PROMPT_TURN_RAW_SCAN-sized window was 21,696 chars, and the longest anywhere in
+# that store 646,245 (a hook prompt, pasted three times), so carrying every full
+# text in the list would be wasteful. turn_prompt_text itself is uncapped - a
+# caller that renders it needs its own bound.
+PROMPT_PREVIEW_CHARS = 400
+# User turns cleaned per prompt_turns call, newest-first. This bound is load-
+# bearing, not a micro-optimization: cleaning EVERY main-thread user turn of a
+# real store (5,433 of them, some 20 KB) costs 1.96s, versus 74ms for the newest
+# 400. It is safe because the newest-N set is suffix-closed per session - the
+# next prompt of any fetched turn is itself fetched, so every window is bounded
+# correctly - except each session's newest turn, which has no next prompt at all
+# and correctly gets next_ts NULL (an open-ended window, by design). The
+# `ORDER BY ts DESC LIMIT` edge can also split a group of turns sharing one
+# (session_id, ts), in which case the oldest turn in the scan collapses over
+# whichever of its texts was fetched and may keep the shorter one. That costs a
+# preview, never a row, and is only reachable once the kept set reaches the raw
+# edge (i.e. most of the scan was noise).
+PROMPT_TURN_RAW_SCAN = 400
+PROMPT_TURN_LIMIT = 200
+TURN_ACTION_LIMIT = 500
+
+
+def prompt_turns(con, limit=PROMPT_TURN_LIMIT, session_id=None,
+                 raw_scan=PROMPT_TURN_RAW_SCAN):
+    """One row per user prompt, newest-first, with what happened in its window.
+
+    Only main-thread turns become rows: a subagent's own turns are its task
+    prompt, which belongs under its parent's turn rather than next to it. A
+    mid-turn user message (Claude Code delivers one as a new `user` event while
+    the turn is still running) starts a NEW group - the correct reading of
+    "grouped by prompt" rather than pretending turns are atomic.
+
+    Harness-generated turns (`TURN_NOISE_PATTERN`, the SQL twin of
+    `TURN_NOISE_RE`) never become rows, and several kept turns sharing one
+    `(session_id, ts)` - an image plus its caption, a `<command-name>` block plus
+    a bare `/compact` - collapse to the longest cleaned text, because left alone
+    they would produce phantom zero-width windows.
+
+    Returns a list of dicts: `session_id, ts, next_ts, event_id, preview,
+    full_len, tools, bash, agents, subcalls, output_tokens,
+    subagent_output_tokens, requests, last_ts, project, cwd`. Timestamps come
+    back as strings (materializing a raw TIMESTAMPTZ needs the optional `pytz`);
+    `next_ts` is None for each session's newest turn and `last_ts` None for a
+    turn that emitted no API request. Every count coalesces to 0, never None.
+    Token numbers are the turn's generation cost by the same attribute-by-time
+    rule the `command_tokens` view documents, so a turn whose reply carried no
+    usage row honestly reports 0. Read-only; never raises for a caller that
+    already guarded the connection.
+    """
+    where = ["type = 'user'", "agent_id IS NULL", "ts IS NOT NULL"]
+    params = []
+    # Filter inside the bounded scan, not after it, so `session_id=` sees that
+    # session's newest `raw_scan` turns rather than whatever survives a global cut.
+    if session_id:
+        where.append("session_id = ?")
+        params.append(session_id)
+    # Reminder regex, trim charset and noise regex are each bound from their one
+    # Python definition (`PROMPT_CLEAN_PARAMS`, `_prefix_alternation`), so the SQL
+    # clean cannot drift from `clean_prompt_text`: `preview` is always a prefix of
+    # `turn_prompt_text` for the same turn, and the `^` noise anchor sees the same
+    # string in both engines.
+    params += [*PROMPT_CLEAN_PARAMS, TURN_NOISE_PATTERN]
+    rows = con.execute(
+        f"""WITH raw AS (
+                SELECT session_id, ts, event_id, text FROM events
+                WHERE {' AND '.join(where)}
+                ORDER BY ts DESC LIMIT {int(raw_scan)}),
+            kept AS (
+                SELECT session_id, ts, event_id, {PROMPT_CLEAN_SQL} AS clean
+                FROM raw),
+            -- Collapse turns sharing one (session_id, ts), keeping the longest
+            -- text. Both aggregates order by the SAME (length, event_id) pair,
+            -- which is unique per row, so the id and the text always come from
+            -- one kept row: turn_prompt_text(event_id) can never disagree with
+            -- the preview the list showed.
+            turns AS (
+                SELECT session_id, ts,
+                       arg_max(event_id, (length(clean), event_id)) AS event_id,
+                       arg_max(clean, (length(clean), event_id))    AS clean
+                FROM kept
+                WHERE clean <> '' AND NOT regexp_matches(clean, ?)
+                GROUP BY session_id, ts),
+            win AS (
+                SELECT session_id, ts, event_id,
+                       substr(clean, 1, {PROMPT_PREVIEW_CHARS}) AS preview,
+                       length(clean) AS full_len,
+                       lead(ts) OVER (PARTITION BY session_id ORDER BY ts) AS next_ts
+                FROM turns),
+            recent AS (SELECT * FROM win ORDER BY ts DESC LIMIT {int(limit)}),
+            acts AS (
+                SELECT r.event_id, count(*) AS tools,
+                       count(*) FILTER (WHERE a.tool_name = 'Bash')     AS bash,
+                       count(DISTINCT a.agent_id)                       AS agents,
+                       count(*) FILTER (WHERE a.agent_id IS NOT NULL)   AS subcalls
+                FROM recent r
+                JOIN events a ON a.session_id = r.session_id AND a.type = 'tool_use'
+                             AND a.ts >= r.ts
+                             AND (r.next_ts IS NULL OR a.ts < r.next_ts)
+                GROUP BY r.event_id),
+            tok AS (
+                SELECT r.event_id, sum(q.output_tokens) AS output_tokens,
+                       sum(CASE WHEN q.agent_id IS NOT NULL THEN q.output_tokens
+                                ELSE 0 END)             AS subagent_output_tokens,
+                       count(*) AS requests, max(q.ts) AS last_ts
+                FROM recent r
+                JOIN api_requests q ON q.session_id = r.session_id
+                                   AND q.ts >= r.ts
+                                   AND (r.next_ts IS NULL OR q.ts < r.next_ts)
+                GROUP BY r.event_id)
+            SELECT r.session_id, r.ts::VARCHAR, r.next_ts::VARCHAR, r.event_id,
+                   r.preview, r.full_len,
+                   coalesce(a.tools, 0), coalesce(a.bash, 0),
+                   coalesce(a.agents, 0), coalesce(a.subcalls, 0),
+                   coalesce(t.output_tokens, 0), coalesce(t.subagent_output_tokens, 0),
+                   coalesce(t.requests, 0), t.last_ts::VARCHAR, s.project, s.cwd
+            FROM recent r
+            LEFT JOIN acts a ON a.event_id = r.event_id
+            LEFT JOIN tok  t ON t.event_id = r.event_id
+            LEFT JOIN sessions s ON s.session_id = r.session_id
+            ORDER BY r.ts DESC""",
+        params,
+    ).fetchall()
+    keys = ["session_id", "ts", "next_ts", "event_id", "preview", "full_len",
+            "tools", "bash", "agents", "subcalls", "output_tokens",
+            "subagent_output_tokens", "requests", "last_ts", "project", "cwd"]
+    return [dict(zip(keys, row)) for row in rows]
+
+
+def turn_actions(con, session_id, ts, next_ts=None, limit=TURN_ACTION_LIMIT):
+    """Every tool call in one turn's window, oldest-first: the detail page's list.
+
+    `ts`/`next_ts` are the strings `prompt_turns` returned for that turn; a
+    `next_ts` of None means the open-ended window of a session's newest turn.
+    Returns a list of dicts `ts, agent_id, tool_name, text, tool_input,
+    is_error`: `agent_id` splits main-thread from subagent calls, `is_error`
+    comes from the joined `tool_result` so the detail can mark failed calls, and
+    `text` is NULL for tools with no `_COMMAND_FIELD` entry (Agent, Skill, MCP,
+    ...), which the caller labels from `tool_input` at render time. A falsy
+    `session_id` or `ts` returns [] rather than an unbounded list: without a lower
+    bound this is not one turn but the session's whole history. Read-only; never
+    raises for a caller that already guarded the connection.
+    """
+    if not session_id or not ts:
+        return []
+    # try_cast so an unparseable bound degrades to an empty window rather than
+    # raising. `next_ts` is bound conditionally instead of
+    # `(?::TIMESTAMPTZ IS NULL OR ...)`: a NULL parameter has no inferable type in
+    # a prepared statement.
+    where = ["u.type = 'tool_use'", "u.session_id = ?",
+             "u.ts >= try_cast(? AS TIMESTAMPTZ)"]
+    params = [session_id, ts]
+    if next_ts:
+        where.append("u.ts < try_cast(? AS TIMESTAMPTZ)")
+        params.append(next_ts)
+    # Join a result set already collapsed to one row per tool_use_id: a call can
+    # carry more than one `tool_result` row (34 tool_use_ids in a real store do),
+    # and a plain join would list that call twice, spend two `limit` slots on it
+    # and disagree with `prompt_turns.tools`, which counts `events` unjoined.
+    # `max(is_error)` reads the duplicates as "any result failed".
+    rows = con.execute(
+        f"""SELECT u.ts::VARCHAR, u.agent_id, u.tool_name, u.text, u.tool_input,
+                   r.is_error
+            FROM events u
+            LEFT JOIN (SELECT tool_use_id, max(is_error) AS is_error
+                       FROM events WHERE type = 'tool_result'
+                       GROUP BY tool_use_id) r ON r.tool_use_id = u.tool_use_id
+            WHERE {' AND '.join(where)}
+            ORDER BY u.ts, u.event_id LIMIT {int(limit)}""",
+        params,
+    ).fetchall()
+    keys = ["ts", "agent_id", "tool_name", "text", "tool_input", "is_error"]
+    return [dict(zip(keys, row)) for row in rows]
+
+
+def turn_prompt_text(con, event_id):
+    """The full cleaned text of one turn, for the detail page's prompt view.
+
+    `prompt_turns` caps `preview` at `PROMPT_PREVIEW_CHARS`, so the whole text is
+    fetched only when something opens that turn. Returns None for an unknown
+    event_id or a turn that cleaned to nothing. Read-only.
+    """
+    if not event_id:
+        return None
+    row = con.execute(
+        "SELECT text FROM events WHERE event_id = ? AND type = 'user'",
+        [event_id],
+    ).fetchone()
+    if not row:
+        return None
+    return clean_prompt_text(row[0]) or None
 
 
 def session_token_totals(con, session_id):
