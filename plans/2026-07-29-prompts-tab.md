@@ -325,7 +325,7 @@ depend on the TUI.
     parent turn, mid-turn message splits the group, noise turns excluded, same-ts turns
     collapsed to one row, zero-call turn returns 0 not NULL, token split main vs subagent,
     `--session` filter, `prompt_for_command` no longer returns an `[Image: source:` echo.
-- [ ] 2. TUI: tab scaffolding
+- [x] 2. TUI: tab scaffolding
   - `TABS`, `AppState.tab`, `PromptsState`, `PromptTurn`/`TurnAction`, per-tab
     `visible_cols`, `selected_session_id()`, `Tab` cycling, tab strip, per-tab status hints,
     `modal_open`/`close_modals` coverage. Prompts tab renders an empty-state hint only.
