@@ -335,12 +335,21 @@ depend on the TUI.
   - `PROMPT_COLUMNS` + renderers, `build_prompts_table` / `build_prompts_panel`,
     `_load_prompt_turns` via `_with_store`, `LOAD_PROMPTS`, age line, `r`, `x`,
     `session_filter`, unavailable/busy hints.
+  - Carried over from the phase 2 review: `PromptsState.goto_bottom` / `move_down` never touch
+    `scroll_offset` (the feed pairs every move with `clamp(max_rows)`), and
+    `build_prompts_panel` ignores `term_height` for content sizing, so at 12 rows the status
+    line and hints are cropped. Both are inert until this phase renders a row window; this
+    phase owns the clamp.
   - Tests: column rendering per row shape, hide-empty filter, cursor clamp on reload,
     store-missing and store-busy hints.
 - [ ] 4. TUI: prompt detail
   - `build_turn_panel`, `OPEN_PROMPT`, `action_label`, agent gutter over actions, `b`
     toggle, scroll clamp, `Enter` into the refactored `build_prompt_panel`, `Esc`/`q` depth
     rules.
+  - Carried over from the phase 2 review: `modal_open()` already counts `prompts.detail` but
+    `render_panel` has no branch for it, so setting that field before this phase would swallow
+    every key but esc/q/enter with no visible change. Add the renderer in the SAME change that
+    first sets the field.
   - Tests: gutter glyphs over a main+subagent action list, `action_label` fallback for an
     `Agent` row (text NULL, description in `tool_input`), bash-only toggle, scroll clamp,
     Enter/Esc/q depth transitions.

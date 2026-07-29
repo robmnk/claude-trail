@@ -2,11 +2,13 @@ import json
 import os
 import sys
 import time
+from dataclasses import fields
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
 
+import claude_trail as feed          # for the records the turn queries map onto
 import claude_trail_store as store
 
 # The 13 objects the schema bootstrap must create: 9 tables + 4 views. Both show
@@ -1469,6 +1471,33 @@ def test_turn_actions_limit_caps_the_list(tmp_path, monkeypatch):
     finally:
         con.close()
     assert [a["tool_name"] for a in acts] == ["Bash", "Read"]
+
+
+def test_prompt_record_fields_match_the_query_keys(tmp_path, monkeypatch):
+    """The TUI's frozen records map 1:1 onto these queries' result dicts.
+
+    Pinned against the REAL queries rather than a copy of their keys: `from_row`
+    DROPS a key the record does not declare (right, for an added column), so a
+    renamed or removed one would otherwise leave the field at its default and
+    render a plausible row of zeros with the suite still green. Equality both
+    ways is the contract - an added key needs a field here, a removed one needs
+    the field gone. This test lives in this file because it needs the duckdb
+    fixtures; tests/test_claude_trail.py stays duckdb-free.
+    """
+    _sid, sid2 = _build_turn_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        rows = store.prompt_turns(con)
+        # Checked here, before the lookups below: a renamed key would otherwise
+        # raise a KeyError out of `rows[0]["ts"]` instead of showing the diff.
+        assert set(rows[0]) == {f.name for f in fields(feed.PromptTurn)}
+        # sid2's only turn is the newest in the store and holds one call in its
+        # open-ended window, so the newest row alone answers for both key sets.
+        acts = store.turn_actions(con, sid2, rows[0]["ts"], rows[0]["next_ts"])
+    finally:
+        con.close()
+    assert acts, "an empty action list would make the key check vacuous"
+    assert set(acts[0]) == {f.name for f in fields(feed.TurnAction)}
 
 
 def test_sql_clean_pipeline_agrees_with_the_python_one(tmp_path, monkeypatch):
