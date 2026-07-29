@@ -1425,6 +1425,21 @@ class TestFilterSessionLog:
         with patch.object(feed, "LOG_PATH", tmp_path / "absent.jsonl"):
             assert feed.filter_session_log("abc12345") is None
 
+    def test_none_when_the_session_has_no_rows_in_the_log(self, tmp_path):
+        """A session with no Bash command in the log has nothing to open. Reachable
+        from the Prompts tab (the store reads transcripts, the log is Bash-only),
+        where returning a path would open a 0-byte buffer in the user's editor
+        with no explanation. Nothing is written either, so no empty temp file is
+        left behind."""
+        import json
+        log = tmp_path / "command-log.jsonl"
+        log.write_text(json.dumps({"session_id": "aaa", "command": "one"}) + "\n",
+                       encoding="utf-8")
+        with patch.object(feed, "LOG_PATH", log), \
+             patch.object(feed.tempfile, "gettempdir", return_value=str(tmp_path)):
+            assert feed.filter_session_log("bbb") is None
+        assert not list(tmp_path.glob("claude-trail-session-*.json"))
+
     def test_filters_to_one_session(self, tmp_path):
         import json
         log = tmp_path / "command-log.jsonl"
@@ -1765,6 +1780,40 @@ class TestVisibleRowCount:
     def test_floors_at_min_visible_rows(self):
         assert feed.visible_row_count(1) == feed.MIN_VISIBLE_ROWS
 
+    def _panel_lines(self, width, height=24):
+        """Render the Commands panel with every column at `width` and return its
+        exported lines. One body row per entry, each carrying the session cell."""
+        entries = [{"timestamp": "2025-01-01T12:00:00+00:00", "command": f"cmd{i}",
+                    "cwd": "/work", "session_id": "abcd1234"} for i in range(60)]
+        cols = {c.key: True for c in feed.COLUMNS}
+        console = Console(width=width, record=True)
+        console.print(feed.build_panel(entries, height, cols, 0))
+        return console.export_text().splitlines()
+
+    def test_chrome_rows_matches_the_rendered_panel(self):
+        """CHROME_ROWS must equal the panel's real non-body height, or the row
+        math silently disagrees with the render: too low and Rich crops the
+        bottom (the key hints go first), too high and a body row is wasted.
+
+        Both widths matter. At 160 the hints fit on one line; at 80 they wrap to
+        two, which is what the constant's slack line has to absorb - so 80 is the
+        width that actually distinguishes 12 from 11.
+        """
+        for width in (80, 160):
+            lines = self._panel_lines(width)
+            out = "\n".join(lines)
+            assert len(lines) == 24, width
+            assert out.count("abcd1234") == feed.visible_row_count(24), width
+            assert "c:clear" in out, width   # the hint tail, first thing a crop eats
+
+    def test_chrome_rows_is_not_one_row_too_many(self):
+        """The other side of the pin: CHROME_ROWS must be the SMALLEST value that
+        fits, so one less has to overflow. Without this a too-generous constant
+        renders cleanly while wasting a body row at every terminal size."""
+        with patch.object(feed, "CHROME_ROWS", feed.CHROME_ROWS - 1):
+            out = "\n".join(self._panel_lines(80))
+            assert "c:clear" not in out
+
 
 class TestAppState:
     """Pure view-state logic lifted out of main()."""
@@ -2013,7 +2062,7 @@ class TestTabs:
     def test_only_the_commands_tab_has_columns_registered(self):
         # The prompts tab's column list lands with its renderers; until then its
         # visibility dict is empty, which is what makes its digit keys inert.
-        assert feed.COLUMNS_BY_TAB["commands"] is feed.COLUMNS
+        assert feed.COLUMNS_BY_TAB["commands"] == feed.COLUMNS
         assert feed.COLUMNS_BY_TAB["prompts"] == []
         assert feed._default_cols("prompts") == {}
 
@@ -2097,8 +2146,12 @@ class TestTabs:
 class TestPromptRecords:
     """The frozen records the store's turn queries map onto."""
 
-    # The keys `claude_trail_store.prompt_turns` documents and returns; the query
-    # itself is covered by tests/test_store.py. A rename there must break here.
+    # The keys `claude_trail_store.prompt_turns` / `turn_actions` document and
+    # return, copied so this file needs no duckdb. The copies are pinned against
+    # the REAL queries in tests/test_store.py
+    # (test_prompt_record_fields_match_the_query_keys) - that is what catches a
+    # rename in the SQL; the two fixture tests below only keep these dicts
+    # exhaustive, so the mapping tests never skip a field.
     TURN_ROW = {
         "session_id": "s1", "ts": "2026-07-29 10:00:00-03", "next_ts": None,
         "event_id": "ev-1", "preview": "lets plan a feature", "full_len": 19,
@@ -2112,10 +2165,10 @@ class TestPromptRecords:
         "is_error": False,
     }
 
-    def test_prompt_turn_fields_match_the_query_keys(self):
+    def test_turn_row_fixture_covers_every_field(self):
         assert {f.name for f in fields(feed.PromptTurn)} == set(self.TURN_ROW)
 
-    def test_turn_action_fields_match_the_query_keys(self):
+    def test_action_row_fixture_covers_every_field(self):
         assert {f.name for f in fields(feed.TurnAction)} == set(self.ACTION_ROW)
 
     def test_from_row_maps_every_value(self):
@@ -2306,6 +2359,16 @@ class TestModalExclusion:
     """modal_open()/close_modals() with the prompts turn in the mix: one place
     resets every modal field, or a stale panel renders over the list."""
 
+    # The fields close_modals() deliberately leaves alone. Everything NOT listed
+    # here is modal state and must be back at its default afterwards, which is
+    # what makes the reset test below derived rather than field-by-field.
+    # `search` is on the list because the search modal closes through its own
+    # handler (`_apply_search_key`), not through close_modals.
+    KEPT_APP_FIELDS = {"entries", "cursor", "scroll_offset", "visible_cols",
+                       "tab", "prompts", "prompt_cols", "search"}
+    KEPT_PROMPTS_FIELDS = {"rows", "cursor", "scroll_offset", "loaded_at",
+                           "status", "session_filter", "hide_empty"}
+
     def test_modal_open_true_for_each_modal(self):
         entry = {"command": "c", "session_id": "s"}
         for kwargs in ({"detail_entry": entry}, {"session_detail": "s"},
@@ -2317,6 +2380,15 @@ class TestModalExclusion:
         assert state.modal_open() is True
 
     def test_close_modals_clears_every_field(self):
+        """Derived from the dataclasses, not a hand-written field list: a modal
+        field added to AppState/PromptsState and forgotten in close_detail must
+        fail here.
+
+        Two loops make that work. The first asserts the setup dirtied every modal
+        field, so a new field nobody thought to set here fails immediately
+        instead of passing vacuously (its value would already be the default);
+        the second is the actual reset check.
+        """
         entry = {"command": "c", "session_id": "s"}
         state = feed.AppState(
             entries=[entry], detail_entry=entry, session_detail="s",
@@ -2331,24 +2403,19 @@ class TestModalExclusion:
         state.prompts.prompt_open = True
         state.prompts.prompt_scroll = 5
 
+        app_defaults, prompt_defaults = feed.AppState(entries=[]), feed.PromptsState()
+        modal = [(state, app_defaults, f.name) for f in fields(feed.AppState)
+                 if f.name not in self.KEPT_APP_FIELDS]
+        modal += [(state.prompts, prompt_defaults, f.name)
+                  for f in fields(feed.PromptsState)
+                  if f.name not in self.KEPT_PROMPTS_FIELDS]
+        for obj, defaults, name in modal:
+            assert getattr(obj, name) != getattr(defaults, name), f"setup missed {name}"
+
         state.close_modals()
 
-        assert state.detail_entry is None
-        assert state.session_detail is None
-        assert state.session_agent_id is None
-        assert state.session_scroll == 0
-        assert state.db_info is None
-        assert state.detail_tokens is None
-        assert state.session_tokens is None
-        assert state.detail_prompt is None
-        assert state.detail_prompt_open is False
-        assert state.detail_prompt_scroll == 0
-        assert state.prompts.detail is None
-        assert state.prompts.actions is None
-        assert state.prompts.detail_text is None
-        assert state.prompts.detail_scroll == 0
-        assert state.prompts.prompt_open is False
-        assert state.prompts.prompt_scroll == 0
+        for obj, defaults, name in modal:
+            assert getattr(obj, name) == getattr(defaults, name), f"not reset: {name}"
         assert state.modal_open() is False
 
     def test_close_modals_keeps_the_loaded_prompts_list(self):
@@ -2390,6 +2457,31 @@ class TestModalExclusion:
         state = _prompts_state(rows=1)
         state.prompts.detail = state.prompts.rows[0]
         assert feed.apply_key(state, "\x03", 10) is feed.Action.QUIT
+
+    def test_tab_is_swallowed_while_a_modal_is_open(self):
+        """An open modal must eat `Tab`, from either tab and for every modal kind.
+
+        The modals are shared but the panels are per tab, so a switch that got
+        through would leave the modal's fields set with no renderer for them: the
+        other tab's list draws and the only way out is a key that closes a modal
+        the user can no longer see.
+        """
+        modals = ("detail_entry", "session_detail", "db_info", "prompts.detail")
+        for tab in feed.TABS:
+            for which in modals:
+                state = _prompts_state(rows=1)
+                state.tab = tab
+                if which == "prompts.detail":
+                    state.prompts.detail = state.prompts.rows[0]
+                elif which == "detail_entry":
+                    state.detail_entry = state.selected_entry()
+                elif which == "db_info":
+                    state.db_info = [("connection", "/x")]
+                else:
+                    state.session_detail = "sid-p0"
+                assert feed.apply_key(state, "\t", 10) is feed.Action.NONE, (tab, which)
+                assert state.tab == tab, (tab, which)
+                assert state.modal_open() is True, (tab, which)
 
 
 class TestPromptView:

@@ -1095,7 +1095,13 @@ def build_table(
 
 def filter_session_log(session_id: str) -> str | None:
     """Filter the command log down to one session, write it pretty-printed to a
-    temp `.json` file, and return that path (or None if there is nothing to show).
+    temp `.json` file, and return that path - or None when there is nothing to
+    show: no session id, no log file, or no line in the log for that session.
+
+    That last case is reachable from the Prompts tab, where a row's session may
+    never have run a Bash command (the store reads transcripts, the log is
+    Bash-only), so nothing is written and `o` stays inert rather than opening an
+    empty buffer in the user's editor.
 
     The output is only ever opened in an editor for a human, so each entry is
     re-emitted indented (blocks joined by a blank line, like
@@ -1110,6 +1116,8 @@ def filter_session_log(session_id: str) -> str | None:
             entry = parse_line(line.strip())
             if entry and entry.get("session_id", "") == session_id:
                 blocks.append(json.dumps(entry, indent=2, ensure_ascii=False))
+    if not blocks:
+        return None
     with open(out_path, "w", encoding="utf-8") as f_out:
         f_out.write("\n\n".join(blocks))
     return out_path
@@ -2144,6 +2152,12 @@ def _record_from_row(cls, row: dict):
     Keys the record does not declare are dropped instead of raising: the store
     owns those queries' shapes, and a TUI that died on an added column would be
     worse than one that ignores it.
+
+    The other direction is NOT caught here: a key the query stopped returning
+    (renamed, dropped) leaves that field at its default, which renders as a
+    plausible zero rather than an error. What pins it is
+    `tests/test_store.py::test_prompt_record_fields_match_the_query_keys`, which
+    compares these field names against the keys the REAL queries return.
     """
     known = {f.name for f in fields(cls)}
     return cls(**{k: v for k, v in row.items() if k in known})
@@ -2154,10 +2168,12 @@ class PromptTurn:
     """One row of the Prompts tab: a user prompt plus what happened in its window.
 
     Field names and order mirror the keys of `claude_trail_store.prompt_turns`,
-    so `from_row` is a straight mapping and a rename in the query breaks loudly
-    here. Timestamps arrive as strings (`ts`, `next_ts`, `last_ts`); `next_ts` is
-    None for a session's newest turn and `last_ts` None for a turn that emitted
-    no API request. Every count is already coalesced to 0 by the query.
+    so `from_row` is a straight mapping; the two key sets are pinned equal
+    against the real query by a test (see `_record_from_row`, which silently
+    drops a key it does not declare). Timestamps arrive as strings (`ts`,
+    `next_ts`, `last_ts`); `next_ts` is None for a session's newest turn and
+    `last_ts` None for a turn that emitted no API request. Every count is already
+    coalesced to 0 by the query.
 
     Two things worth knowing before rendering these:
 
