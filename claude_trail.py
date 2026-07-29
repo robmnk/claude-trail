@@ -8,12 +8,17 @@ Pipeline:
     column view state), and Rich renders the state as a newest-first table or a
     full-command detail panel.
 
+    That feed is the Commands tab. A second top-level tab (Prompts, `TABS`) lists
+    one row per user prompt and is read from the audit store instead
+    (`claude_trail_store`), which the store subcommands and the token/prompt
+    modals already use; `Tab` switches between them and each keeps its own cursor.
+
 Layout: the file is split into `# ==== <name> ====` banners, in file order:
-    config/paths, danger + path patterns, columns, session /color parsing,
+    config/paths, danger + path patterns, columns + tabs, session /color parsing,
     danger detection + path extraction, session names, session colors,
     format/parse helpers, rendering (table), side-effecting actions,
     rendering (panels), input decoding, file tailing, hook,
-    AppState + apply_key, main.
+    AppState (+ per-tab state) + apply_key, main.
 """
 
 import enum
@@ -30,7 +35,7 @@ import tempfile
 import termios
 import time
 import tty
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 from pathlib import Path
@@ -93,7 +98,7 @@ def _env_int(key: str, default: int) -> int:
 
 MAX_ENTRIES = 1000
 POLL_INTERVAL = 0.3
-CHROME_ROWS = 10  # title, status, padding
+CHROME_ROWS = 12  # title, tab strip + its blank, status, padding
 # Non-body lines around the search-results table (borders, padding, header/root
 # rows, table header, blank spacers, hint); the results window is sized so the
 # table body never overflows the panel and crops the cursor row out of view.
@@ -209,7 +214,7 @@ FILE_PATH_RE = re.compile(
 )
 
 
-# ==== Columns ====
+# ==== Columns + tabs ====
 
 
 @dataclass(frozen=True, eq=False)
@@ -322,6 +327,22 @@ COLUMNS = [
     Column(5, "Command", "white",
            {"ratio": 1, "no_wrap": True, "overflow": "ellipsis"}, _render_command),
 ]
+
+# The two top-level views. `AppState.tab` holds one and `Tab` cycles them; the
+# feed stays first so the default view is unchanged.
+TABS = ("commands", "prompts")
+
+# Which columns each tab shows. One registry keyed by tab is the single source of
+# truth for the digit toggles, each tab's default visibility dict, and the status
+# bar's `cols:` segment. The prompts tab has no column list registered yet, so
+# its visibility dict is empty and its digit keys are inert.
+COLUMNS_BY_TAB: dict[str, list[Column]] = {"commands": COLUMNS, "prompts": []}
+
+
+def _default_cols(tab: str) -> dict[int, bool]:
+    """Every column registered for `tab`, all visible (a tab's initial state)."""
+    return {c.key: True for c in COLUMNS_BY_TAB.get(tab, ())}
+
 
 # ==== Session /color parsing + aliases ====
 
@@ -1774,6 +1795,50 @@ def count_active_sessions(
     return len(active)
 
 
+def _tab_strip(active: str) -> Text:
+    """The tab strip: the first line of a panel's body, one chip per `TABS` entry.
+
+    The active tab is `bold reverse` and the others `dim`, so which view is on
+    screen is readable without colour.
+    """
+    strip = Text("  ")
+    for tab in TABS:
+        strip.append(f" {tab.capitalize()} ",
+                     style="bold reverse" if tab == active else "dim")
+        strip.append(" ")
+    return strip
+
+
+# Key hints per tab: the tabs answer different keys (the feed has `/`, `f` and
+# `c`; the prompts list has `r` and `x`), so one shared line would advertise keys
+# that do nothing on the view you are looking at.
+_TAB_HINTS = {
+    "commands": ("j/k:nav  ↵:view  s:session  d:db  o:log  t:transcript  "
+                 "/:search  f:folder  tab:prompts  q:quit  c:clear"),
+    "prompts": ("j/k:nav  ↵:view  r:refresh  x:hide empty  s:session  "
+                "o:log  t:transcript  d:db  tab:commands  q:quit"),
+}
+
+
+def _tab_status(tab: str, visible_cols: dict[int, bool]) -> Text:
+    """The hints line for `tab`, prefixed by its column toggles.
+
+    A tab with no registered columns (empty `visible_cols`) shows the hints
+    alone rather than an empty `cols:` label.
+    """
+    hints = _TAB_HINTS.get(tab, "")
+    if not visible_cols:
+        return Text.from_markup(f"  [dim italic]{hints}[/dim italic]")
+    col_toggles = " ".join(
+        f"[bold]{k}[/bold]" if visible_cols[k] else f"[dim]{k}[/dim]"
+        for k in sorted(visible_cols)
+    )
+    return Text.from_markup(
+        f"  [dim italic]cols:[/dim italic] {col_toggles}"
+        f"  [dim italic]·  {hints}[/dim italic]"
+    )
+
+
 def build_panel(
     entries: list[LogEntry],
     term_height: int,
@@ -1785,6 +1850,10 @@ def build_panel(
     agent_map: dict[str, dict] | None = None,
 ) -> Panel:
     """Wrap the table (or the empty-state hint) plus the status bar in a Panel.
+
+    This is the Commands tab, so its strip marks that tab active and
+    `visible_cols` is that tab's flat `{key: shown}` dict (see
+    `AppState.visible_cols_for`); the Prompts tab has `build_prompts_panel`.
 
     Cursor/offset contract matches `build_table`: the display is newest-first,
     the highlighted row is at `highlight_idx = cursor - offset`, and `offset`
@@ -1803,11 +1872,6 @@ def build_panel(
 
     active_count = count_active_sessions(entries, datetime.now().astimezone())
 
-    col_toggles = " ".join(
-        f"[bold]{k}[/bold]" if visible_cols[k] else f"[dim]{k}[/dim]"
-        for k in sorted(visible_cols)
-    )
-
     status = Text()
     status.append(" \u25cf", style="bright_green")
     status.append(f"  {active_count} active", style="bold yellow" if active_count > 0 else "dim")
@@ -1816,17 +1880,50 @@ def build_panel(
     else:
         status.append("  \u00b7  0/0", style="dim")
 
-    status2 = Text.from_markup(
-        f"  [dim italic]cols:[/dim italic] {col_toggles}"
-        "  [dim italic]\u00b7  j/k:nav  \u21b5:view  s:session  d:db  o:log  t:transcript  /:search  f:folder  q:quit  c:clear[/dim italic]"
-    )
-
-    body = Group(content, Text(""), status, status2)
+    body = Group(_tab_strip("commands"), Text(""), content, Text(""), status,
+                 _tab_status("commands", visible_cols))
 
     return Panel(
         body,
         title=_panel_title(),
         subtitle=f"[dim]{LOG_PATH}[/dim]",
+        box=box.ROUNDED,
+        padding=(1, 2),
+        height=term_height,
+    )
+
+
+def build_prompts_panel(
+    prompts: "PromptsState",
+    term_height: int,
+    visible_cols: dict[int, bool] | None = None,
+) -> Panel:
+    """The Prompts tab: tab strip, the turn list, and the status bar.
+
+    The list is read from the audit store rather than the live command log, so
+    an empty list is the normal state until an ingest has run and the empty state
+    says so (and how to fix it) instead of showing a blank table. A `status` set
+    on the state (a missing store, or a lock collision against a running ingest)
+    is shown above the hint, so the tab always explains itself.
+    """
+    content = Text()
+    if prompts.status:
+        content.append(f"{prompts.status}\n\n", style="dim italic")
+    content.append("No prompts to show.\n\n", style="dim italic")
+    content.append(
+        "This tab reads the audit store, not the live command feed.\n", style="dim")
+    content.append("Fill it with: claude-trail ingest", style="dim")
+
+    n = len(prompts.rows)
+    status = Text()
+    status.append(f"  {prompts.cursor + 1}/{n}" if n else "  0/0", style="dim")
+
+    body = Group(_tab_strip("prompts"), Text(""), content, Text(""), status,
+                 _tab_status("prompts", visible_cols or {}))
+
+    return Panel(
+        body,
+        title=_panel_title(),
         box=box.ROUNDED,
         padding=(1, 2),
         height=term_height,
@@ -2041,6 +2138,141 @@ class SearchState:
     flash: str | None = None
 
 
+def _record_from_row(cls, row: dict):
+    """Build one frozen record of `cls` from a store result dict.
+
+    Keys the record does not declare are dropped instead of raising: the store
+    owns those queries' shapes, and a TUI that died on an added column would be
+    worse than one that ignores it.
+    """
+    known = {f.name for f in fields(cls)}
+    return cls(**{k: v for k, v in row.items() if k in known})
+
+
+@dataclass(frozen=True)
+class PromptTurn:
+    """One row of the Prompts tab: a user prompt plus what happened in its window.
+
+    Field names and order mirror the keys of `claude_trail_store.prompt_turns`,
+    so `from_row` is a straight mapping and a rename in the query breaks loudly
+    here. Timestamps arrive as strings (`ts`, `next_ts`, `last_ts`); `next_ts` is
+    None for a session's newest turn and `last_ts` None for a turn that emitted
+    no API request. Every count is already coalesced to 0 by the query.
+
+    Two things worth knowing before rendering these:
+
+    - `tools` is INCLUSIVE of `subcalls`: one main-thread Bash plus two subagent
+      calls is `tools=3, subcalls=2`, so a main-thread count is `tools - subcalls`
+      (subtract, never add).
+    - `cwd` is always None. `_upsert_session` never writes that column, so
+      `sessions.cwd` is dead; `project` is the populated one. The field is kept
+      because it documents the gap, and nothing renders it.
+    """
+
+    session_id: str
+    ts: str
+    next_ts: str | None = None
+    event_id: str = ""
+    preview: str = ""
+    full_len: int = 0
+    tools: int = 0
+    bash: int = 0
+    agents: int = 0
+    subcalls: int = 0
+    output_tokens: int = 0
+    subagent_output_tokens: int = 0
+    requests: int = 0
+    last_ts: str | None = None
+    project: str | None = None
+    cwd: str | None = None
+
+    @classmethod
+    def from_row(cls, row: dict) -> "PromptTurn":
+        """One turn from a `prompt_turns` result dict (unknown keys dropped)."""
+        return _record_from_row(cls, row)
+
+
+@dataclass(frozen=True)
+class TurnAction:
+    """One tool call inside a turn's window, for the turn-detail list.
+
+    Field names mirror the keys of `claude_trail_store.turn_actions`. `agent_id`
+    is None for a main-thread call and the subagent's id otherwise (what the
+    detail page's tree gutter groups by); `text` is None for tools the store has
+    no command repr for (Agent, Skill, MCP, ...), which the renderer labels from
+    `tool_input` instead; `is_error` comes from the joined `tool_result`.
+    """
+
+    ts: str
+    agent_id: str | None = None
+    tool_name: str = ""
+    text: str | None = None
+    tool_input: str | None = None
+    is_error: bool | None = None
+
+    @classmethod
+    def from_row(cls, row: dict) -> "TurnAction":
+        """One call from a `turn_actions` result dict (unknown keys dropped)."""
+        return _record_from_row(cls, row)
+
+
+@dataclass
+class PromptsState:
+    """View state for the Prompts tab (`AppState.prompts`).
+
+    Nested like `SearchState` so `AppState` does not grow a dozen more fields,
+    and so this tab's cursor/scroll are separate from the feed's: switching tabs
+    leaves each view where the user left it.
+
+    The first block is the list (`rows` newest-first, as the query returns them,
+    with `cursor` indexing it directly - no reversal, unlike the feed). The
+    second block is the open turn's modal; `AppState.close_modals` resets it
+    through `close_detail` so every modal is still dropped in one place.
+    """
+
+    rows: list[PromptTurn] = field(default_factory=list)
+    cursor: int = 0
+    scroll_offset: int = 0
+    loaded_at: float | None = None      # time.monotonic() of the last load, for the age line
+    status: str | None = None           # why the list is empty/stale (missing store, busy store)
+    session_filter: str | None = None   # None = every session, interleaved newest-first
+    hide_empty: bool = False            # drop turns with 0 tool calls
+    detail: PromptTurn | None = None    # the open turn (modal)
+    actions: list[TurnAction] | None = None
+    detail_text: str | None = None      # full prompt text for the open turn
+    detail_scroll: int = 0
+    prompt_open: bool = False           # the nested full-prompt view
+    prompt_scroll: int = 0
+
+    def close_detail(self) -> None:
+        """Drop the open turn's modal state, keeping the loaded list intact."""
+        self.detail = None
+        self.actions = None
+        self.detail_text = None
+        self.detail_scroll = 0
+        self.prompt_open = False
+        self.prompt_scroll = 0
+
+    def selected(self) -> PromptTurn | None:
+        """The row the cursor points at, or None when the list is empty."""
+        if not self.rows or self.cursor < 0 or self.cursor >= len(self.rows):
+            return None
+        return self.rows[self.cursor]
+
+    def move_up(self) -> None:
+        self.cursor = max(0, self.cursor - 1)
+
+    def move_down(self) -> None:
+        self.cursor = min(max(0, len(self.rows) - 1), self.cursor + 1)
+
+    def goto_top(self) -> None:
+        self.cursor = 0
+        self.scroll_offset = 0
+
+    def goto_bottom(self) -> None:
+        self.cursor = max(0, len(self.rows) - 1)
+
+
 @dataclass
 class AppState:
     """All view state for the TUI, independent of terminal I/O.
@@ -2049,13 +2281,25 @@ class AppState:
     `scroll_offset` index the newest-first VIEW, where index 0 = the newest
     entry. `selected_entry()` is the single place that bridges the two by
     reversing `entries`.
+
+    `tab` selects the active top-level view. The feed's row state
+    (`entries`/`cursor`/`scroll_offset`/`visible_cols`) is the Commands tab's; the
+    Prompts tab keeps its own in `prompts`, so each tab remembers its cursor
+    across a switch. Column visibility is per tab too (`visible_cols_for`), while
+    the modal fields below are shared: `s`, `d` and the detail views open the same
+    panels from either tab.
     """
 
     entries: list[LogEntry]
     cursor: int = 0
     scroll_offset: int = 0
     visible_cols: dict[int, bool] = field(
-        default_factory=lambda: {c.key: True for c in COLUMNS}
+        default_factory=lambda: _default_cols("commands")
+    )
+    tab: str = TABS[0]  # "commands": the feed stays the default view
+    prompts: PromptsState = field(default_factory=PromptsState)
+    prompt_cols: dict[int, bool] = field(
+        default_factory=lambda: _default_cols("prompts")
     )
     detail_entry: LogEntry | None = None
     session_detail: str | None = None  # a session_id while the session modal is open
@@ -2070,11 +2314,14 @@ class AppState:
     detail_prompt_scroll: int = 0       # scroll offset over the full prompt's lines
 
     def modal_open(self) -> bool:
-        """True while a full-screen modal (command detail, session detail, or the
-        database view) is open. Only one is ever open at a time; while open,
-        navigation/column/clear keys are ignored (only Ctrl-C still quits)."""
+        """True while a full-screen modal (command detail, session detail, the
+        database view, or a prompts-tab turn) is open. Only one is ever open at a
+        time; while open, navigation/column/clear keys are ignored (only Ctrl-C
+        still quits). The prompts turn's own sub-state (`actions`, `detail_text`,
+        `prompt_open`) only exists while `detail` is set, so `detail` alone
+        answers for that modal."""
         return (self.detail_entry is not None or self.session_detail is not None
-                or self.db_info is not None)
+                or self.db_info is not None or self.prompts.detail is not None)
 
     def prompt_available(self) -> bool:
         """True when the open command modal has a real prompt to drill into.
@@ -2097,12 +2344,66 @@ class AppState:
         self.detail_prompt = None
         self.detail_prompt_open = False
         self.detail_prompt_scroll = 0
+        self.prompts.close_detail()
 
     def selected_entry(self) -> LogEntry | None:
         """The entry the cursor points at in the newest-first view, or None."""
         if not self.entries or self.cursor < 0 or self.cursor >= len(self.entries):
             return None
         return list(reversed(self.entries))[self.cursor]
+
+    def selected_row(self) -> object | None:
+        """The row the cursor points at on the ACTIVE tab, or None when that tab
+        has no rows: a `LogEntry` on commands, a `PromptTurn` on prompts. The
+        session-scoped keys gate on this so they are inert on an empty list."""
+        if self.tab == "prompts":
+            return self.prompts.selected()
+        return self.selected_entry()
+
+    def selected_session_id(self) -> str | None:
+        """The session the cursor points at, whichever tab is active.
+
+        `s`, `o`, `t` need only a session id, so routing them through one
+        accessor makes them work on both tabs. None when the tab has no row, or
+        when the row carries no session id (a hand-edited/legacy log line), which
+        leaves those keys inert rather than acting on a blank session."""
+        if self.tab == "prompts":
+            turn = self.prompts.selected()
+            return (turn.session_id or None) if turn else None
+        entry = self.selected_entry()
+        return (entry.get("session_id") or None) if entry else None
+
+    def cycle_tab(self, step: int = 1) -> None:
+        """Switch to the next tab (`Tab`). Each tab's cursor/scroll live in
+        separate fields, so a switch never disturbs the other view."""
+        try:
+            idx = TABS.index(self.tab)
+        except ValueError:
+            idx = 0
+        self.tab = TABS[(idx + step) % len(TABS)]
+
+    def visible_cols_for(self, tab: str | None = None) -> dict[int, bool]:
+        """The `{column key: shown}` dict of `tab` (default: the active tab).
+
+        Kept as one flat dict per tab so `build_table` / `build_panel` keep taking
+        exactly what they took before - the active tab's dict."""
+        if (tab or self.tab) == "prompts":
+            return self.prompt_cols
+        return self.visible_cols
+
+    def open_session_detail(self, sid: str | None,
+                            agent_id: str | None = None) -> Action:
+        """Open the session modal for `sid`, returning the Action main() needs.
+
+        Shared by both tabs' `s` key so the modal's fields are set in one place.
+        A falsy `sid` (no row, or a row with no session) leaves the modal closed
+        and returns NONE instead of showing a blank identity."""
+        if not sid:
+            return Action.NONE
+        self.session_detail = sid
+        self.session_agent_id = agent_id
+        self.session_scroll = 0  # start each open at the top of the list
+        return Action.OPEN_SESSION_DETAIL
 
     def move_up(self) -> None:
         self.cursor = max(0, self.cursor - 1)
@@ -2117,10 +2418,16 @@ class AppState:
     def goto_bottom(self) -> None:
         self.cursor = max(0, len(self.entries) - 1)
 
-    def toggle_col(self, col: int) -> None:
-        """Flip a column's visibility, but never hide the last visible column."""
-        if not self.visible_cols[col] or sum(self.visible_cols.values()) > 1:
-            self.visible_cols[col] = not self.visible_cols[col]
+    def toggle_col(self, col: int, tab: str | None = None) -> None:
+        """Flip a column's visibility on `tab` (default: the active tab), but
+        never hide the last visible column. A key the tab has no column for is a
+        no-op, which is what makes the digit keys inert on a tab with no
+        registered columns."""
+        cols = self.visible_cols_for(tab)
+        if col not in cols:
+            return
+        if not cols[col] or sum(cols.values()) > 1:
+            cols[col] = not cols[col]
 
     def ingest(self, new_lines: list[str]) -> int:
         """Parse and append new log lines; re-anchor the cursor if scrolled away.
@@ -2213,62 +2520,126 @@ def _apply_search_key(state: AppState, search: SearchState, ch: str) -> Action:
     return Action.NONE
 
 
+def _apply_modal_key(state: AppState, ch: str) -> Action:
+    """Handle one keypress while a full-screen modal is open (mutation only).
+
+    Modal view (command detail, session detail, database, prompts turn): esc / q
+    / enter return to the table; Ctrl-C still quits. `close_modals()` clears
+    every modal field, which keeps them mutually exclusive.
+
+    Both tabs route here: `s` and `d` open the session / database modals from the
+    prompts list too, so one handler answers wherever the modal was opened from
+    (otherwise a modal opened on the prompts tab would be a trap, since that
+    tab's branch runs before this one).
+    """
+    if ch == "\x03":
+        return Action.QUIT
+    if state.detail_prompt_open:
+        # The full-prompt view (drilled into from the command modal) owns its
+        # keys: esc / enter step back one level to the command, `q` still
+        # closes everything in one key, and j/k/g/G scroll the prompt body.
+        if ch in ("\x1b", "\r", "\n"):
+            state.detail_prompt_open = False
+            state.detail_prompt_scroll = 0
+        elif ch == "q":
+            state.close_modals()
+        elif ch in ("j", "down"):
+            state.detail_prompt_scroll += 1
+        elif ch in ("k", "up"):
+            state.detail_prompt_scroll = max(0, state.detail_prompt_scroll - 1)
+        elif ch == "g":
+            state.detail_prompt_scroll = 0
+        elif ch == "G":
+            state.detail_prompt_scroll = 10**9  # clamped in build_prompt_panel
+        return Action.NONE
+    if ch in ("\r", "\n") and state.detail_entry is not None and state.prompt_available():
+        # Enter on a command modal that HAS a prompt opens it in full instead
+        # of closing; with no prompt to open it keeps the old one-key exit.
+        state.detail_prompt_open = True
+        state.detail_prompt_scroll = 0
+        return Action.NONE
+    if ch in ("\x1b", "q", "\r", "\n"):
+        state.close_modals()
+        return Action.NONE
+    # In the session modal only, the nav keys scroll the subagent list
+    # instead of being swallowed. G's sentinel and every offset are clamped
+    # for display in build_session_panel (and written back by render_panel).
+    # The command-detail / database modals keep full-swallow behavior.
+    if state.session_detail is not None:
+        if ch in ("j", "down"):
+            state.session_scroll += 1
+        elif ch in ("k", "up"):
+            state.session_scroll = max(0, state.session_scroll - 1)
+        elif ch == "g":
+            state.session_scroll = 0
+        elif ch == "G":
+            state.session_scroll = 10**9  # clamped in build_session_panel
+    return Action.NONE
+
+
+def _apply_prompts_key(state: AppState, prompts: PromptsState, ch: str) -> Action:
+    """Handle one keypress while the Prompts tab is active (mutation only).
+
+    Mirrors `_apply_search_key`: it mutates state and returns an Action for
+    main() to perform, doing no I/O itself. An open modal is handed to the shared
+    `_apply_modal_key`, since `s` and `d` open those panels from this tab too.
+
+    The feed-only keys are deliberately absent: `c` (clear) belongs to the log
+    tail, and `/` (search) and `f` (folder) need a row's cwd and a command's file
+    list, which a turn row does not carry. `↵` (open a turn), `r` (refresh) and
+    `x` (hide empty turns) are advertised in the status hints and fall through to
+    NONE until the list itself reads the store.
+    """
+    if state.modal_open():
+        return _apply_modal_key(state, ch)
+    if ch in ("q", "\x03"):
+        return Action.QUIT
+    if ch == "\t":
+        state.cycle_tab()
+    elif ch in ("k", "up"):
+        prompts.move_up()
+    elif ch in ("j", "down"):
+        prompts.move_down()
+    elif ch == "g":
+        prompts.goto_top()
+    elif ch == "G":
+        prompts.goto_bottom()
+    elif ch.isdigit():
+        # Inert while this tab has no columns registered; toggle_col ignores a
+        # key it has no column for, so no digit can hide a column of the feed.
+        state.toggle_col(int(ch))
+    elif ch == "s":
+        # A turn row is a main-thread turn, so there is no subagent to spotlight.
+        return state.open_session_detail(state.selected_session_id())
+    elif ch in ("o", "t"):
+        # Session-scoped: main() resolves the id with selected_session_id(), so
+        # both tabs share one path. Inert when there is no row to act on.
+        if state.selected_row() is not None:
+            return Action.OPEN_SESSION if ch == "o" else Action.OPEN_TRANSCRIPT
+    elif ch == "d":
+        # The database modal describes the store, not a session, so it opens from
+        # either tab with or without a selected row (see the commands branch).
+        return Action.LOAD_DB_INFO
+    return Action.NONE
+
+
 def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
     """Apply one keypress to `state`, returning the Action main() must perform.
 
     Mutates `state` but spawns no processes and touches no terminal.
+
+    Dispatch order: the search modal (it owns every key, including `Tab`, while
+    open), then the active tab's handler, then - on the Commands tab - any open
+    modal, then the feed's own keys.
     """
     if state.search is not None:
         # The search modal is mutually exclusive with the command/session modals
         # and takes precedence: it owns every key while open.
         return _apply_search_key(state, state.search, ch)
+    if state.tab == "prompts":
+        return _apply_prompts_key(state, state.prompts, ch)
     if state.modal_open():
-        # Modal view (command detail or session detail): esc / q / enter return
-        # to the table; Ctrl-C still quits. close_modals() clears every modal
-        # field, which keeps them mutually exclusive.
-        if ch == "\x03":
-            return Action.QUIT
-        if state.detail_prompt_open:
-            # The full-prompt view (drilled into from the command modal) owns its
-            # keys: esc / enter step back one level to the command, `q` still
-            # closes everything in one key, and j/k/g/G scroll the prompt body.
-            if ch in ("\x1b", "\r", "\n"):
-                state.detail_prompt_open = False
-                state.detail_prompt_scroll = 0
-            elif ch == "q":
-                state.close_modals()
-            elif ch in ("j", "down"):
-                state.detail_prompt_scroll += 1
-            elif ch in ("k", "up"):
-                state.detail_prompt_scroll = max(0, state.detail_prompt_scroll - 1)
-            elif ch == "g":
-                state.detail_prompt_scroll = 0
-            elif ch == "G":
-                state.detail_prompt_scroll = 10**9  # clamped in build_prompt_panel
-            return Action.NONE
-        if ch in ("\r", "\n") and state.detail_entry is not None and state.prompt_available():
-            # Enter on a command modal that HAS a prompt opens it in full instead
-            # of closing; with no prompt to open it keeps the old one-key exit.
-            state.detail_prompt_open = True
-            state.detail_prompt_scroll = 0
-            return Action.NONE
-        if ch in ("\x1b", "q", "\r", "\n"):
-            state.close_modals()
-            return Action.NONE
-        # In the session modal only, the nav keys scroll the subagent list
-        # instead of being swallowed. G's sentinel and every offset are clamped
-        # for display in build_session_panel (and written back by render_panel).
-        # The command-detail / database modals keep full-swallow behavior.
-        if state.session_detail is not None:
-            if ch in ("j", "down"):
-                state.session_scroll += 1
-            elif ch in ("k", "up"):
-                state.session_scroll = max(0, state.session_scroll - 1)
-            elif ch == "g":
-                state.session_scroll = 0
-            elif ch == "G":
-                state.session_scroll = 10**9  # clamped in build_session_panel
-        return Action.NONE
+        return _apply_modal_key(state, ch)
     if ch in ("q", "\x03"):
         return Action.QUIT
     if ch == "c":
@@ -2286,6 +2657,8 @@ def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
     elif ch == "G":
         state.goto_bottom()
         state.clamp(max_rows)
+    elif ch == "\t":
+        state.cycle_tab()
     elif ch.isdigit() and int(ch) in state.visible_cols:
         state.toggle_col(int(ch))
     elif ch in ("\r", "\n"):
@@ -2295,20 +2668,15 @@ def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
         return Action.OPEN_DETAIL
     elif ch == "s":
         # Open the session-detail modal for the selected row's session. Opening
-        # it precludes the command modal (only one modal open at a time).
+        # it precludes the command modal (only one modal open at a time). An
+        # empty/missing session_id (hand-edited or legacy line) leaves the modal
+        # closed rather than showing a blank identity.
         entry = state.selected_entry()
-        # Treat an empty/missing session_id (hand-edited or legacy line) as no
-        # session so the modal stays closed instead of showing a blank identity.
-        sid = (entry.get("session_id") or None) if entry else None
-        state.session_detail = sid
+        sid = state.selected_session_id()
         # Spotlight the row's subagent on the session page (None for a main-agent
         # row, so it renders exactly as before); only when the modal opens.
-        state.session_agent_id = entry_agent_id(entry) if sid else None
-        state.session_scroll = 0  # start each open at the top of the list
-        # Only ask main() to load the token total when a session actually opened;
-        # an empty/missing session_id leaves the modal closed and returns NONE.
-        if sid:
-            return Action.OPEN_SESSION_DETAIL
+        return state.open_session_detail(
+            sid, entry_agent_id(entry) if (sid and entry) else None)
     elif ch == "/":
         # Open the per-session search modal for the selected row's session,
         # resolving its transcript-folder and cwd roots up front (S.1). Unlike
@@ -2323,16 +2691,18 @@ def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
             default_root = "transcript" if "transcript" in roots else (
                 "cwd" if "cwd" in roots else "transcript")
             state.search = SearchState(sid=sid, roots=roots, root=default_root)
-    elif ch == "o":
-        return Action.OPEN_SESSION
-    elif ch == "t":
-        return Action.OPEN_TRANSCRIPT
+    elif ch in ("o", "t"):
+        # Session-scoped: main() resolves the id with selected_session_id(), the
+        # same path the prompts tab takes. Inert with no row to act on.
+        if state.selected_row() is not None:
+            return Action.OPEN_SESSION if ch == "o" else Action.OPEN_TRANSCRIPT
     elif ch == "f":
         return Action.OPEN_FILES
     elif ch == "d":
         # Open the audit-store database modal. The store (and duckdb) is imported
         # lazily by main() when this action fires, so the normal feed never loads
-        # duckdb; apply_key stays pure and does no I/O here.
+        # duckdb; apply_key stays pure and does no I/O here. It describes the
+        # store rather than a session, so it needs no selected row.
         return Action.LOAD_DB_INFO
     return Action.NONE
 
@@ -2523,6 +2893,10 @@ def main():
             )
         if state.db_info is not None:
             return build_db_panel(state.db_info, console.height)
+        if state.tab == "prompts":
+            return build_prompts_panel(
+                state.prompts, console.height, state.visible_cols_for("prompts"),
+            )
         return build_panel(
             state.entries, console.height, state.visible_cols,
             state.cursor, state.scroll_offset, name_map, color_map, agent_map,
@@ -2564,8 +2938,10 @@ def main():
                     except OSError:
                         pass
 
-            def open_session_log(entry: LogEntry) -> None:
-                out_path = filter_session_log(entry.get("session_id", ""))
+            def open_session_log(sid: str) -> None:
+                # Takes a session id, not a row: both tabs resolve one through
+                # AppState.selected_session_id(), so `o` works on either.
+                out_path = filter_session_log(sid)
                 if out_path:
                     open_path_in_editor(out_path)
 
@@ -2622,14 +2998,13 @@ def main():
                                 quit_now = True
                                 break
                             if action is Action.OPEN_SESSION:
-                                entry = state.selected_entry()
-                                if entry:
-                                    open_session_log(entry)
+                                sid = state.selected_session_id()
+                                if sid:
+                                    open_session_log(sid)
                             elif action is Action.OPEN_TRANSCRIPT:
-                                entry = state.selected_entry()
-                                if entry:
-                                    path = format_session_transcript(
-                                        entry.get("session_id", ""))
+                                sid = state.selected_session_id()
+                                if sid:
+                                    path = format_session_transcript(sid)
                                     if path:
                                         open_path_in_editor(path)
                             elif action is Action.OPEN_FILES:
