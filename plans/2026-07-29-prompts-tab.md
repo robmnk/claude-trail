@@ -353,9 +353,29 @@ depend on the TUI.
   - Tests: gutter glyphs over a main+subagent action list, `action_label` fallback for an
     `Agent` row (text NULL, description in `tool_input`), bash-only toggle, scroll clamp,
     Enter/Esc/q depth transitions.
-- [ ] 5. CLI `prompts` subcommand + dispatch wiring, with tests.
-- [ ] 6. Docs + release: CLAUDE.md (Controls, Columns, Conventions, Audit store), README,
-      `.env.example` widths, version bump.
+- [ ] 5. Store: populate `sessions.cwd` at ingest, prefer it for the Project column
+  - Phase 3's review overturned this plan's earlier claim that no better source exists. Every
+    transcript line carries an exact top-level `cwd` (verified in a live transcript);
+    `sessions.cwd` is dead only because `_upsert_session` never writes it. Meanwhile
+    `_decode_project` replaces every `-` with `/`, so 3 of the 6 projects visible in the newest
+    200 turns render as paths that do not exist: `…/claude/trail` for `claude-trail`,
+    `…/personal/fin` for `personal-fin`, `…/keypad/macros` for `keypad-macros`. The primary new
+    view currently names half this user's projects wrongly.
+  - `_upsert_session` writes `cwd` from the transcript `cwd`; `prompt_turns` already returns the
+    key; `_render_turn_project` prefers `cwd` and falls back to `project`. Keep
+    `_decode_project` as the fallback rather than trying to disambiguate its lossy encoding.
+  - Backfill: existing rows have `cwd` NULL and the raw payload is pruned for non-snapshot
+    lines, so re-deriving needs a re-ingest from the transcripts on disk. Decide and document
+    whether that is a `reset-db` + ingest, or an in-place sweep that re-reads transcripts for
+    session rows whose `cwd` is NULL, and say which in the docs phase.
+  - Tests: a transcript whose dir name contains a `-` gets the true path (not the `/`-substituted
+    one), the Project column prefers `cwd`, the fallback still renders when `cwd` is NULL, and the
+    phase 1 test that pins `cwd is None` is updated deliberately rather than deleted.
+- [ ] 6. CLI `prompts` subcommand + dispatch wiring, with tests.
+- [ ] 7. Docs + release: CLAUDE.md (Controls, Columns, Conventions, Audit store), README,
+      `.env.example` widths (including the six `CLAUDE_TRAIL_PROMPT_COL_*` keys), the `S` key,
+      version bump. The plan, CLAUDE.md's Controls table and the README all currently disagree
+      with the code on the prompts-tab key set; this phase reconciles all three.
 
 ## Conventions for this run
 
