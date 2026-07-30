@@ -1826,8 +1826,16 @@ PROMPT_LOOKBACK_TURNS = 16
 # about a command, not invoking one, and swallowing the whole turn into `/compact`
 # would misreport it. `<command-args>` is then read from that head run only
 # (group 0), so a later block cannot contribute the args of this one.
+#
+# `<command-name>` is not always first: a plugin/skill command emits
+# `<command-message>dev-orchestrate</command-message>` ahead of it, so the head run
+# is accepted on BOTH sides of the name (lazily on the leading side, so a turn that
+# does open with `<command-name>` still matches it with zero prefix). Without that,
+# those turns fell through to the raw text and the TUI's one-line Prompt cell
+# rendered XML (measured: 3 of the newest 200 turns).
 _SLASH_HEAD_RE = re.compile(
-    r"\s*<command-name>\s*([^<]+?)\s*</command-name>"
+    r"\s*(?:<command-[a-z-]+>[^<]*</command-[a-z-]+>\s*)*?"
+    r"<command-name>\s*([^<]+?)\s*</command-name>"
     r"(?:\s*<command-[a-z-]+>[^<]*</command-[a-z-]+>)*")
 _SLASH_ARGS_RE = re.compile(r"<command-args>\s*([^<]*?)\s*</command-args>")
 

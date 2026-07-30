@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 from dataclasses import fields
 from pathlib import Path
@@ -966,6 +967,77 @@ class TestColumnWidthWiring:
             assert cols["Files"].kwargs["width"] == 20
 
 
+class TestPromptColumnWidthWiring:
+    """Same guard for the Prompts tab's six .env width keys: a typo at a
+    PROMPT_COLUMNS call site would silently no-op that column while every helper
+    test still passed. Matched by column name, so reordering is safe."""
+
+    _OVERRIDES = {
+        "CLAUDE_TRAIL_PROMPT_COL_TIME_WIDTH": "11",
+        "CLAUDE_TRAIL_PROMPT_COL_SESSION_WIDTH": "18",
+        "CLAUDE_TRAIL_PROMPT_COL_PROJECT_WIDTH": "21",
+        "CLAUDE_TRAIL_PROMPT_COL_CALLS_WIDTH": "15",
+        "CLAUDE_TRAIL_PROMPT_COL_AGENTS_WIDTH": "9",
+        "CLAUDE_TRAIL_PROMPT_COL_TOKENS_WIDTH": "23",
+    }
+
+    def _cols_by_name(self):
+        return {c.name: c for c in feed.PROMPT_COLUMNS}
+
+    def test_env_widths_reach_prompt_columns(self, tmp_path):
+        import importlib
+        env = tmp_path / ".env"
+        env.write_text("".join(f"{k}={v}\n" for k, v in self._OVERRIDES.items()),
+                       encoding="utf-8")
+        try:
+            with patch.dict(os.environ, {"CLAUDE_TRAIL_ENV": str(env)}):
+                importlib.reload(feed)
+                cols = self._cols_by_name()
+                assert cols["Time"].kwargs["width"] == 11
+                assert cols["Session"].kwargs["width"] == 18
+                assert cols["Calls"].kwargs["width"] == 15
+                assert cols["Agents"].kwargs["width"] == 9
+                assert cols["Tokens"].kwargs["width"] == 23
+                # Project shares PROJECT_LABEL_WIDTH with short_path's truncation.
+                assert feed.PROJECT_LABEL_WIDTH == 21
+                assert cols["Project"].kwargs["width"] == 21
+        finally:
+            importlib.reload(feed)
+
+    def test_the_feeds_keys_do_not_move_the_prompts_columns(self, tmp_path):
+        # The two tabs have separate keys: setting a feed width must leave this
+        # tab alone (a copy-pasted key name would break exactly this).
+        import importlib
+        env = tmp_path / ".env"
+        env.write_text("CLAUDE_TRAIL_COL_TIME_WIDTH=30\n"
+                       "CLAUDE_TRAIL_COL_SESSION_WIDTH=31\n", encoding="utf-8")
+        try:
+            with patch.dict(os.environ, {"CLAUDE_TRAIL_ENV": str(env)}):
+                importlib.reload(feed)
+                cols = self._cols_by_name()
+                assert cols["Time"].kwargs["width"] == 8       # prompts default
+                assert cols["Session"].kwargs["width"] == 13
+        finally:
+            importlib.reload(feed)
+
+    def test_clean_reload_reproduces_prompt_defaults(self, tmp_path):
+        import importlib
+        absent = tmp_path / "absent.env"
+        with patch.dict(os.environ, {"CLAUDE_TRAIL_ENV": str(absent)}):
+            for k in [k for k in os.environ if k.startswith("CLAUDE_TRAIL_PROMPT_COL_")]:
+                os.environ.pop(k)
+            importlib.reload(feed)
+            cols = self._cols_by_name()
+            assert cols["Time"].kwargs["width"] == 8
+            assert cols["Session"].kwargs["width"] == 13
+            assert cols["Project"].kwargs["width"] == 16
+            # 14 so the widest real cell (`185 (82 bash)`) fits without an ellipsis.
+            assert cols["Calls"].kwargs["width"] == 14
+            assert cols["Agents"].kwargs["width"] == 6
+            assert cols["Tokens"].kwargs["width"] == 16
+            assert feed.PROJECT_LABEL_WIDTH == 16
+
+
 class TestHookMain:
     def _run_hook(self, tmp_path, payload):
         import io
@@ -1606,18 +1678,24 @@ class TestColumnRender:
         assert cell.style == "orange1"
         assert cell.plain == "abcd1234"
 
-    def test_session_column_plain_string_without_color(self):
+    def test_session_column_untinted_is_an_unstyled_text(self):
+        # Text with no style, not a bare str: the label can be a name the user
+        # typed, so it must never reach Rich as markup (see the class comment
+        # above `_danger_prefixed` and TestConsoleMarkupIsNeverParsed).
+        from rich.text import Text
         cell = self._col(2).render(self._entry(), feed.RenderCtx())
-        assert cell == "abcd1234"  # plain str, no tint
+        assert isinstance(cell, Text)
+        assert cell.plain == "abcd1234"
+        assert not cell.style          # no tint
 
     def test_directory_column_shortens_cwd(self):
         # a swap of _render_directory / _render_files in COLUMNS must fail here
         cell = self._col(3).render(self._entry(cwd="/home/user/project"), feed.RenderCtx())
-        assert cell == feed.short_path("/home/user/project")
+        assert cell.plain == feed.short_path("/home/user/project")
 
     def test_files_column_extracts_basenames(self):
         cell = self._col(4).render(self._entry(command="cat /etc/hosts"), feed.RenderCtx())
-        assert cell == "hosts"
+        assert cell.plain == "hosts"
 
     def test_command_column_marks_dangerous(self):
         from rich.text import Span, Text
@@ -2059,24 +2137,39 @@ class TestTabs:
         assert feed.TABS == ("commands", "prompts")
         assert feed.AppState(entries=[]).tab == "commands"  # the feed stays default
 
-    def test_only_the_commands_tab_has_columns_registered(self):
-        # The prompts tab's column list lands with its renderers; until then its
-        # visibility dict is empty, which is what makes its digit keys inert.
+    def test_each_tab_registers_its_own_columns(self):
+        # One registry per tab, each numbered from 1 independently: the feed's six
+        # and the prompts list's seven.
         assert feed.COLUMNS_BY_TAB["commands"] == feed.COLUMNS
-        assert feed.COLUMNS_BY_TAB["prompts"] == []
-        assert feed._default_cols("prompts") == {}
+        assert feed.COLUMNS_BY_TAB["prompts"] == feed.PROMPT_COLUMNS
+        assert sorted(feed._default_cols("commands")) == [1, 2, 3, 4, 5, 6]
+        assert sorted(feed._default_cols("prompts")) == [1, 2, 3, 4, 5, 6, 7]
+        assert all(feed._default_cols("prompts").values())  # all visible initially
+
+    def test_prompt_columns_are_named_in_plan_order(self):
+        # Position in the list is the on-screen order; `key` is the stable digit.
+        assert [(c.key, c.name) for c in feed.PROMPT_COLUMNS] == [
+            (1, "Time"), (2, "Session"), (3, "Project"), (4, "Calls"),
+            (5, "Agents"), (6, "Tokens"), (7, "Prompt")]
+        # The Prompt cell takes the leftover width; every other column is fixed.
+        assert feed.PROMPT_COLUMNS[-1].kwargs["ratio"] == 1
+        assert all("width" in c.kwargs for c in feed.PROMPT_COLUMNS[:-1])
 
     def test_visible_cols_for_follows_the_active_tab(self):
         state = feed.AppState(entries=[])
-        assert state.visible_cols_for() == {c.key: True for c in feed.COLUMNS}
-        assert state.visible_cols_for("prompts") == {}
+        commands = {c.key: True for c in feed.COLUMNS}
+        prompts = {c.key: True for c in feed.PROMPT_COLUMNS}
+        assert state.visible_cols_for() == commands
+        assert state.visible_cols_for("prompts") == prompts
         state.tab = "prompts"
-        assert state.visible_cols_for() == {}
-        assert state.visible_cols_for("commands") == {c.key: True for c in feed.COLUMNS}
+        assert state.visible_cols_for() == prompts
+        assert state.visible_cols_for("commands") == commands
 
     def test_tab_cycles_commands_prompts_commands(self):
         state = feed.AppState(entries=[{"command": "c", "session_id": "s"}])
-        assert feed.apply_key(state, "\t", 10) is feed.Action.NONE
+        # Entering the prompts tab asks main() to read the store; leaving it does
+        # not (the feed tails the log on its own).
+        assert feed.apply_key(state, "\t", 10) is feed.Action.LOAD_PROMPTS
         assert state.tab == "prompts"
         assert feed.apply_key(state, "\t", 10) is feed.Action.NONE
         assert state.tab == "commands"
@@ -2124,23 +2217,49 @@ class TestTabs:
         assert "cols:" in out                  # the feed keeps its toggle bar
 
     def test_prompts_hints_are_per_tab(self):
-        out = self._text(feed.build_prompts_panel(feed.PromptsState(), 40, {}))
+        out = self._text(feed.build_prompts_panel(feed.PromptsState(), 40))
         assert "tab:commands" in out
         assert "r:refresh" in out and "x:hide empty" in out
-        assert "cols:" not in out              # no columns registered on this tab
+        assert "S:session only" in out         # the session filter
+        assert "cols:" in out                  # this tab has its own toggles
         assert "/:search" not in out and "c:clear" not in out  # feed-only keys
-
-    def test_prompts_empty_state_points_at_the_store(self):
-        out = self._text(feed.build_prompts_panel(feed.PromptsState(), 40))
-        assert "audit store" in out
-        assert "claude-trail ingest" in out
-        # user-facing text must not mention unreleased work
-        assert "phase" not in out.lower()
 
     def test_prompts_panel_shows_a_status_when_set(self):
         state = feed.PromptsState(status="store busy: an ingest is writing")
         out = self._text(feed.build_prompts_panel(state, 40))
         assert "store busy" in out
+
+    def test_a_digit_toggle_reaches_the_prompts_panel(self):
+        """`build_prompts_panel`'s `visible_cols` argument, end to end.
+
+        Ignoring it (falling back to `_default_cols`) used to leave the whole
+        suite green: `TestPromptsTable` passes its own dict straight to
+        `build_prompts_table`, so nothing pinned that the PANEL forwards the one
+        `AppState.visible_cols_for` hands it. Both halves of the panel have to
+        follow the toggle: the rendered table and the `cols:` indicator (whose
+        digits are always drawn - only bold vs dim says which are on, hence the
+        styled export).
+        """
+        prompts = feed.PromptsState(rows=[_turn(tools=1, project="/p/proj")],
+                                    loaded_at=1000.0, checked_at=1000.0)
+        cols = {c.key: True for c in feed.PROMPT_COLUMNS}
+
+        def render(visible):
+            console = Console(width=120, record=True)
+            console.print(feed.build_prompts_panel(prompts, 24, visible, now=1000.0))
+            # clear=False: export_text drains the record buffer by default, so the
+            # styled export would come back empty.
+            return (console.export_text(clear=False),
+                    console.export_text(styles=True))
+
+        plain, styled = render(cols)
+        assert "Project" in plain
+        assert "\x1b[1m3\x1b[0m" in styled            # key 3 shown: bold
+        plain, styled = render({**cols, 3: False})
+        assert "Project" not in plain                 # column gone from the table
+        assert "/p/proj" not in plain                 # and so is its cell
+        assert "\x1b[2m3\x1b[0m" in styled            # key 3 hidden: dim
+        assert "Prompt" in plain                      # the rest is untouched
 
 
 class TestPromptRecords:
@@ -2207,6 +2326,426 @@ class TestPromptRecords:
         assert feed.TurnAction(ts="t").agent_id is None
 
 
+class TestPromptColumnRender:
+    """Each PROMPT_COLUMNS entry's `render(turn, ctx)` produces the right cell."""
+
+    def _col(self, key):
+        return next(c for c in feed.PROMPT_COLUMNS if c.key == key)
+
+    def test_time_column_renders_hms(self):
+        # The store hands timestamps back as strings; format_time parses them.
+        turn = _turn(ts="2026-07-29 18:58:55+00:00")
+        expected = feed.format_time("2026-07-29 18:58:55+00:00")
+        assert self._col(1).render(turn, feed.RenderCtx()) == expected
+        assert expected != "??:??:??"          # the string really did parse
+
+    def test_session_column_is_the_feeds_session_cell(self):
+        from rich.text import Text
+        ctx = feed.RenderCtx(name_map={"sid-p": "my-session"},
+                             color_map={"sid-p": "orange"})
+        cell = self._col(2).render(_turn(sid="sid-p"), ctx)
+        assert isinstance(cell, Text)
+        assert cell.plain == "my-session"      # name wins over the short id
+        assert cell.style == "orange1"         # mapped through rich_color
+        # Same cell the feed renders for the same sid, not a second copy of the
+        # label + tint rules.
+        assert cell.plain == feed._session_cell("sid-p", ctx).plain
+
+    def test_session_column_falls_back_to_the_short_id(self):
+        cell = self._col(2).render(_turn(sid="abcd1234-5678"), feed.RenderCtx())
+        assert cell.plain == "abcd1234"
+
+    def test_project_column_renders_project_and_never_cwd(self):
+        turn = _turn(project="/home/naka/Projects/personal/claude-trail")
+        cell = self._col(3).render(turn, feed.RenderCtx())
+        assert cell.plain == feed.short_path(turn.project, feed.PROJECT_LABEL_WIDTH)
+        assert "claude-trail" in cell.plain
+        # `sessions.cwd` is never written, so a row carrying one must not show it:
+        # the plan's old cwd fallback would have been dead code.
+        sneaky = feed.PromptTurn(session_id="s", ts="2026-07-29 10:00:00-03",
+                                 project=None, cwd="/should/not/render")
+        assert self._col(3).render(sneaky, feed.RenderCtx()).plain == ""
+
+    def test_calls_column_shows_the_total_and_the_bash_share(self):
+        from rich.text import Text
+        # tools=64 is INCLUSIVE of subcalls=41: the cell shows 64, never 105.
+        turn = _turn(tools=64, bash=14, subcalls=41)
+        cell = self._col(4).render(turn, feed.RenderCtx())
+        assert isinstance(cell, Text)
+        assert cell.plain == "64 (14 bash)"
+        assert "105" not in cell.plain
+
+    def test_calls_column_omits_the_bash_part_when_no_bash_ran(self):
+        cell = self._col(4).render(_turn(tools=5, bash=0), feed.RenderCtx())
+        assert cell.plain == "5"
+
+    def test_calls_column_zero_is_a_dim_dash(self):
+        cell = self._col(4).render(_turn(tools=0), feed.RenderCtx())
+        assert cell.plain == "-"
+        assert cell.style == "dim"          # a real turn, not missing data
+
+    def test_agents_column_counts_subagents_and_is_blank_at_zero(self):
+        assert self._col(5).render(_turn(agents=3), feed.RenderCtx()).plain == "3"
+        assert self._col(5).render(_turn(agents=0), feed.RenderCtx()).plain == ""
+
+    def test_tokens_column_abbreviates_and_calls_out_the_subagent_share(self):
+        cell = self._col(6).render(
+            _turn(output_tokens=24_200, subagent_output_tokens=3_100), feed.RenderCtx())
+        assert cell.plain == "24.2k +3.1k sub"
+
+    def test_tokens_column_omits_the_subagent_part_without_subagent_tokens(self):
+        # A subagent that generated nothing adds no cost to call out.
+        cell = self._col(6).render(
+            _turn(output_tokens=24_200, agents=1, subagent_output_tokens=0),
+            feed.RenderCtx())
+        assert cell.plain == "24.2k"
+        assert "sub" not in cell.plain
+
+    def test_tokens_column_zero_is_dim(self):
+        # A turn whose reply carried no usage row honestly reports 0.
+        cell = self._col(6).render(_turn(output_tokens=0), feed.RenderCtx())
+        assert cell.plain == "0"
+        assert cell.style == "dim"
+
+    def test_abbrev_count_stays_within_six_columns(self):
+        assert feed._abbrev_count(0) == "0"
+        assert feed._abbrev_count(912) == "912"
+        assert feed._abbrev_count(24_200) == "24.2k"
+        assert feed._abbrev_count(183_400) == "183k"
+        assert feed._abbrev_count(1_340_000) == "1.34m"
+        assert feed._abbrev_count(987_654_321) == "988m"
+        # Each magnitude boundary pinned by VALUE, not just by length: a `<`
+        # loosened to `<=` keeps every result six columns wide, so the loop below
+        # cannot catch it.
+        assert feed._abbrev_count(999) == "999"
+        assert feed._abbrev_count(1000) == "1.0k"
+        assert feed._abbrev_count(99_999) == "100.0k"
+        assert feed._abbrev_count(100_000) == "100k"
+        assert feed._abbrev_count(999_999) == "1000k"
+        assert feed._abbrev_count(1_000_000) == "1.00m"
+        assert feed._abbrev_count(9_999_999) == "10.00m"
+        assert feed._abbrev_count(10_000_000) == "10m"
+        for n in (0, 1, 999, 1000, 9_999, 99_999, 100_000, 999_999, 1_000_000,
+                  9_999_999, 10_000_000, 999_999_999):
+            assert len(feed._abbrev_count(n)) <= 6, n
+
+    def test_prompt_column_shows_the_first_line_only(self):
+        turn = _turn(preview="fix the failing test\nand then run the suite")
+        assert self._col(7).render(turn, feed.RenderCtx()).plain \
+            == "fix the failing test"
+
+    def test_prompt_column_labels_a_slash_command(self):
+        # A /compact turn is stored as a <command-name> block; the cell must read
+        # as the command the user actually invoked.
+        turn = _turn(preview="<command-name>/compact</command-name>\n"
+                             "<command-args></command-args>")
+        assert self._col(7).render(turn, feed.RenderCtx()).plain == "/compact"
+
+    def test_prompt_column_keeps_slash_args(self):
+        turn = _turn(preview="<command-name>/model</command-name>\n"
+                             "<command-args>opus</command-args>")
+        assert self._col(7).render(turn, feed.RenderCtx()).plain == "/model opus"
+
+    def test_prompt_column_labels_a_command_message_led_slash_block(self):
+        # A plugin/skill command emits <command-message> BEFORE <command-name>;
+        # the store's head regex has to accept it or this cell shows raw XML
+        # (measured: 3 of the newest 200 turns of the live store).
+        turn = _turn(preview="<command-message>dev-orchestrate</command-message>\n"
+                             "<command-name>/dev-orchestrate</command-name>\n"
+                             "<command-args>--repo ~/x</command-args>")
+        assert self._col(7).render(turn, feed.RenderCtx()).plain \
+            == "/dev-orchestrate --repo ~/x"
+
+    def test_prompt_column_skips_a_leading_blank_line(self):
+        # The store trims the preview, so this should not occur - but a blank
+        # first line must show the prompt rather than blank the cell.
+        turn = _turn(preview="\n\n  the real ask\nmore")
+        assert self._col(7).render(turn, feed.RenderCtx()).plain == "the real ask"
+
+    def test_prompt_column_empty_preview_is_a_dim_hint(self):
+        cell = self._col(7).render(_turn(preview=""), feed.RenderCtx())
+        assert cell.plain == "(empty)"
+        assert self._col(7).render(_turn(preview="  \n \n"), feed.RenderCtx()).plain \
+            == "(empty)"
+
+
+class TestConsoleMarkupIsNeverParsed:
+    """Text from outside this program must reach Rich as `Text`, never a bare `str`.
+
+    `Table.add_row`, `Table.grid`'s rows and a `Panel`'s title/subtitle all run a
+    bare `str` through `console.render_str`, which has console markup ENABLED. Two
+    failure modes, both driven here rather than reasoned about:
+
+    - `[bold]` (a valid open tag) is SILENTLY DELETED. Measured on the live audit
+      store, 2 of its 5,452 user turns already lose text this way, one of them
+      `"...when we press [enter] claude-trail should..."`.
+    - `[/tmp/x]` (an unmatched closing tag) raises MarkupError. In the TUI that
+      happens inside `live.update(render_panel(), ...)` in main()'s loop, which is
+      past its `except KeyboardInterrupt`, so the whole TUI dies with a traceback.
+
+    So every case below asserts the bracketed value renders LITERALLY: the probes
+    are chosen so a regression shows up as a missing needle (deletion) or as the
+    MarkupError propagating out of `console.print` (crash).
+    """
+
+    BRACKET = "[/tmp/x]"     # unmatched closing tag -> MarkupError
+    DELETE = "[bold]"        # valid open tag -> silently swallowed
+
+    FEED_COLS = {c.key: True for c in feed.COLUMNS}
+    PROMPT_COLS = {c.key: True for c in feed.PROMPT_COLUMNS}
+
+    def _out(self, renderable, width=200):
+        console = Console(width=width, record=True)
+        console.print(renderable)      # a MarkupError here IS the bug
+        return console.export_text()
+
+    def _literal(self, build, needle=None):
+        """`build(probe)` must render `probe` (or `needle(probe)`) untouched, for
+        both probe forms - the crashing one and the silently-deleted one."""
+        for probe in (self.BRACKET, self.DELETE):
+            out = self._out(build(probe))
+            assert (needle(probe) if needle else probe) in out, (probe, out)
+
+    def _entry(self, **kw):
+        e = {"timestamp": "2026-07-29T10:00:00-03:00", "command": "ls",
+             "cwd": "/tmp", "session_id": "s1"}
+        e.update(kw)
+        return e
+
+    def _model(self, **kw):
+        m = dict(session_id="s1", name="n", status="", live=True, cwd="/tmp",
+                 version="1.0", kind="startup", started_at=0,
+                 transcript_path="/t.jsonl", subagents=())
+        m.update(kw)
+        return feed.SessionModel(**m)
+
+    def _sub(self, **kw):
+        s = dict(agent_id="aid1", agent_type="gp", description="d", status="done",
+                 command_count=1, command_count_capped=False)
+        s.update(kw)
+        return feed.SubagentInfo(**s)
+
+    # ---- the feed's columns ----
+
+    def test_feed_session_name_is_literal(self):
+        # A session name comes from `sessions/<pid>.json`, so the user typed it.
+        self._literal(lambda p: feed.build_table(
+            [self._entry()], 5, self.FEED_COLS, 0, name_map={"s1": f"n{p}"}))
+        # Same through the tinted branch, which is a different return path.
+        self._literal(lambda p: feed.build_table(
+            [self._entry()], 5, self.FEED_COLS, 0,
+            name_map={"s1": f"n{p}"}, color_map={"s1": "orange"}))
+
+    def test_feed_directory_and_command_are_literal(self):
+        self._literal(lambda p: feed.build_table(
+            [self._entry(cwd=f"/tmp/{p}")], 5, self.FEED_COLS, 0))
+        self._literal(lambda p: feed.build_table(
+            [self._entry(command=f"echo {p}")], 5, self.FEED_COLS, 0))
+
+    def test_feed_files_cell_keeps_a_bracketed_basename(self):
+        # A basename cannot carry the crash form (`[/x]` needs a `/`, which ends
+        # the basename), but `[bold].txt` is a legal filename and was deleted.
+        out = self._out(feed.build_table(
+            [self._entry(command="cat /tmp/[bold].txt")], 5, self.FEED_COLS, 0))
+        assert "[bold].txt" in out
+
+    def test_feed_agent_label_is_literal(self):
+        # An agent description is the Task tool's `description`, i.e. prose.
+        self._literal(lambda p: feed.build_table(
+            [self._entry(agent_id="aid1")], 5, self.FEED_COLS, 0,
+            agent_map={"aid1": {"description": p, "type": "gp"}}))
+
+    # ---- the prompts tab's columns ----
+
+    def test_prompt_cell_is_literal(self):
+        # The whole point of this phase: a turn's preview is a human's own prose.
+        self._literal(lambda p: feed.build_prompts_table(
+            [_turn(preview=f"look in {p} now", tools=1)], 5, self.PROMPT_COLS, 0))
+
+    def test_prompts_project_and_session_cells_are_literal(self):
+        self._literal(lambda p: feed.build_prompts_table(
+            [_turn(project=f"/p/{p}", tools=1)], 5, self.PROMPT_COLS, 0))
+        self._literal(lambda p: feed.build_prompts_table(
+            [_turn(tools=1)], 5, self.PROMPT_COLS, 0, name_map={"sid-p": f"n{p}"}))
+
+    def test_every_prompt_column_survives_a_bracketed_row(self):
+        # Whole-row sweep: no PROMPT_COLUMNS renderer may hand Rich a bare str,
+        # including one added later (this fails on the added column, not on a
+        # hand-listed subset).
+        turn = _turn(sid=f"s{self.BRACKET}", project=f"/p/{self.BRACKET}",
+                     preview=f"ask {self.BRACKET}", tools=3, bash=1, agents=2,
+                     output_tokens=1200, subagent_output_tokens=30)
+        for col in feed.PROMPT_COLUMNS:
+            self._out(feed.build_prompts_table([turn], 5, {col.key: True}, 0))
+
+    # ---- the panels ----
+
+    def test_command_detail_rows_are_literal(self):
+        self._literal(lambda p: feed.build_detail_panel(
+            self._entry(cwd=f"/tmp/{p}"), 40))
+        self._literal(lambda p: feed.build_detail_panel(
+            self._entry(command=f"echo {p}"), 40))
+        self._literal(lambda p: feed.build_detail_panel(
+            self._entry(), 40, prompt={"text": f"ask {p}", "ts": "2026-07-29 10:00"}))
+        # The Files metadata row, deletion form only (see the feed's Files test).
+        # Counted, not just present: the command body below it renders the same
+        # path, so `in out` alone passes even with the Files row swallowed.
+        out = self._out(feed.build_detail_panel(
+            self._entry(command="cat /tmp/[bold].txt"), 40))
+        assert out.count("[bold].txt") == 2      # the Files row AND the command
+
+    def test_full_prompt_panel_is_literal(self):
+        self._literal(lambda p: feed.build_prompt_panel(
+            self._entry(), 40, {"text": f"ask {p}", "ts": "2026-07-29 10:00:00"}))
+        # The `Sent` row is a store timestamp: no `[` is reachable today, but it
+        # is outside text and a bare str crashed on one.
+        self._literal(lambda p: feed.build_prompt_panel(
+            self._entry(), 40, {"text": "b", "ts": p}))
+
+    def test_session_panel_rows_are_literal(self):
+        for build in (
+            lambda p: feed.build_session_panel(self._model(session_id=f"s{p}")),
+            lambda p: feed.build_session_panel(self._model(name=f"n{p}")),
+            lambda p: feed.build_session_panel(self._model(cwd=f"/tmp/{p}")),
+            lambda p: feed.build_session_panel(self._model(version=f"1.0{p}")),
+            lambda p: feed.build_session_panel(
+                self._model(started_at=1_700_000_000_000, kind=f"k{p}")),
+            lambda p: feed.build_session_panel(
+                self._model(subagents=(self._sub(description=f"d{p}"),))),
+            lambda p: feed.build_session_panel(
+                self._model(subagents=(self._sub(agent_type=f"t{p}"),))),
+            lambda p: feed.build_session_panel(
+                self._model(subagents=(self._sub(description=f"d{p}"),)),
+                highlight_agent_id="aid1"),
+        ):
+            self._literal(build)
+
+    def test_db_panel_rows_are_literal(self):
+        # The connection string is a path from $CLAUDE_TRAIL_DB and the failure
+        # rows carry a raw exception message.
+        self._literal(lambda p: feed.build_db_panel([("connection", f"/tmp/{p}.duckdb")]))
+        self._literal(lambda p: feed.build_db_panel([("error", f"boom {p}")]))
+        self._literal(lambda p: feed.build_db_panel([(f"rows {p}", "1")]))
+
+    def test_search_hits_are_literal(self):
+        # Source code, JSON and markdown are the `[`-densest text in the program,
+        # and every grep hit is one of those.
+        def hit(**kw):
+            s = dict(sid="s1", roots={"cwd": [Path("/tmp")]}, root="cwd",
+                     mode="RESULTS", query="q")
+            s.update(kw)
+            return feed.build_search_panel(feed.SearchState(**s))
+        self._literal(lambda p: hit(results=[("/tmp/a.py", 3, f"x = list{p}")]))
+        self._literal(lambda p: hit(results=[(f"/tmp/{p}.py", 3, "hit")]))
+
+    def test_prompts_panel_chrome_is_literal(self):
+        self._literal(lambda p: feed.build_prompts_panel(
+            feed.PromptsState(rows=[_turn(preview=f"ask {p}", tools=1)],
+                              loaded_at=1.0, checked_at=1.0), 24, now=1.0))
+        self._literal(lambda p: feed.build_prompts_panel(
+            feed.PromptsState(status=f"store unreadable: {p}",
+                              loaded_at=1.0, checked_at=1.0), 24, now=1.0))
+
+    def test_panel_subtitles_survive_a_bracketed_config_dir(self):
+        # LOG_PATH is derived from $CLAUDE_CONFIG_DIR, so it is outside text too,
+        # and the subtitles used to interpolate it INTO markup (`[dim]{path}`).
+        def subtitled(builder):
+            def build(probe):
+                with patch.object(feed, "LOG_PATH",
+                                  Path(f"/tmp/{probe}/command-log.jsonl")):
+                    return builder()
+            return build
+        self._literal(subtitled(
+            lambda: feed.build_panel([self._entry()], 40, self.FEED_COLS, 0)))
+        self._literal(subtitled(lambda: feed.build_detail_panel(self._entry(), 40)))
+        self._literal(subtitled(lambda: feed.build_prompt_panel(
+            self._entry(), 40, {"text": "b", "ts": "2026-07-29 10:00:00"})))
+
+    def test_a_live_driven_render_of_every_panel_survives_a_bracket_prompt(self):
+        """The crash exactly where the TUI hits it: `live.update(render_panel())`.
+
+        `console.print` above is the same render path, but this is the one main()
+        actually runs, and it is the reason a MarkupError is fatal rather than
+        cosmetic - it is raised past `except KeyboardInterrupt`, so the loop
+        unwinds and the tool exits with a traceback.
+        """
+        import io
+        from rich.live import Live
+        probe = "look in [/tmp/x] now"
+        entry = self._entry(command=f"echo {probe}", cwd=f"/tmp/{probe}")
+        prompts = feed.PromptsState(rows=[_turn(preview=probe, tools=1)],
+                                    loaded_at=1.0, checked_at=1.0)
+        panels = [
+            feed.build_prompts_panel(prompts, 24, now=1.0),
+            feed.build_panel([entry], 24, self.FEED_COLS, 0),
+            feed.build_detail_panel(entry, 24,
+                                    prompt={"text": probe, "ts": "2026-07-29 10:00"}),
+            feed.build_prompt_panel(entry, 24, {"text": probe, "ts": "2026-07-29 10:00"}),
+            feed.build_session_panel(self._model(
+                cwd=f"/tmp/{probe}", subagents=(self._sub(description=probe),))),
+            feed.build_db_panel([("error", probe)]),
+            feed.build_search_panel(feed.SearchState(
+                sid="s1", roots={"cwd": [Path("/tmp")]}, root="cwd", mode="RESULTS",
+                results=[("/tmp/a.py", 3, probe)])),
+        ]
+        # force_terminal, or Live.refresh() short-circuits on a file console and
+        # nothing would be rendered at all.
+        console = Console(file=io.StringIO(), width=120, force_terminal=True)
+        with Live(panels[0], console=console) as live:
+            for panel in panels:
+                live.update(panel, refresh=True)
+
+
+class TestPromptsTable:
+    """build_prompts_table: newest-first WITHOUT a reversal (unlike the feed),
+    the cursor highlight, the scroll window, and per-column visibility."""
+
+    ALL = {c.key: True for c in feed.PROMPT_COLUMNS}
+
+    def _rows(self, n):
+        # Distinguishable at both ends: row 0 is the newest ("turn-0").
+        return [_turn(sid=f"sid{i:05d}", ts=f"2026-07-29 10:{59 - i:02d}:00-03",
+                      preview=f"turn-{i}", tools=1) for i in range(n)]
+
+    def _text(self, table, width=160):
+        console = Console(width=width, record=True)
+        console.print(table)
+        return console.export_text()
+
+    def test_rows_render_in_list_order_no_reversal(self):
+        # The feed reverses `entries` (append order) to show newest first; the
+        # prompts query already returns newest-first, so reversing here would
+        # silently show the OLDEST turn at the top.
+        out = self._text(feed.build_prompts_table(self._rows(3), 10, self.ALL, 0))
+        assert out.index("turn-0") < out.index("turn-1") < out.index("turn-2")
+
+    def test_max_rows_truncates_from_the_newest_end(self):
+        out = self._text(feed.build_prompts_table(self._rows(5), 2, self.ALL, 0))
+        assert "turn-0" in out and "turn-1" in out
+        assert "turn-2" not in out
+
+    def test_offset_skips_the_newest_turns(self):
+        out = self._text(feed.build_prompts_table(self._rows(5), 2, self.ALL, 3, offset=3))
+        assert "turn-0" not in out
+        assert "turn-3" in out and "turn-4" in out
+
+    def test_cursor_highlights_the_row_at_cursor_minus_offset(self):
+        rows = self._rows(5)
+        table = feed.build_prompts_table(rows, 5, self.ALL, 3, offset=1)
+        styles = [r.style for r in table.rows]
+        assert styles == [None, None, "on grey23", None]  # 4 displayed, cursor 3rd
+
+    def test_cursor_scrolled_out_of_view_highlights_nothing(self):
+        table = feed.build_prompts_table(self._rows(5), 2, self.ALL, 4, offset=0)
+        assert all(r.style is None for r in table.rows)
+
+    def test_hidden_columns_are_not_rendered(self):
+        cols = {**self.ALL, 3: False, 6: False}         # Project, Tokens off
+        out = self._text(feed.build_prompts_table(self._rows(1), 5, cols, 0))
+        assert "Project" not in out and "Tokens" not in out
+        assert "Prompt" in out and "Calls" in out
+
+
 class TestPromptsTabKeys:
     """Key routing while the Prompts tab is active: its own nav, the feed-only
     keys staying feed-only, and the session-scoped keys working on both tabs."""
@@ -2244,12 +2783,35 @@ class TestPromptsTabKeys:
         assert feed.apply_key(state, "c", 10) is feed.Action.NONE
         assert len(state.entries) == 4               # the feed is untouched
 
-    def test_digits_do_not_toggle_columns_from_the_prompts_tab(self):
+    def test_digits_toggle_this_tabs_columns_and_not_the_feeds(self):
         state = _prompts_state()
-        for ch in "123456":
+        for ch in "1234567":
             assert feed.apply_key(state, ch, 10) is feed.Action.NONE
+        # Every prompts column but the last toggled off; the feed is untouched.
         assert state.visible_cols == {c.key: True for c in feed.COLUMNS}
-        assert state.prompt_cols == {}               # nothing to toggle yet
+        off = [k for k, shown in state.prompt_cols.items() if not shown]
+        assert len(off) == len(feed.PROMPT_COLUMNS) - 1
+
+    def test_digits_refuse_to_hide_the_last_prompts_column(self):
+        state = _prompts_state()
+        for ch in "1234567":
+            feed.apply_key(state, ch, 10)
+        assert sum(state.prompt_cols.values()) == 1   # one always survives
+        # And the survivor cannot be hidden either, however many times it is hit.
+        survivor = next(k for k, shown in state.prompt_cols.items() if shown)
+        for _ in range(3):
+            feed.apply_key(state, str(survivor), 10)
+        assert state.prompt_cols[survivor] is True
+
+    def test_a_digit_with_no_prompts_column_is_inert(self):
+        # The feed has no key 7 and the prompts list has no key 8: an unregistered
+        # digit must not touch either dict.
+        state = _prompts_state()
+        assert feed.apply_key(state, "8", 10) is feed.Action.NONE
+        assert all(state.prompt_cols.values())
+        state.tab = "commands"
+        assert feed.apply_key(state, "7", 10) is feed.Action.NONE
+        assert all(state.visible_cols.values())
 
     def test_slash_does_not_open_search_from_the_prompts_tab(self):
         # `/` needs a row's cwd, which a turn row does not carry.
@@ -2264,15 +2826,18 @@ class TestPromptsTabKeys:
 
     def test_prompts_only_keys_are_inert_on_the_commands_tab(self):
         state = feed.AppState(entries=[{"command": "c", "session_id": "s"}])
-        for ch in ("r", "x"):
+        for ch in ("r", "x", "S"):
             assert feed.apply_key(state, ch, 10) is feed.Action.NONE
         assert state.tab == "commands"
+        assert state.prompts == feed.PromptsState()   # the other tab is untouched
 
-    def test_advertised_but_unwired_keys_are_inert_on_the_prompts_tab(self):
-        # `↵`/`r`/`x` are listed in the hints; they must be no-ops (and pure)
-        # rather than half-open a view.
+    def test_enter_is_still_inert_on_the_prompts_tab(self):
+        # `↵` is advertised, and the turn view it opens is not built yet: it must
+        # stay a pure no-op rather than set `prompts.detail`, which modal_open()
+        # already counts and no panel renders (every key would be swallowed with
+        # nothing on screen to explain it).
         state = _prompts_state(rows=2)
-        for ch in ("\r", "\n", "r", "x"):
+        for ch in ("\r", "\n"):
             assert feed.apply_key(state, ch, 10) is feed.Action.NONE
         assert state.prompts.detail is None
         assert state.modal_open() is False
@@ -2354,6 +2919,313 @@ class TestPromptsTabKeys:
         assert state.search.root == "cwd"
         assert state.tab == "commands"
 
+    # ---- refresh / filter keys: every one of them stays pure ----
+
+    def test_no_prompts_key_opens_a_modal_there_is_no_panel_for(self):
+        """EVERY key this tab answers must leave `modal_open()` False.
+
+        `prompts.detail` is counted by `modal_open()` and no panel renders it yet,
+        so setting it in any branch turns the tab into a key trap: every key but
+        esc/q/enter dead, nothing on screen to explain it. Asserted over the whole
+        key set in one loop rather than per-key, so a future rewrite of any single
+        test cannot quietly drop the guard (it did once - phase 3's `r`/`x`
+        rewrite).
+        """
+        for ch in ("r", "x", "S", "\r", "\n", "j", "k", "g", "G", "\t",
+                   "1", "2", "7", "c", "f", "/", "o", "t"):
+            state = _prompts_state(rows=0)
+            # tools=1 so the rows survive `x`: with an empty filtered list
+            # `selected()` is None and the trap would set `detail = None`, which
+            # looks fine while being exactly the bug in one of its two states.
+            state.prompts.rows = [_turn(sid=f"sid-p{i}", tools=1) for i in range(3)]
+            feed.apply_key(state, ch, 10)
+            assert state.prompts.detail is None, ch
+            assert state.modal_open() is False, ch
+
+    def test_r_asks_for_a_reload_without_touching_the_list(self):
+        state = _prompts_state(rows=3)
+        rows_before, cursor_before = list(state.prompts.rows), state.prompts.cursor
+        assert feed.apply_key(state, "r", 10) is feed.Action.LOAD_PROMPTS
+        assert state.prompts.rows == rows_before      # main() does the reading
+        assert state.prompts.cursor == cursor_before
+        assert state.prompts.loaded_at is None        # no I/O happened here
+        assert state.modal_open() is False            # and no modal was opened
+
+    def test_x_toggles_hide_empty_without_a_reload(self):
+        # Filtered in place over the snapshot, so no store read is requested.
+        state = _prompts_state(rows=3)
+        assert feed.apply_key(state, "x", 10) is feed.Action.NONE
+        assert state.prompts.hide_empty is True
+        assert feed.apply_key(state, "x", 10) is feed.Action.NONE
+        assert state.prompts.hide_empty is False
+        assert state.modal_open() is False            # and no modal was opened
+
+    def test_every_nav_key_pairs_with_the_clamp(self):
+        """The deferred finding: `goto_bottom` / `move_down` never touched
+        `scroll_offset`, where the feed pairs every move with a clamp. Driven
+        through `apply_key` rather than by calling clamp by hand, so what is pinned
+        is the PAIRING - remove it after any one key and the cursor walks off the
+        rendered window with the offset stuck at 0.
+        """
+        state = _prompts_state(rows=0)
+        state.prompts.rows = [_turn(sid=f"s{i:05d}", tools=1) for i in range(20)]
+        feed.apply_key(state, "G", 5)
+        assert (state.prompts.cursor, state.prompts.scroll_offset) == (19, 15)
+        for _ in range(20):
+            feed.apply_key(state, "k", 5)
+        assert (state.prompts.cursor, state.prompts.scroll_offset) == (0, 0)
+        for _ in range(9):
+            feed.apply_key(state, "j", 5)
+        assert (state.prompts.cursor, state.prompts.scroll_offset) == (9, 5)
+        feed.apply_key(state, "g", 5)
+        assert (state.prompts.cursor, state.prompts.scroll_offset) == (0, 0)
+
+    def test_x_reanchors_the_cursor_onto_the_shorter_list(self):
+        state = _prompts_state(rows=0)
+        state.prompts.rows = [_turn(sid="a", tools=2), _turn(sid="b", tools=0),
+                              _turn(sid="c", tools=0)]
+        feed.apply_key(state, "G", 10)
+        assert state.prompts.cursor == 2
+        feed.apply_key(state, "x", 10)                # only one row survives
+        assert state.prompts.cursor == 0
+        assert state.prompts.selected().session_id == "a"
+
+    def test_S_filters_to_the_selected_session_and_reloads(self):
+        state = _prompts_state(rows=3)
+        state.prompts.cursor = 2
+        assert feed.apply_key(state, "S", 10) is feed.Action.LOAD_PROMPTS
+        assert state.prompts.session_filter == "sid-p2"
+        # A scoped list is a new list, so it starts at the top.
+        assert (state.prompts.cursor, state.prompts.scroll_offset) == (0, 0)
+        assert state.prompts.rows                     # apply_key does no I/O
+
+    def test_S_again_clears_the_filter_and_reloads(self):
+        state = _prompts_state(rows=2)
+        state.prompts.session_filter = "sid-p1"
+        assert feed.apply_key(state, "S", 10) is feed.Action.LOAD_PROMPTS
+        assert state.prompts.session_filter is None
+
+    def test_S_is_inert_without_a_row_to_take_a_session_from(self):
+        state = _prompts_state(rows=0)
+        assert feed.apply_key(state, "S", 10) is feed.Action.NONE
+        assert state.prompts.session_filter is None
+
+
+class TestPromptsFilter:
+    """`x` (hide zero-call turns): a client-side lens over one snapshot, with the
+    panel staying honest about what it is not showing."""
+
+    def _state(self):
+        prompts = feed.PromptsState(rows=[
+            _turn(sid="busy1", tools=4, bash=2), _turn(sid="quiet1", tools=0),
+            _turn(sid="busy2", tools=1), _turn(sid="quiet2", tools=0)])
+        prompts.loaded_at = prompts.checked_at = 1000.0
+        return prompts
+
+    def _text(self, panel, width=160):
+        console = Console(width=width, record=True)
+        console.print(panel)
+        return console.export_text()
+
+    def test_visible_rows_is_every_row_by_default(self):
+        prompts = self._state()
+        assert prompts.visible_rows() == prompts.rows
+        assert prompts.hidden_count() == 0
+
+    def test_hide_empty_drops_only_zero_call_turns(self):
+        prompts = self._state()
+        prompts.hide_empty = True
+        assert [r.session_id for r in prompts.visible_rows()] == ["busy1", "busy2"]
+        assert prompts.hidden_count() == 2
+        assert len(prompts.rows) == 4          # the snapshot itself is untouched
+
+    def test_selected_follows_the_filtered_list(self):
+        prompts = self._state()
+        prompts.hide_empty = True
+        prompts.cursor = 1
+        assert prompts.selected().session_id == "busy2"   # not the raw rows[1]
+
+    def test_header_counts_only_what_is_shown_and_says_what_is_hidden(self):
+        prompts = self._state()
+        prompts.hide_empty = True
+        out = self._text(feed.build_prompts_panel(prompts, 24, now=1000.0))
+        assert "2 turns (2 hidden)" in out
+        assert "1/2" in out                    # the cursor line counts the same 2
+
+    def test_header_omits_the_hidden_note_when_nothing_is_hidden(self):
+        out = self._text(feed.build_prompts_panel(self._state(), 24, now=1000.0))
+        assert "4 turns" in out
+        assert "hidden" not in out
+
+    def test_a_fully_filtered_list_says_so_instead_of_advising_ingest(self):
+        # The store is current here; telling the user to run an ingest would be
+        # wrong advice. The rows are one keypress away, and the text says which.
+        prompts = self._state()
+        prompts.rows = [_turn(sid="quiet1", tools=0)]
+        prompts.hide_empty = True
+        out = self._text(feed.build_prompts_panel(prompts, 24, now=1000.0))
+        assert "hidden" in out
+        assert "press x" in out
+        assert "claude-trail ingest" not in out
+
+
+class TestPromptsClamp:
+    """PromptsState.clamp: the contract AppState.clamp has, over the visible rows.
+    Every cursor move and every reload pairs with it, or `G` then a shorter list
+    leaves the cursor selecting nothing."""
+
+    def _rows(self, n):
+        return [_turn(sid=f"sid{i:05d}", preview=f"turn-{i}", tools=1)
+                for i in range(n)]
+
+    def test_move_down_scrolls_the_window(self):
+        # The deferred bug: move_down/goto_bottom used to leave scroll_offset at 0,
+        # so the cursor walked off the bottom of the rendered window.
+        prompts = feed.PromptsState(rows=self._rows(20))
+        for _ in range(9):
+            prompts.move_down()
+            prompts.clamp(5)
+        assert prompts.cursor == 9
+        assert prompts.scroll_offset == 5      # cursor visible in a 5-row window
+        assert prompts.scroll_offset <= prompts.cursor < prompts.scroll_offset + 5
+
+    def test_goto_bottom_scrolls_to_the_end(self):
+        prompts = feed.PromptsState(rows=self._rows(20))
+        prompts.goto_bottom()
+        prompts.clamp(5)
+        assert prompts.cursor == 19
+        assert prompts.scroll_offset == 15
+        assert prompts.selected().preview == "turn-19"
+
+    def test_move_up_pulls_the_window_back(self):
+        prompts = feed.PromptsState(rows=self._rows(20), cursor=19, scroll_offset=15)
+        for _ in range(16):
+            prompts.move_up()
+            prompts.clamp(5)
+        assert (prompts.cursor, prompts.scroll_offset) == (3, 3)
+
+    def test_reload_to_a_shorter_list_reanchors(self):
+        prompts = feed.PromptsState(rows=self._rows(30))
+        prompts.goto_bottom()
+        prompts.clamp(10)
+        assert (prompts.cursor, prompts.scroll_offset) == (29, 20)
+        prompts.rows = self._rows(4)           # what a re-query can hand back
+        prompts.clamp(10)
+        assert prompts.cursor == 3
+        assert prompts.scroll_offset == 0      # a list that fits never scrolls
+        assert prompts.selected() is not None
+
+    def test_reload_to_an_empty_list_resets(self):
+        prompts = feed.PromptsState(rows=self._rows(9), cursor=8, scroll_offset=4)
+        prompts.rows = []
+        prompts.clamp(5)
+        assert (prompts.cursor, prompts.scroll_offset) == (0, 0)
+        assert prompts.selected() is None
+
+    def test_offset_never_runs_past_the_end(self):
+        prompts = feed.PromptsState(rows=self._rows(12), cursor=0, scroll_offset=99)
+        prompts.clamp(5)
+        assert prompts.scroll_offset == 0      # pulled back to keep row 0 visible
+        prompts.cursor, prompts.scroll_offset = 11, 99
+        prompts.clamp(5)
+        assert prompts.scroll_offset == 7      # len - max_rows, not 99
+
+    def test_cursor_zero_is_the_newest_turn_not_the_oldest(self):
+        # The feed's cursor indexes a REVERSED view of `entries`; this one does
+        # not. A list whose ends are distinguishable catches the confusion.
+        prompts = feed.PromptsState(rows=self._rows(5))
+        prompts.clamp(5)
+        assert prompts.selected().preview == "turn-0"
+        prompts.goto_bottom()
+        prompts.clamp(5)
+        assert prompts.selected().preview == "turn-4"
+
+    def test_the_rendered_window_starts_at_the_scroll_offset(self):
+        # End to end: the clamp's offset is the slice the panel draws.
+        prompts = feed.PromptsState(rows=self._rows(40))
+        prompts.cursor = 30
+        prompts.clamp(feed.prompts_row_count(24))
+        console = Console(width=160, record=True)
+        console.print(feed.build_prompts_panel(prompts, 24))
+        out = console.export_text()
+        assert "turn-30" in out                # the cursor row is on screen
+        assert "turn-0" not in out             # scrolled past the newest
+
+
+class TestPromptsPanelGeometry:
+    """PROMPTS_CHROME_ROWS pinned from both sides against the rendered panel, the
+    way CHROME_ROWS is: too low crops the key hints, too high wastes a body row."""
+
+    def _panel_lines(self, width, height=24, rows=60):
+        turns = [_turn(sid=f"sid{i:05d}", tools=1, preview=f"turn-{i}")
+                 for i in range(rows)]
+        prompts = feed.PromptsState(rows=turns)
+        prompts.loaded_at = prompts.checked_at = 500.0
+        console = Console(width=width, record=True)
+        console.print(feed.build_prompts_panel(prompts, height, now=500.0))
+        return console.export_text().splitlines()
+
+    def _body_rows(self, lines):
+        # One body row per turn, each carrying its 8-char session label.
+        return sum(1 for line in lines if re.search(r"sid\d{5}", line))
+
+    def test_chrome_rows_matches_the_rendered_panel(self):
+        """The body must get exactly `prompts_row_count(h)` rows and the panel
+        must still end with its hints. Both widths matter for the same reason as
+        the feed's: at 160 the hints fit one line, at 80 they wrap to two and the
+        constant's single slack line has to absorb that.
+
+        The two counting assertions are weak on their own: the `Panel` is built
+        with `height=term_height`, so `len(lines) == 24` holds at chrome 12-15 and
+        `body_rows == prompts_row_count(24)` is true by construction of the same
+        constant. What pins the constant is the `q:quit` tail here plus
+        `test_chrome_rows_is_not_one_row_too_many` at w=80 (the minimal side)."""
+        for width in (80, 160):
+            lines = self._panel_lines(width)
+            out = "\n".join(lines)
+            assert len(lines) == 24, width
+            assert self._body_rows(lines) == feed.prompts_row_count(24), width
+            assert "q:quit" in out, width      # hint tail, first thing a crop eats
+            assert "as of" in out, width       # and the snapshot header survives
+
+    def test_chrome_rows_is_not_one_row_too_many(self):
+        """The other side of the pin: one less must overflow, so the constant is
+        the smallest value that fits rather than a generous guess that silently
+        wastes a body row at every terminal size."""
+        with patch.object(feed, "PROMPTS_CHROME_ROWS", feed.PROMPTS_CHROME_ROWS - 1):
+            out = "\n".join(self._panel_lines(80))
+            assert "q:quit" not in out
+
+    def test_chrome_leaves_one_more_row_than_the_feed(self):
+        # The difference is exactly the snapshot header line.
+        assert feed.PROMPTS_CHROME_ROWS == feed.CHROME_ROWS + 1
+        assert feed.prompts_row_count(40) == feed.visible_row_count(40) - 1
+
+    def test_row_count_floors_at_min_visible_rows(self):
+        assert feed.prompts_row_count(1) == feed.MIN_VISIBLE_ROWS
+
+    def test_the_body_is_sized_from_term_height(self):
+        """The deferred finding: the panel used to ignore `term_height` for content
+        sizing, so a short terminal cropped the status line and the hints. The body
+        is now `prompts_row_count(height)` rows at every height the row math covers
+        - down to PROMPTS_CHROME_ROWS + MIN_VISIBLE_ROWS - and both survive."""
+        floor = feed.PROMPTS_CHROME_ROWS + feed.MIN_VISIBLE_ROWS
+        for height in (floor, floor + 1, 24, 50):
+            lines = self._panel_lines(160, height=height)
+            out = "\n".join(lines)
+            assert len(lines) == height, height
+            assert self._body_rows(lines) == feed.prompts_row_count(height), height
+            assert "q:quit" in out and "1/60" in out, height
+
+    def test_below_the_row_floor_it_degrades_like_the_feed(self):
+        """Under that floor MIN_VISIBLE_ROWS wins and the chrome is cropped, the
+        same trade-off `visible_row_count` makes for the feed (rows first on a tiny
+        terminal) - one row earlier here, since this panel carries one more chrome
+        line. Recorded so the threshold cannot move unnoticed."""
+        assert feed.prompts_row_count(12) == feed.MIN_VISIBLE_ROWS
+        assert "q:quit" not in "\n".join(self._panel_lines(160, height=12))
+        assert "c:clear" not in "\n".join(TestVisibleRowCount()._panel_lines(160, 12))
+
 
 class TestModalExclusion:
     """modal_open()/close_modals() with the prompts turn in the mix: one place
@@ -2367,7 +3239,7 @@ class TestModalExclusion:
     KEPT_APP_FIELDS = {"entries", "cursor", "scroll_offset", "visible_cols",
                        "tab", "prompts", "prompt_cols", "search"}
     KEPT_PROMPTS_FIELDS = {"rows", "cursor", "scroll_offset", "loaded_at",
-                           "status", "session_filter", "hide_empty"}
+                           "checked_at", "status", "session_filter", "hide_empty"}
 
     def test_modal_open_true_for_each_modal(self):
         entry = {"command": "c", "session_id": "s"}
@@ -3142,6 +4014,347 @@ class TestTokenLoaders:
             console.print(panel)
         assert "Tokens" in cap.get()
         assert "pending ingest" in cap.get()
+
+    def test_hint_wordings_have_one_definition(self):
+        # The modals' sentinel and the prompts tab's status read from the same
+        # constants, so the two views can never describe one store differently.
+        assert feed.NO_STORE_HINT == "no audit store yet - run: claude-trail ingest"
+        assert feed.PENDING_INGEST_HINT == "pending ingest (store lags the live feed)"
+        assert feed.STORE_BUSY_HINT == "store busy: an ingest is writing"
+        assert feed.STORE_BUSY_KEPT_HINT.startswith(feed.STORE_BUSY_HINT)
+
+    def test_with_store_reports_the_error_it_swallows(self, tmp_path, monkeypatch):
+        # `on_error` must not widen the catch: the return value is still None, the
+        # exception is just no longer lost. That is what lets the prompts loader
+        # tell a lock collision from an empty answer.
+        import claude_trail_store as store
+        db = tmp_path / "trail.duckdb"
+        db.touch()
+        monkeypatch.setattr(store, "STORE_PATH", db)
+        monkeypatch.setattr(store, "connect", lambda **kw: (_ for _ in ()).throw(
+            OSError("Could not set lock on file")))
+        seen = []
+        assert feed._with_store(lambda con: "unreachable", on_error=seen.append) is None
+        assert len(seen) == 1 and "Could not set lock" in str(seen[0])
+        # And without the hook the behaviour is byte-for-byte what it was.
+        assert feed._with_store(lambda con: "unreachable") is None
+
+    def test_a_raising_on_error_hook_cannot_escape(self, tmp_path, monkeypatch):
+        # The contract is "never raise at the caller" - a diagnostic callback must
+        # not be the one thing that breaks it, or a second caller's buggy hook
+        # takes the TUI down through a path that exists to swallow failures.
+        import claude_trail_store as store
+        db = tmp_path / "trail.duckdb"
+        db.touch()
+        monkeypatch.setattr(store, "STORE_PATH", db)
+        monkeypatch.setattr(store, "connect", lambda **kw: (_ for _ in ()).throw(
+            OSError("boom")))
+
+        def raising(exc):
+            raise ValueError("the hook itself is broken")
+
+        assert feed._with_store(lambda con: "unreachable", on_error=raising) is None
+
+
+class TestPromptTurnLoader:
+    """`_load_prompt_turns` / `_refresh_prompts`: the three store states the
+    Prompts tab must tell apart, driven through the loader boundary so no test
+    needs a real duckdb file."""
+
+    def _store_at(self, tmp_path, monkeypatch, exists=True):
+        import claude_trail_store as store
+        db = tmp_path / "trail.duckdb"
+        if exists:
+            db.touch()
+        monkeypatch.setattr(store, "STORE_PATH", db)
+        return store
+
+    ROW = {"session_id": "s1", "ts": "2026-07-29 10:00:00-03", "next_ts": None,
+           "event_id": "ev-1", "preview": "do the thing", "full_len": 12,
+           "tools": 2, "bash": 1, "agents": 0, "subcalls": 0,
+           "output_tokens": 500, "subagent_output_tokens": 0, "requests": 1,
+           "last_ts": None, "project": "/p", "cwd": None}
+
+    def test_missing_store_returns_no_rows_and_the_ingest_hint(self, tmp_path, monkeypatch):
+        self._store_at(tmp_path, monkeypatch, exists=False)
+        assert feed._load_prompt_turns() == ([], feed.NO_STORE_HINT)
+
+    def test_a_successful_read_maps_rows_and_clears_the_status(self, tmp_path, monkeypatch):
+        store = self._store_at(tmp_path, monkeypatch)
+        monkeypatch.setattr(store, "prompt_turns", lambda con, **kw: [self.ROW])
+        monkeypatch.setattr(feed, "_with_store",
+                            lambda fn, on_error=None: fn(None))
+        rows, status = feed._load_prompt_turns()
+        assert status is None
+        assert [r.preview for r in rows] == ["do the thing"]
+        assert isinstance(rows[0], feed.PromptTurn)
+
+    def test_an_empty_but_successful_read_is_not_an_error(self, tmp_path, monkeypatch):
+        # A current store that holds no turn for this scope: no rows AND no status,
+        # which is what lets the panel show "no prompts" instead of blaming ingest.
+        store = self._store_at(tmp_path, monkeypatch)
+        monkeypatch.setattr(store, "prompt_turns", lambda con, **kw: [])
+        monkeypatch.setattr(feed, "_with_store", lambda fn, on_error=None: fn(None))
+        assert feed._load_prompt_turns() == ([], None)
+
+    def test_the_session_filter_reaches_the_query(self, tmp_path, monkeypatch):
+        store = self._store_at(tmp_path, monkeypatch)
+        seen = {}
+
+        def fake_prompt_turns(con, **kw):
+            seen.update(kw)
+            return []
+
+        monkeypatch.setattr(store, "prompt_turns", fake_prompt_turns)
+        monkeypatch.setattr(feed, "_with_store", lambda fn, on_error=None: fn(None))
+        feed._load_prompt_turns("sid-9")
+        assert seen == {"session_id": "sid-9"}
+        seen.clear()
+        feed._load_prompt_turns(None)
+        assert seen == {}                       # unscoped: the query's own default
+
+    def test_a_locked_store_returns_none_rows_and_says_busy(self, tmp_path, monkeypatch):
+        # None means "no answer, keep what is on screen": DuckDB's lock excludes in
+        # both directions, so colliding with the running ingest is routine.
+        self._store_at(tmp_path, monkeypatch)
+
+        def busy(fn, on_error=None):
+            if on_error is not None:
+                on_error(OSError("IO Error: Could not set lock on file"))
+            return None
+
+        monkeypatch.setattr(feed, "_with_store", busy)
+        assert feed._load_prompt_turns() == (None, feed.STORE_BUSY_HINT)
+
+    def test_a_non_lock_failure_is_reported_not_disguised_as_empty(self, tmp_path, monkeypatch):
+        self._store_at(tmp_path, monkeypatch)
+
+        def broken(fn, on_error=None):
+            if on_error is not None:
+                on_error(RuntimeError("schema is from the future"))
+            return None
+
+        monkeypatch.setattr(feed, "_with_store", broken)
+        rows, status = feed._load_prompt_turns()
+        assert rows == []
+        assert "store unreadable" in status and "future" in status
+
+    def test_refresh_stores_the_snapshot_and_stamps_both_clocks(self, monkeypatch):
+        turn = feed.PromptTurn.from_row(self.ROW)
+        monkeypatch.setattr(feed, "_load_prompt_turns", lambda sid=None: ([turn], None))
+        prompts = feed.PromptsState()
+        feed._refresh_prompts(prompts, 10)
+        assert prompts.rows == [turn]
+        assert prompts.status is None
+        assert prompts.loaded_at is not None
+        assert prompts.checked_at == prompts.loaded_at
+
+    def test_refresh_reanchors_the_cursor_on_a_shorter_snapshot(self, monkeypatch):
+        prompts = feed.PromptsState(rows=[_turn(sid=f"s{i}") for i in range(9)],
+                                    cursor=8, scroll_offset=5)
+        monkeypatch.setattr(feed, "_load_prompt_turns",
+                            lambda sid=None: ([_turn(sid="only")], None))
+        feed._refresh_prompts(prompts, 5)
+        assert (prompts.cursor, prompts.scroll_offset) == (0, 0)
+        assert prompts.selected().session_id == "only"
+
+    def test_refresh_keeps_the_last_snapshot_when_the_store_is_busy(self, monkeypatch):
+        kept = [_turn(sid="kept-1"), _turn(sid="kept-2")]
+        prompts = feed.PromptsState(rows=kept, cursor=1, loaded_at=100.0)
+        monkeypatch.setattr(feed, "_load_prompt_turns",
+                            lambda sid=None: (None, feed.STORE_BUSY_HINT))
+        feed._refresh_prompts(prompts, 10)
+        assert prompts.rows == kept              # nothing was blanked
+        assert prompts.cursor == 1               # nor re-anchored
+        assert prompts.loaded_at == 100.0        # the age keeps counting up
+        assert prompts.status == feed.STORE_BUSY_KEPT_HINT
+        assert prompts.checked_at is not None    # but the attempt was recorded
+
+    def test_refresh_on_a_busy_store_with_nothing_on_screen_just_says_busy(self, monkeypatch):
+        # No previous snapshot to keep, so the status must not claim one was kept.
+        prompts = feed.PromptsState()
+        monkeypatch.setattr(feed, "_load_prompt_turns",
+                            lambda sid=None: (None, feed.STORE_BUSY_HINT))
+        feed._refresh_prompts(prompts, 10)
+        assert prompts.status == feed.STORE_BUSY_HINT
+        assert prompts.loaded_at is None
+        assert prompts.rows == []
+
+    def test_refresh_does_not_date_a_read_that_answered_nothing(self, monkeypatch):
+        # `loaded_at` dates the last ANSWER. Stamping it on a failure made the
+        # header claim `as of 22:30:04 (0s ago) · 0 turns` over a body explaining
+        # that the store could not be read - two false statements at once.
+        prompts = feed.PromptsState()
+        monkeypatch.setattr(feed, "_load_prompt_turns",
+                            lambda sid=None: ([], "store unreadable: boom"))
+        feed._refresh_prompts(prompts, 10)
+        assert prompts.loaded_at is None            # never answered
+        assert prompts.checked_at is not None       # but the attempt is recorded
+        assert prompts.status == "store unreadable: boom"
+
+    def test_refresh_keeps_a_good_snapshot_through_a_non_lock_failure(self, monkeypatch):
+        # The store vanishing between the `exists()` check and `connect` is a
+        # transient race; blanking the list for it (where a lock collision keeps
+        # it) threw away a perfectly readable snapshot.
+        kept = [_turn(sid="kept-1", tools=1), _turn(sid="kept-2", tools=1)]
+        prompts = feed.PromptsState(rows=kept, cursor=1, loaded_at=100.0)
+        monkeypatch.setattr(feed, "_load_prompt_turns",
+                            lambda sid=None: ([], feed.NO_STORE_HINT))
+        feed._refresh_prompts(prompts, 10)
+        assert prompts.rows == kept                 # still on screen
+        assert prompts.cursor == 1
+        assert prompts.loaded_at == 100.0           # and still dated by its read
+        assert prompts.status == feed.NO_STORE_HINT
+
+    def test_refresh_replaces_the_snapshot_on_a_successful_empty_read(self, monkeypatch):
+        # The other side of the previous test: an empty answer is an ANSWER, so it
+        # does replace the rows (a session whose turns aged out must go empty).
+        prompts = feed.PromptsState(rows=[_turn(sid="old", tools=1)], loaded_at=100.0)
+        monkeypatch.setattr(feed, "_load_prompt_turns", lambda sid=None: ([], None))
+        feed._refresh_prompts(prompts, 10)
+        assert prompts.rows == []
+        assert prompts.status is None
+        assert prompts.loaded_at != 100.0
+
+    def test_refresh_passes_the_active_session_filter(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(feed, "_load_prompt_turns",
+                            lambda sid=None: (seen.append(sid), ([], None))[1])
+        prompts = feed.PromptsState(session_filter="sid-7")
+        feed._refresh_prompts(prompts, 10)
+        assert seen == ["sid-7"]
+
+    def test_refresh_due_gates_on_the_last_attempt(self):
+        prompts = feed.PromptsState()
+        assert feed._prompts_refresh_due(prompts) is True      # never tried
+        prompts.checked_at = 1000.0
+        assert feed._prompts_refresh_due(prompts, now=1000.0) is False
+        assert feed._prompts_refresh_due(
+            prompts, now=1000.0 + feed.PROMPTS_AUTO_REFRESH - 1) is False
+        assert feed._prompts_refresh_due(
+            prompts, now=1000.0 + feed.PROMPTS_AUTO_REFRESH) is True
+
+    def test_refresh_due_backs_off_after_a_busy_collision(self, monkeypatch):
+        # A locked store leaves `loaded_at` alone, so gating on it would retry on
+        # every 300ms poll for as long as the ingest holds the file.
+        prompts = feed.PromptsState(rows=[_turn()])
+        monkeypatch.setattr(feed, "_load_prompt_turns",
+                            lambda sid=None: (None, feed.STORE_BUSY_HINT))
+        monkeypatch.setattr(feed.time, "monotonic", lambda: 2000.0)
+        feed._refresh_prompts(prompts, 10)
+        assert prompts.loaded_at is None
+        assert feed._prompts_refresh_due(prompts, now=2001.0) is False
+
+    def test_the_auto_refresh_matches_the_ingest_cadence(self):
+        # A faster tick would spend a query per poll to find nothing new.
+        assert feed.PROMPTS_AUTO_REFRESH == 30.0
+
+    def test_snapshot_age_and_its_wording(self):
+        assert feed._snapshot_age(None) is None
+        assert feed._snapshot_age(100.0, now=112.0) == 12.0
+        assert feed._snapshot_age(100.0, now=99.0) == 0.0     # never negative
+        assert feed._format_age(0) == "0s ago"
+        assert feed._format_age(12.7) == "12s ago"
+        assert feed._format_age(60) == "1m ago"
+        assert feed._format_age(3600 + 7 * 60) == "1h 07m ago"
+
+
+class TestPromptsPanelStates:
+    """What the panel says for each store state: it must never look silently
+    broken, and never give advice that is wrong for the state it is in."""
+
+    def _text(self, prompts, width=160, height=24, now=1000.0):
+        console = Console(width=width, record=True)
+        console.print(feed.build_prompts_panel(prompts, height, now=now))
+        return console.export_text()
+
+    def test_never_read_says_so_and_how_to_read_it(self):
+        out = self._text(feed.PromptsState())
+        assert "not read yet" in out          # the header's age slot
+        assert "No prompts read yet" in out
+        assert "Press r" in out
+        assert "claude-trail ingest" in out
+        assert "phase" not in out.lower()     # no unreleased-work references
+
+    def test_a_missing_store_shows_the_same_hint_as_the_modals(self):
+        prompts = feed.PromptsState(status=feed.NO_STORE_HINT,
+                                    loaded_at=1000.0, checked_at=1000.0)
+        out = self._text(prompts)
+        assert feed.NO_STORE_HINT in out
+
+    def test_a_failed_read_says_so_instead_of_blaming_an_empty_store(self):
+        # The panel used to make two false statements at once here: a header
+        # dating a read that never happened, and a body reading "No prompts in the
+        # audit store. Fill it with: claude-trail ingest" - wrong advice for a
+        # store that IS there and cannot be read.
+        prompts = feed.PromptsState(status="store unreadable: schema is from the future",
+                                    checked_at=1000.0)
+        out = self._text(prompts)
+        assert "could not be read" in out
+        assert "schema is from the future" in out
+        assert "Press r" in out
+        assert "No prompts in the audit store" not in out
+        assert "as of" not in out                  # nothing was ever answered
+        assert "not read yet" in out
+
+    def test_a_kept_snapshot_filtered_empty_still_advises_the_x_key(self):
+        # A busy store with a snapshot the `x` filter hides: the store-failure
+        # branch must not steal this case, or the way back is unexplained.
+        prompts = feed.PromptsState(rows=[_turn(sid="quiet", tools=0)],
+                                    hide_empty=True,
+                                    status=feed.STORE_BUSY_KEPT_HINT,
+                                    loaded_at=940.0, checked_at=1000.0)
+        out = self._text(prompts)
+        assert "press x" in out
+        assert "could not be read" not in out
+
+    def test_a_busy_store_says_busy_over_the_snapshot_it_kept(self):
+        prompts = feed.PromptsState(
+            rows=[_turn(sid="kept-1", tools=1, preview="the kept turn")],
+            status=feed.STORE_BUSY_KEPT_HINT, loaded_at=940.0, checked_at=1000.0)
+        out = self._text(prompts)
+        assert "store busy" in out
+        assert "kept the last snapshot" in out
+        assert "the kept turn" in out          # the old snapshot is still readable
+        assert "(1m ago)" in out               # and dated, so the staleness shows
+
+    def test_an_empty_successful_read_does_not_blame_the_store(self):
+        prompts = feed.PromptsState(loaded_at=1000.0, checked_at=1000.0)
+        out = self._text(prompts)
+        assert "No prompts in the audit store" in out
+        assert "as of" in out                  # it WAS read
+        assert "not read yet" not in out
+
+    def test_an_empty_session_scoped_read_points_at_the_filter(self):
+        prompts = feed.PromptsState(session_filter="sid-abcdef12",
+                                    loaded_at=1000.0, checked_at=1000.0)
+        out = self._text(prompts)
+        assert "No prompts for this session" in out
+        assert "Press S" in out
+        assert "session sid-abcd" in out       # the header names the scope
+        assert "claude-trail ingest" not in out
+
+    def test_the_scoped_header_names_the_session_the_way_the_column_does(self):
+        # The header showed a raw id prefix while the Session column showed the
+        # resolved name, which read as two different sessions.
+        prompts = feed.PromptsState(rows=[_turn(sid="sid-abcdef12", tools=1)],
+                                    session_filter="sid-abcdef12",
+                                    loaded_at=1000.0, checked_at=1000.0)
+        console = Console(width=160, record=True)
+        console.print(feed.build_prompts_panel(
+            prompts, 24, name_map={"sid-abcdef12": "my-session"}, now=1000.0))
+        out = console.export_text()
+        assert "session my-session" in out
+        assert "sid-abcd" not in out            # not the raw prefix, in either place
+        assert feed._prompts_header(prompts, 1000.0).plain.strip().endswith(
+            "session sid-abcd")                 # and it still falls back without one
+
+    def test_the_age_line_reports_the_snapshot_clock(self):
+        prompts = feed.PromptsState(rows=[_turn(tools=1)],
+                                    loaded_at=1000.0, checked_at=1000.0)
+        out = self._text(prompts, now=1012.0)
+        assert "(12s ago)" in out
+        assert re.search(r"as of \d\d:\d\d:\d\d", out)
 
 
 class TestSearchRoots:
