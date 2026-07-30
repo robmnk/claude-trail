@@ -1564,6 +1564,29 @@ def test_slash_label_renders_the_command_block_and_leaves_prose_alone():
                              "then <command-args>opus</command-args>") == "/clear"
 
 
+def test_slash_label_accepts_a_command_message_before_the_name():
+    """A plugin/skill slash command emits `<command-message>` FIRST, so
+    `<command-name>` is not at the head of the turn.
+
+    Real payloads from the live store (3 of its newest 200 turns), which used to
+    fall through to the raw text and render as XML in the TUI's Prompt cell.
+    """
+    assert store.slash_label(
+        "<command-message>dev-orchestrate</command-message>\n"
+        "<command-name>/dev-orchestrate</command-name>\n"
+        "<command-args>--repo ~/Projects/personal/claude-trail</command-args>"
+    ) == "/dev-orchestrate --repo ~/Projects/personal/claude-trail"
+    assert store.slash_label(
+        "<command-message>m2-standup</command-message>\n"
+        "<command-name>/m2-standup</command-name>\n"
+        "<command-args></command-args>") == "/m2-standup"
+    # Still head-ANCHORED (what phase 2's review required): a leading run of
+    # `<command-*>` elements is accepted, prose before them is not.
+    prose = ("does <command-message>x</command-message>"
+             "<command-name>/y</command-name> matter?")
+    assert store.slash_label(prose) == prose
+
+
 def test_prompt_for_command_skips_an_image_echo_sharing_the_timestamp(tmp_path, monkeypatch):
     """Regression: an `[Image: source: ...]` echo is emitted at the SAME timestamp
     as the text the user typed, so `ORDER BY ts DESC LIMIT 1` could return the

@@ -1031,7 +1031,8 @@ class TestPromptColumnWidthWiring:
             assert cols["Time"].kwargs["width"] == 8
             assert cols["Session"].kwargs["width"] == 13
             assert cols["Project"].kwargs["width"] == 16
-            assert cols["Calls"].kwargs["width"] == 12
+            # 14 so the widest real cell (`185 (82 bash)`) fits without an ellipsis.
+            assert cols["Calls"].kwargs["width"] == 14
             assert cols["Agents"].kwargs["width"] == 6
             assert cols["Tokens"].kwargs["width"] == 16
             assert feed.PROJECT_LABEL_WIDTH == 16
@@ -1677,18 +1678,24 @@ class TestColumnRender:
         assert cell.style == "orange1"
         assert cell.plain == "abcd1234"
 
-    def test_session_column_plain_string_without_color(self):
+    def test_session_column_untinted_is_an_unstyled_text(self):
+        # Text with no style, not a bare str: the label can be a name the user
+        # typed, so it must never reach Rich as markup (see the class comment
+        # above `_danger_prefixed` and TestConsoleMarkupIsNeverParsed).
+        from rich.text import Text
         cell = self._col(2).render(self._entry(), feed.RenderCtx())
-        assert cell == "abcd1234"  # plain str, no tint
+        assert isinstance(cell, Text)
+        assert cell.plain == "abcd1234"
+        assert not cell.style          # no tint
 
     def test_directory_column_shortens_cwd(self):
         # a swap of _render_directory / _render_files in COLUMNS must fail here
         cell = self._col(3).render(self._entry(cwd="/home/user/project"), feed.RenderCtx())
-        assert cell == feed.short_path("/home/user/project")
+        assert cell.plain == feed.short_path("/home/user/project")
 
     def test_files_column_extracts_basenames(self):
         cell = self._col(4).render(self._entry(command="cat /etc/hosts"), feed.RenderCtx())
-        assert cell == "hosts"
+        assert cell.plain == "hosts"
 
     def test_command_column_marks_dangerous(self):
         from rich.text import Span, Text
@@ -2217,17 +2224,42 @@ class TestTabs:
         assert "cols:" in out                  # this tab has its own toggles
         assert "/:search" not in out and "c:clear" not in out  # feed-only keys
 
-    def test_prompts_empty_state_points_at_the_store(self):
-        out = self._text(feed.build_prompts_panel(feed.PromptsState(), 40))
-        assert "audit store" in out
-        assert "claude-trail ingest" in out
-        # user-facing text must not mention unreleased work
-        assert "phase" not in out.lower()
-
     def test_prompts_panel_shows_a_status_when_set(self):
         state = feed.PromptsState(status="store busy: an ingest is writing")
         out = self._text(feed.build_prompts_panel(state, 40))
         assert "store busy" in out
+
+    def test_a_digit_toggle_reaches_the_prompts_panel(self):
+        """`build_prompts_panel`'s `visible_cols` argument, end to end.
+
+        Ignoring it (falling back to `_default_cols`) used to leave the whole
+        suite green: `TestPromptsTable` passes its own dict straight to
+        `build_prompts_table`, so nothing pinned that the PANEL forwards the one
+        `AppState.visible_cols_for` hands it. Both halves of the panel have to
+        follow the toggle: the rendered table and the `cols:` indicator (whose
+        digits are always drawn - only bold vs dim says which are on, hence the
+        styled export).
+        """
+        prompts = feed.PromptsState(rows=[_turn(tools=1, project="/p/proj")],
+                                    loaded_at=1000.0, checked_at=1000.0)
+        cols = {c.key: True for c in feed.PROMPT_COLUMNS}
+
+        def render(visible):
+            console = Console(width=120, record=True)
+            console.print(feed.build_prompts_panel(prompts, 24, visible, now=1000.0))
+            # clear=False: export_text drains the record buffer by default, so the
+            # styled export would come back empty.
+            return (console.export_text(clear=False),
+                    console.export_text(styles=True))
+
+        plain, styled = render(cols)
+        assert "Project" in plain
+        assert "\x1b[1m3\x1b[0m" in styled            # key 3 shown: bold
+        plain, styled = render({**cols, 3: False})
+        assert "Project" not in plain                 # column gone from the table
+        assert "/p/proj" not in plain                 # and so is its cell
+        assert "\x1b[2m3\x1b[0m" in styled            # key 3 hidden: dim
+        assert "Prompt" in plain                      # the rest is untouched
 
 
 class TestPromptRecords:
@@ -2321,18 +2353,18 @@ class TestPromptColumnRender:
 
     def test_session_column_falls_back_to_the_short_id(self):
         cell = self._col(2).render(_turn(sid="abcd1234-5678"), feed.RenderCtx())
-        assert cell == "abcd1234"
+        assert cell.plain == "abcd1234"
 
     def test_project_column_renders_project_and_never_cwd(self):
         turn = _turn(project="/home/naka/Projects/personal/claude-trail")
         cell = self._col(3).render(turn, feed.RenderCtx())
-        assert cell == feed.short_path(turn.project, feed.PROJECT_LABEL_WIDTH)
-        assert "claude-trail" in cell
+        assert cell.plain == feed.short_path(turn.project, feed.PROJECT_LABEL_WIDTH)
+        assert "claude-trail" in cell.plain
         # `sessions.cwd` is never written, so a row carrying one must not show it:
         # the plan's old cwd fallback would have been dead code.
         sneaky = feed.PromptTurn(session_id="s", ts="2026-07-29 10:00:00-03",
                                  project=None, cwd="/should/not/render")
-        assert self._col(3).render(sneaky, feed.RenderCtx()) == ""
+        assert self._col(3).render(sneaky, feed.RenderCtx()).plain == ""
 
     def test_calls_column_shows_the_total_and_the_bash_share(self):
         from rich.text import Text
@@ -2382,37 +2414,286 @@ class TestPromptColumnRender:
         assert feed._abbrev_count(183_400) == "183k"
         assert feed._abbrev_count(1_340_000) == "1.34m"
         assert feed._abbrev_count(987_654_321) == "988m"
+        # Each magnitude boundary pinned by VALUE, not just by length: a `<`
+        # loosened to `<=` keeps every result six columns wide, so the loop below
+        # cannot catch it.
+        assert feed._abbrev_count(999) == "999"
+        assert feed._abbrev_count(1000) == "1.0k"
+        assert feed._abbrev_count(99_999) == "100.0k"
+        assert feed._abbrev_count(100_000) == "100k"
+        assert feed._abbrev_count(999_999) == "1000k"
+        assert feed._abbrev_count(1_000_000) == "1.00m"
+        assert feed._abbrev_count(9_999_999) == "10.00m"
+        assert feed._abbrev_count(10_000_000) == "10m"
         for n in (0, 1, 999, 1000, 9_999, 99_999, 100_000, 999_999, 1_000_000,
                   9_999_999, 10_000_000, 999_999_999):
             assert len(feed._abbrev_count(n)) <= 6, n
 
     def test_prompt_column_shows_the_first_line_only(self):
         turn = _turn(preview="fix the failing test\nand then run the suite")
-        assert self._col(7).render(turn, feed.RenderCtx()) == "fix the failing test"
+        assert self._col(7).render(turn, feed.RenderCtx()).plain \
+            == "fix the failing test"
 
     def test_prompt_column_labels_a_slash_command(self):
         # A /compact turn is stored as a <command-name> block; the cell must read
         # as the command the user actually invoked.
         turn = _turn(preview="<command-name>/compact</command-name>\n"
                              "<command-args></command-args>")
-        assert self._col(7).render(turn, feed.RenderCtx()) == "/compact"
+        assert self._col(7).render(turn, feed.RenderCtx()).plain == "/compact"
 
     def test_prompt_column_keeps_slash_args(self):
         turn = _turn(preview="<command-name>/model</command-name>\n"
                              "<command-args>opus</command-args>")
-        assert self._col(7).render(turn, feed.RenderCtx()) == "/model opus"
+        assert self._col(7).render(turn, feed.RenderCtx()).plain == "/model opus"
+
+    def test_prompt_column_labels_a_command_message_led_slash_block(self):
+        # A plugin/skill command emits <command-message> BEFORE <command-name>;
+        # the store's head regex has to accept it or this cell shows raw XML
+        # (measured: 3 of the newest 200 turns of the live store).
+        turn = _turn(preview="<command-message>dev-orchestrate</command-message>\n"
+                             "<command-name>/dev-orchestrate</command-name>\n"
+                             "<command-args>--repo ~/x</command-args>")
+        assert self._col(7).render(turn, feed.RenderCtx()).plain \
+            == "/dev-orchestrate --repo ~/x"
 
     def test_prompt_column_skips_a_leading_blank_line(self):
         # The store trims the preview, so this should not occur - but a blank
         # first line must show the prompt rather than blank the cell.
         turn = _turn(preview="\n\n  the real ask\nmore")
-        assert self._col(7).render(turn, feed.RenderCtx()) == "the real ask"
+        assert self._col(7).render(turn, feed.RenderCtx()).plain == "the real ask"
 
     def test_prompt_column_empty_preview_is_a_dim_hint(self):
         cell = self._col(7).render(_turn(preview=""), feed.RenderCtx())
         assert cell.plain == "(empty)"
         assert self._col(7).render(_turn(preview="  \n \n"), feed.RenderCtx()).plain \
             == "(empty)"
+
+
+class TestConsoleMarkupIsNeverParsed:
+    """Text from outside this program must reach Rich as `Text`, never a bare `str`.
+
+    `Table.add_row`, `Table.grid`'s rows and a `Panel`'s title/subtitle all run a
+    bare `str` through `console.render_str`, which has console markup ENABLED. Two
+    failure modes, both driven here rather than reasoned about:
+
+    - `[bold]` (a valid open tag) is SILENTLY DELETED. Measured on the live audit
+      store, 2 of its 5,452 user turns already lose text this way, one of them
+      `"...when we press [enter] claude-trail should..."`.
+    - `[/tmp/x]` (an unmatched closing tag) raises MarkupError. In the TUI that
+      happens inside `live.update(render_panel(), ...)` in main()'s loop, which is
+      past its `except KeyboardInterrupt`, so the whole TUI dies with a traceback.
+
+    So every case below asserts the bracketed value renders LITERALLY: the probes
+    are chosen so a regression shows up as a missing needle (deletion) or as the
+    MarkupError propagating out of `console.print` (crash).
+    """
+
+    BRACKET = "[/tmp/x]"     # unmatched closing tag -> MarkupError
+    DELETE = "[bold]"        # valid open tag -> silently swallowed
+
+    FEED_COLS = {c.key: True for c in feed.COLUMNS}
+    PROMPT_COLS = {c.key: True for c in feed.PROMPT_COLUMNS}
+
+    def _out(self, renderable, width=200):
+        console = Console(width=width, record=True)
+        console.print(renderable)      # a MarkupError here IS the bug
+        return console.export_text()
+
+    def _literal(self, build, needle=None):
+        """`build(probe)` must render `probe` (or `needle(probe)`) untouched, for
+        both probe forms - the crashing one and the silently-deleted one."""
+        for probe in (self.BRACKET, self.DELETE):
+            out = self._out(build(probe))
+            assert (needle(probe) if needle else probe) in out, (probe, out)
+
+    def _entry(self, **kw):
+        e = {"timestamp": "2026-07-29T10:00:00-03:00", "command": "ls",
+             "cwd": "/tmp", "session_id": "s1"}
+        e.update(kw)
+        return e
+
+    def _model(self, **kw):
+        m = dict(session_id="s1", name="n", status="", live=True, cwd="/tmp",
+                 version="1.0", kind="startup", started_at=0,
+                 transcript_path="/t.jsonl", subagents=())
+        m.update(kw)
+        return feed.SessionModel(**m)
+
+    def _sub(self, **kw):
+        s = dict(agent_id="aid1", agent_type="gp", description="d", status="done",
+                 command_count=1, command_count_capped=False)
+        s.update(kw)
+        return feed.SubagentInfo(**s)
+
+    # ---- the feed's columns ----
+
+    def test_feed_session_name_is_literal(self):
+        # A session name comes from `sessions/<pid>.json`, so the user typed it.
+        self._literal(lambda p: feed.build_table(
+            [self._entry()], 5, self.FEED_COLS, 0, name_map={"s1": f"n{p}"}))
+        # Same through the tinted branch, which is a different return path.
+        self._literal(lambda p: feed.build_table(
+            [self._entry()], 5, self.FEED_COLS, 0,
+            name_map={"s1": f"n{p}"}, color_map={"s1": "orange"}))
+
+    def test_feed_directory_and_command_are_literal(self):
+        self._literal(lambda p: feed.build_table(
+            [self._entry(cwd=f"/tmp/{p}")], 5, self.FEED_COLS, 0))
+        self._literal(lambda p: feed.build_table(
+            [self._entry(command=f"echo {p}")], 5, self.FEED_COLS, 0))
+
+    def test_feed_files_cell_keeps_a_bracketed_basename(self):
+        # A basename cannot carry the crash form (`[/x]` needs a `/`, which ends
+        # the basename), but `[bold].txt` is a legal filename and was deleted.
+        out = self._out(feed.build_table(
+            [self._entry(command="cat /tmp/[bold].txt")], 5, self.FEED_COLS, 0))
+        assert "[bold].txt" in out
+
+    def test_feed_agent_label_is_literal(self):
+        # An agent description is the Task tool's `description`, i.e. prose.
+        self._literal(lambda p: feed.build_table(
+            [self._entry(agent_id="aid1")], 5, self.FEED_COLS, 0,
+            agent_map={"aid1": {"description": p, "type": "gp"}}))
+
+    # ---- the prompts tab's columns ----
+
+    def test_prompt_cell_is_literal(self):
+        # The whole point of this phase: a turn's preview is a human's own prose.
+        self._literal(lambda p: feed.build_prompts_table(
+            [_turn(preview=f"look in {p} now", tools=1)], 5, self.PROMPT_COLS, 0))
+
+    def test_prompts_project_and_session_cells_are_literal(self):
+        self._literal(lambda p: feed.build_prompts_table(
+            [_turn(project=f"/p/{p}", tools=1)], 5, self.PROMPT_COLS, 0))
+        self._literal(lambda p: feed.build_prompts_table(
+            [_turn(tools=1)], 5, self.PROMPT_COLS, 0, name_map={"sid-p": f"n{p}"}))
+
+    def test_every_prompt_column_survives_a_bracketed_row(self):
+        # Whole-row sweep: no PROMPT_COLUMNS renderer may hand Rich a bare str,
+        # including one added later (this fails on the added column, not on a
+        # hand-listed subset).
+        turn = _turn(sid=f"s{self.BRACKET}", project=f"/p/{self.BRACKET}",
+                     preview=f"ask {self.BRACKET}", tools=3, bash=1, agents=2,
+                     output_tokens=1200, subagent_output_tokens=30)
+        for col in feed.PROMPT_COLUMNS:
+            self._out(feed.build_prompts_table([turn], 5, {col.key: True}, 0))
+
+    # ---- the panels ----
+
+    def test_command_detail_rows_are_literal(self):
+        self._literal(lambda p: feed.build_detail_panel(
+            self._entry(cwd=f"/tmp/{p}"), 40))
+        self._literal(lambda p: feed.build_detail_panel(
+            self._entry(command=f"echo {p}"), 40))
+        self._literal(lambda p: feed.build_detail_panel(
+            self._entry(), 40, prompt={"text": f"ask {p}", "ts": "2026-07-29 10:00"}))
+        # The Files metadata row, deletion form only (see the feed's Files test).
+        # Counted, not just present: the command body below it renders the same
+        # path, so `in out` alone passes even with the Files row swallowed.
+        out = self._out(feed.build_detail_panel(
+            self._entry(command="cat /tmp/[bold].txt"), 40))
+        assert out.count("[bold].txt") == 2      # the Files row AND the command
+
+    def test_full_prompt_panel_is_literal(self):
+        self._literal(lambda p: feed.build_prompt_panel(
+            self._entry(), 40, {"text": f"ask {p}", "ts": "2026-07-29 10:00:00"}))
+        # The `Sent` row is a store timestamp: no `[` is reachable today, but it
+        # is outside text and a bare str crashed on one.
+        self._literal(lambda p: feed.build_prompt_panel(
+            self._entry(), 40, {"text": "b", "ts": p}))
+
+    def test_session_panel_rows_are_literal(self):
+        for build in (
+            lambda p: feed.build_session_panel(self._model(session_id=f"s{p}")),
+            lambda p: feed.build_session_panel(self._model(name=f"n{p}")),
+            lambda p: feed.build_session_panel(self._model(cwd=f"/tmp/{p}")),
+            lambda p: feed.build_session_panel(self._model(version=f"1.0{p}")),
+            lambda p: feed.build_session_panel(
+                self._model(started_at=1_700_000_000_000, kind=f"k{p}")),
+            lambda p: feed.build_session_panel(
+                self._model(subagents=(self._sub(description=f"d{p}"),))),
+            lambda p: feed.build_session_panel(
+                self._model(subagents=(self._sub(agent_type=f"t{p}"),))),
+            lambda p: feed.build_session_panel(
+                self._model(subagents=(self._sub(description=f"d{p}"),)),
+                highlight_agent_id="aid1"),
+        ):
+            self._literal(build)
+
+    def test_db_panel_rows_are_literal(self):
+        # The connection string is a path from $CLAUDE_TRAIL_DB and the failure
+        # rows carry a raw exception message.
+        self._literal(lambda p: feed.build_db_panel([("connection", f"/tmp/{p}.duckdb")]))
+        self._literal(lambda p: feed.build_db_panel([("error", f"boom {p}")]))
+        self._literal(lambda p: feed.build_db_panel([(f"rows {p}", "1")]))
+
+    def test_search_hits_are_literal(self):
+        # Source code, JSON and markdown are the `[`-densest text in the program,
+        # and every grep hit is one of those.
+        def hit(**kw):
+            s = dict(sid="s1", roots={"cwd": [Path("/tmp")]}, root="cwd",
+                     mode="RESULTS", query="q")
+            s.update(kw)
+            return feed.build_search_panel(feed.SearchState(**s))
+        self._literal(lambda p: hit(results=[("/tmp/a.py", 3, f"x = list{p}")]))
+        self._literal(lambda p: hit(results=[(f"/tmp/{p}.py", 3, "hit")]))
+
+    def test_prompts_panel_chrome_is_literal(self):
+        self._literal(lambda p: feed.build_prompts_panel(
+            feed.PromptsState(rows=[_turn(preview=f"ask {p}", tools=1)],
+                              loaded_at=1.0, checked_at=1.0), 24, now=1.0))
+        self._literal(lambda p: feed.build_prompts_panel(
+            feed.PromptsState(status=f"store unreadable: {p}",
+                              loaded_at=1.0, checked_at=1.0), 24, now=1.0))
+
+    def test_panel_subtitles_survive_a_bracketed_config_dir(self):
+        # LOG_PATH is derived from $CLAUDE_CONFIG_DIR, so it is outside text too,
+        # and the subtitles used to interpolate it INTO markup (`[dim]{path}`).
+        def subtitled(builder):
+            def build(probe):
+                with patch.object(feed, "LOG_PATH",
+                                  Path(f"/tmp/{probe}/command-log.jsonl")):
+                    return builder()
+            return build
+        self._literal(subtitled(
+            lambda: feed.build_panel([self._entry()], 40, self.FEED_COLS, 0)))
+        self._literal(subtitled(lambda: feed.build_detail_panel(self._entry(), 40)))
+        self._literal(subtitled(lambda: feed.build_prompt_panel(
+            self._entry(), 40, {"text": "b", "ts": "2026-07-29 10:00:00"})))
+
+    def test_a_live_driven_render_of_every_panel_survives_a_bracket_prompt(self):
+        """The crash exactly where the TUI hits it: `live.update(render_panel())`.
+
+        `console.print` above is the same render path, but this is the one main()
+        actually runs, and it is the reason a MarkupError is fatal rather than
+        cosmetic - it is raised past `except KeyboardInterrupt`, so the loop
+        unwinds and the tool exits with a traceback.
+        """
+        import io
+        from rich.live import Live
+        probe = "look in [/tmp/x] now"
+        entry = self._entry(command=f"echo {probe}", cwd=f"/tmp/{probe}")
+        prompts = feed.PromptsState(rows=[_turn(preview=probe, tools=1)],
+                                    loaded_at=1.0, checked_at=1.0)
+        panels = [
+            feed.build_prompts_panel(prompts, 24, now=1.0),
+            feed.build_panel([entry], 24, self.FEED_COLS, 0),
+            feed.build_detail_panel(entry, 24,
+                                    prompt={"text": probe, "ts": "2026-07-29 10:00"}),
+            feed.build_prompt_panel(entry, 24, {"text": probe, "ts": "2026-07-29 10:00"}),
+            feed.build_session_panel(self._model(
+                cwd=f"/tmp/{probe}", subagents=(self._sub(description=probe),))),
+            feed.build_db_panel([("error", probe)]),
+            feed.build_search_panel(feed.SearchState(
+                sid="s1", roots={"cwd": [Path("/tmp")]}, root="cwd", mode="RESULTS",
+                results=[("/tmp/a.py", 3, probe)])),
+        ]
+        # force_terminal, or Live.refresh() short-circuits on a file console and
+        # nothing would be rendered at all.
+        console = Console(file=io.StringIO(), width=120, force_terminal=True)
+        with Live(panels[0], console=console) as live:
+            for panel in panels:
+                live.update(panel, refresh=True)
 
 
 class TestPromptsTable:
@@ -2640,6 +2921,27 @@ class TestPromptsTabKeys:
 
     # ---- refresh / filter keys: every one of them stays pure ----
 
+    def test_no_prompts_key_opens_a_modal_there_is_no_panel_for(self):
+        """EVERY key this tab answers must leave `modal_open()` False.
+
+        `prompts.detail` is counted by `modal_open()` and no panel renders it yet,
+        so setting it in any branch turns the tab into a key trap: every key but
+        esc/q/enter dead, nothing on screen to explain it. Asserted over the whole
+        key set in one loop rather than per-key, so a future rewrite of any single
+        test cannot quietly drop the guard (it did once - phase 3's `r`/`x`
+        rewrite).
+        """
+        for ch in ("r", "x", "S", "\r", "\n", "j", "k", "g", "G", "\t",
+                   "1", "2", "7", "c", "f", "/", "o", "t"):
+            state = _prompts_state(rows=0)
+            # tools=1 so the rows survive `x`: with an empty filtered list
+            # `selected()` is None and the trap would set `detail = None`, which
+            # looks fine while being exactly the bug in one of its two states.
+            state.prompts.rows = [_turn(sid=f"sid-p{i}", tools=1) for i in range(3)]
+            feed.apply_key(state, ch, 10)
+            assert state.prompts.detail is None, ch
+            assert state.modal_open() is False, ch
+
     def test_r_asks_for_a_reload_without_touching_the_list(self):
         state = _prompts_state(rows=3)
         rows_before, cursor_before = list(state.prompts.rows), state.prompts.cursor
@@ -2647,6 +2949,7 @@ class TestPromptsTabKeys:
         assert state.prompts.rows == rows_before      # main() does the reading
         assert state.prompts.cursor == cursor_before
         assert state.prompts.loaded_at is None        # no I/O happened here
+        assert state.modal_open() is False            # and no modal was opened
 
     def test_x_toggles_hide_empty_without_a_reload(self):
         # Filtered in place over the snapshot, so no store read is requested.
@@ -2655,6 +2958,7 @@ class TestPromptsTabKeys:
         assert state.prompts.hide_empty is True
         assert feed.apply_key(state, "x", 10) is feed.Action.NONE
         assert state.prompts.hide_empty is False
+        assert state.modal_open() is False            # and no modal was opened
 
     def test_every_nav_key_pairs_with_the_clamp(self):
         """The deferred finding: `goto_bottom` / `move_down` never touched
@@ -2869,7 +3173,13 @@ class TestPromptsPanelGeometry:
         """The body must get exactly `prompts_row_count(h)` rows and the panel
         must still end with its hints. Both widths matter for the same reason as
         the feed's: at 160 the hints fit one line, at 80 they wrap to two and the
-        constant's single slack line has to absorb that."""
+        constant's single slack line has to absorb that.
+
+        The two counting assertions are weak on their own: the `Panel` is built
+        with `height=term_height`, so `len(lines) == 24` holds at chrome 12-15 and
+        `body_rows == prompts_row_count(24)` is true by construction of the same
+        constant. What pins the constant is the `q:quit` tail here plus
+        `test_chrome_rows_is_not_one_row_too_many` at w=80 (the minimal side)."""
         for width in (80, 160):
             lines = self._panel_lines(width)
             out = "\n".join(lines)
@@ -3729,6 +4039,22 @@ class TestTokenLoaders:
         # And without the hook the behaviour is byte-for-byte what it was.
         assert feed._with_store(lambda con: "unreachable") is None
 
+    def test_a_raising_on_error_hook_cannot_escape(self, tmp_path, monkeypatch):
+        # The contract is "never raise at the caller" - a diagnostic callback must
+        # not be the one thing that breaks it, or a second caller's buggy hook
+        # takes the TUI down through a path that exists to swallow failures.
+        import claude_trail_store as store
+        db = tmp_path / "trail.duckdb"
+        db.touch()
+        monkeypatch.setattr(store, "STORE_PATH", db)
+        monkeypatch.setattr(store, "connect", lambda **kw: (_ for _ in ()).throw(
+            OSError("boom")))
+
+        def raising(exc):
+            raise ValueError("the hook itself is broken")
+
+        assert feed._with_store(lambda con: "unreachable", on_error=raising) is None
+
 
 class TestPromptTurnLoader:
     """`_load_prompt_turns` / `_refresh_prompts`: the three store states the
@@ -3854,6 +4180,42 @@ class TestPromptTurnLoader:
         assert prompts.loaded_at is None
         assert prompts.rows == []
 
+    def test_refresh_does_not_date_a_read_that_answered_nothing(self, monkeypatch):
+        # `loaded_at` dates the last ANSWER. Stamping it on a failure made the
+        # header claim `as of 22:30:04 (0s ago) · 0 turns` over a body explaining
+        # that the store could not be read - two false statements at once.
+        prompts = feed.PromptsState()
+        monkeypatch.setattr(feed, "_load_prompt_turns",
+                            lambda sid=None: ([], "store unreadable: boom"))
+        feed._refresh_prompts(prompts, 10)
+        assert prompts.loaded_at is None            # never answered
+        assert prompts.checked_at is not None       # but the attempt is recorded
+        assert prompts.status == "store unreadable: boom"
+
+    def test_refresh_keeps_a_good_snapshot_through_a_non_lock_failure(self, monkeypatch):
+        # The store vanishing between the `exists()` check and `connect` is a
+        # transient race; blanking the list for it (where a lock collision keeps
+        # it) threw away a perfectly readable snapshot.
+        kept = [_turn(sid="kept-1", tools=1), _turn(sid="kept-2", tools=1)]
+        prompts = feed.PromptsState(rows=kept, cursor=1, loaded_at=100.0)
+        monkeypatch.setattr(feed, "_load_prompt_turns",
+                            lambda sid=None: ([], feed.NO_STORE_HINT))
+        feed._refresh_prompts(prompts, 10)
+        assert prompts.rows == kept                 # still on screen
+        assert prompts.cursor == 1
+        assert prompts.loaded_at == 100.0           # and still dated by its read
+        assert prompts.status == feed.NO_STORE_HINT
+
+    def test_refresh_replaces_the_snapshot_on_a_successful_empty_read(self, monkeypatch):
+        # The other side of the previous test: an empty answer is an ANSWER, so it
+        # does replace the rows (a session whose turns aged out must go empty).
+        prompts = feed.PromptsState(rows=[_turn(sid="old", tools=1)], loaded_at=100.0)
+        monkeypatch.setattr(feed, "_load_prompt_turns", lambda sid=None: ([], None))
+        feed._refresh_prompts(prompts, 10)
+        assert prompts.rows == []
+        assert prompts.status is None
+        assert prompts.loaded_at != 100.0
+
     def test_refresh_passes_the_active_session_filter(self, monkeypatch):
         seen = []
         monkeypatch.setattr(feed, "_load_prompt_turns",
@@ -3920,6 +4282,32 @@ class TestPromptsPanelStates:
         out = self._text(prompts)
         assert feed.NO_STORE_HINT in out
 
+    def test_a_failed_read_says_so_instead_of_blaming_an_empty_store(self):
+        # The panel used to make two false statements at once here: a header
+        # dating a read that never happened, and a body reading "No prompts in the
+        # audit store. Fill it with: claude-trail ingest" - wrong advice for a
+        # store that IS there and cannot be read.
+        prompts = feed.PromptsState(status="store unreadable: schema is from the future",
+                                    checked_at=1000.0)
+        out = self._text(prompts)
+        assert "could not be read" in out
+        assert "schema is from the future" in out
+        assert "Press r" in out
+        assert "No prompts in the audit store" not in out
+        assert "as of" not in out                  # nothing was ever answered
+        assert "not read yet" in out
+
+    def test_a_kept_snapshot_filtered_empty_still_advises_the_x_key(self):
+        # A busy store with a snapshot the `x` filter hides: the store-failure
+        # branch must not steal this case, or the way back is unexplained.
+        prompts = feed.PromptsState(rows=[_turn(sid="quiet", tools=0)],
+                                    hide_empty=True,
+                                    status=feed.STORE_BUSY_KEPT_HINT,
+                                    loaded_at=940.0, checked_at=1000.0)
+        out = self._text(prompts)
+        assert "press x" in out
+        assert "could not be read" not in out
+
     def test_a_busy_store_says_busy_over_the_snapshot_it_kept(self):
         prompts = feed.PromptsState(
             rows=[_turn(sid="kept-1", tools=1, preview="the kept turn")],
@@ -3945,6 +4333,21 @@ class TestPromptsPanelStates:
         assert "Press S" in out
         assert "session sid-abcd" in out       # the header names the scope
         assert "claude-trail ingest" not in out
+
+    def test_the_scoped_header_names_the_session_the_way_the_column_does(self):
+        # The header showed a raw id prefix while the Session column showed the
+        # resolved name, which read as two different sessions.
+        prompts = feed.PromptsState(rows=[_turn(sid="sid-abcdef12", tools=1)],
+                                    session_filter="sid-abcdef12",
+                                    loaded_at=1000.0, checked_at=1000.0)
+        console = Console(width=160, record=True)
+        console.print(feed.build_prompts_panel(
+            prompts, 24, name_map={"sid-abcdef12": "my-session"}, now=1000.0))
+        out = console.export_text()
+        assert "session my-session" in out
+        assert "sid-abcd" not in out            # not the raw prefix, in either place
+        assert feed._prompts_header(prompts, 1000.0).plain.strip().endswith(
+            "session sid-abcd")                 # and it still falls back without one
 
     def test_the_age_line_reports_the_snapshot_clock(self):
         prompts = feed.PromptsState(rows=[_turn(tools=1)],

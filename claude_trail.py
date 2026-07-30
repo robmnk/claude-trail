@@ -278,6 +278,21 @@ class Column:
     render: Callable[["LogEntry | PromptTurn", RenderCtx], object]
 
 
+# `Table.add_row` runs a bare `str` cell through `console.render_str`, which has
+# console markup ENABLED: a path, session name or prompt containing `[bold]` has
+# that span silently deleted, and one containing an unmatched `[/tmp/x]` raises
+# MarkupError from inside `live.update()` - past main()'s `except
+# KeyboardInterrupt`, killing the TUI. `Table.grid` rows and a `Panel`'s
+# title/subtitle go through the same render_str, so the rule covers the panels
+# too: every cell, metadata row and subtitle that can carry text from outside this
+# program is wrapped in `Text`, which is never parsed. A bare `str` is left only
+# where the value provably cannot contain `[`: `format_time`'s
+# `HH:MM:SS`/`??:??:??`, digit-only counts, `Text.append`ed segments (append does
+# not parse), and literals in the source - including the `[dim]`-style markup the
+# panel titles and hint lines are built from on purpose.
+# TestConsoleMarkupIsNeverParsed pins this per column and per panel.
+
+
 def _danger_prefixed(cmd: str, body: str) -> Text:
     """A `Text` of `body`, prefixed with a bold-red `* ` when `cmd` is dangerous."""
     text = Text()
@@ -296,10 +311,14 @@ def _session_cell(sid: str, ctx: RenderCtx):
 
     Factored out of `_render_session` so the Prompts tab's Session column is the
     same cell rather than a second copy of the label + tint rules.
+
+    Always a `Text`, tint or none: the label may be a name the user typed into
+    `sessions/<pid>.json`, and a bare `str` would be parsed as console markup
+    (see the note under `Column`).
     """
     label = session_label(sid, ctx.name_map)
     color = rich_color(ctx.color_map.get(sid)) if ctx.color_map else None
-    return Text(label, style=color) if color else label
+    return Text(label, style=color or "")
 
 
 def _render_session(entry: LogEntry, ctx: RenderCtx):
@@ -307,11 +326,11 @@ def _render_session(entry: LogEntry, ctx: RenderCtx):
 
 
 def _render_directory(entry: LogEntry, ctx: RenderCtx):
-    return short_path(entry.get("cwd", ""))
+    return Text(short_path(entry.get("cwd", "")))
 
 
 def _render_files(entry: LogEntry, ctx: RenderCtx):
-    return extract_files(entry.get("command", ""))
+    return Text(extract_files(entry.get("command", "")))
 
 
 def _render_command(entry: LogEntry, ctx: RenderCtx):
@@ -411,8 +430,11 @@ def _render_turn_project(turn: "PromptTurn", ctx: RenderCtx):
 
     `sessions.project` ALONE: `PromptTurn.cwd` is always None (`_upsert_session`
     never writes that column), so a fallback to it would be dead code.
+
+    A `Text`, because a project path is outside text (see the note under
+    `Column`): a directory named `[wip]` would otherwise be deleted from the cell.
     """
-    return short_path(turn.project or "", PROJECT_LABEL_WIDTH)
+    return Text(short_path(turn.project or "", PROJECT_LABEL_WIDTH))
 
 
 def _render_turn_calls(turn: "PromptTurn", ctx: RenderCtx):
@@ -467,10 +489,15 @@ def _render_turn_prompt(turn: "PromptTurn", ctx: RenderCtx):
     preview so line one should already be that line, and taking the first
     non-blank one means a stray leading newline shows the prompt instead of an
     empty cell.
+
+    Always a `Text`: this cell is a human's own prose, the most `[`-prone value in
+    the program. As a bare `str` Rich parses it as console markup, so
+    `list[int]` loses `[int]` and `look in [/tmp/x] now` raises MarkupError out of
+    `live.update()` (see the note under `Column`).
     """
     label = _slash_label(turn.preview or "")
     first = next((line.strip() for line in label.splitlines() if line.strip()), "")
-    return first or Text("(empty)", style="dim italic")
+    return Text(first) if first else Text("(empty)", style="dim italic")
 
 
 PROMPT_COLUMNS = [
@@ -482,8 +509,10 @@ PROMPT_COLUMNS = [
             "no_wrap": True, "overflow": "ellipsis"}, _render_turn_session),
     Column(3, "Project", "green",
            {"width": PROJECT_LABEL_WIDTH, "no_wrap": True}, _render_turn_project),
+    # 14, not 12: the widest real cell is `185 (82 bash)` (measured across the
+    # newest 200 turns of a 1 GiB store), which 12 truncated to `185 (82 bas…`.
     Column(4, "Calls", "yellow",
-           {"width": _env_int("CLAUDE_TRAIL_PROMPT_COL_CALLS_WIDTH", 12),
+           {"width": _env_int("CLAUDE_TRAIL_PROMPT_COL_CALLS_WIDTH", 14),
             "no_wrap": True, "overflow": "ellipsis"}, _render_turn_calls),
     Column(5, "Agents", AGENT_STYLE,
            {"width": _env_int("CLAUDE_TRAIL_PROMPT_COL_AGENTS_WIDTH", 6),
@@ -1477,10 +1506,12 @@ def build_detail_panel(
     label = agent_label(entry, agent_map or {})
     if label is not None:
         meta.add_row("Agent", Text(label, style=AGENT_STYLE))
-    meta.add_row("Directory", entry.get("cwd", "") or "(none)")
+    # Text, not str: a cwd or a basename can carry `[` (see the note under
+    # `Column`), and `Table.grid` parses a bare str exactly like `Table` does.
+    meta.add_row("Directory", Text(entry.get("cwd", "") or "(none)"))
     files = extract_files(cmd)
     if files:
-        meta.add_row("Files", files)
+        meta.add_row("Files", Text(files))
     if tokens:
         meta.add_row("Tokens", _format_command_tokens(tokens))
 
@@ -1510,7 +1541,7 @@ def build_detail_panel(
     return Panel(
         body,
         title=_panel_title("· command"),
-        subtitle=f"[dim]{LOG_PATH}[/dim]",
+        subtitle=Text(str(LOG_PATH), style="dim"),
         box=box.ROUNDED,
         padding=(1, 2),
         height=term_height,
@@ -1565,7 +1596,7 @@ def build_prompt_panel(
     # offset tail rather than parsing it (no fromisoformat, no pytz).
     when = (prompt.get("ts") or "")[:19]
     if when:
-        meta.add_row("Sent", when)
+        meta.add_row("Sent", Text(when))
 
     n = len(lines)
     scroll = _clamp_prompt_scroll(scroll, n, term_height)
@@ -1596,7 +1627,7 @@ def build_prompt_panel(
     return Panel(
         Group(meta, Text(""), header, prompt_panel),
         title=_panel_title("· prompt"),
-        subtitle=f"[dim]{LOG_PATH}[/dim]",
+        subtitle=Text(str(LOG_PATH), style="dim"),
         box=box.ROUNDED,
         padding=(1, 2),
         height=term_height,
@@ -1696,7 +1727,10 @@ def build_session_panel(
     name = Text(model.name or session_label(sid, name_map), style=color or "")
     if model.status:
         name.append(f"  ({model.status})", style="bold green")
-    meta.add_row("Session", sid or "(none)")
+    # Every value on this page comes from pid.json / the transcript / an agent
+    # meta file, so each one is wrapped in Text rather than left a bare str for
+    # Rich to parse as markup (see the note under `Column`).
+    meta.add_row("Session", Text(sid or "(none)"))
     meta.add_row("Name", name)
     # Opened from a subagent row: surface that subagent's complete name (the
     # Agent column ellipsizes it) right under Name, tinted like the feed.
@@ -1709,10 +1743,10 @@ def build_session_panel(
             if info.agent_type:
                 full += f"  ({info.agent_type})"
             meta.add_row("Subagent", Text(full, style=AGENT_STYLE))
-    meta.add_row("Folder", _tilde(model.cwd))
+    meta.add_row("Folder", Text(_tilde(model.cwd)))
     meta.add_row("Transcript", Text(model.transcript_path or "(none)", style="dim"))
-    meta.add_row("Version", model.version or "(unknown)")
-    meta.add_row("Started", _session_started_line(model))
+    meta.add_row("Version", Text(model.version or "(unknown)"))
+    meta.add_row("Started", Text(_session_started_line(model)))
     if tokens:
         meta.add_row("Tokens", _format_session_tokens(tokens))
 
@@ -1747,8 +1781,8 @@ def build_session_panel(
             row_style = "reverse" if s.agent_id == highlight_agent_id else None
             subs.add_row(
                 Text(glyph, style=gstyle),
-                f"{short}  {s.description}" if s.description else short,
-                s.agent_type,
+                Text(f"{short}  {s.description}" if s.description else short),
+                Text(s.agent_type),
                 Text(s.status, style=gstyle),
                 count_cell,
                 style=row_style,
@@ -1783,7 +1817,10 @@ def build_db_panel(info: list, term_height: int = 40) -> Panel:
     grid.add_column(style="dim", justify="right", no_wrap=True)
     grid.add_column(ratio=1, overflow="fold")
     for label, value in info:
-        grid.add_row(label, str(value))
+        # Both sides as Text: the connection string is a path from
+        # $CLAUDE_TRAIL_DB and the failure rows carry a raw exception message, so
+        # neither is markup-safe (see the note under `Column`).
+        grid.add_row(Text(str(label)), Text(str(value)))
     hint = Text.from_markup("[dim italic]esc / q / ↵ : back[/dim italic]")
     body = Group(grid, Text(""), hint)
     return Panel(
@@ -1909,8 +1946,11 @@ def build_search_panel(search: "SearchState", term_height: int = 40) -> Panel:
         base = _search_root_base(search)
         for i in range(win_start, win_end):
             path, line, text = search.results[i]
+            # A grep hit is the most `[`-dense text in the program (source code,
+            # JSON, markdown), so both the path and the snippet are Text rather
+            # than a bare str Rich would parse (see the note under `Column`).
             tbl.add_row(
-                _rel_to(path, base), str(line), text.strip(),
+                Text(_rel_to(path, base)), str(line), Text(text.strip()),
                 style="on grey23" if i == search.cursor else None,
             )
         body = tbl
@@ -2068,7 +2108,7 @@ def build_panel(
     return Panel(
         body,
         title=_panel_title(),
-        subtitle=f"[dim]{LOG_PATH}[/dim]",
+        subtitle=Text(str(LOG_PATH), style="dim"),
         box=box.ROUNDED,
         padding=(1, 2),
         height=term_height,
@@ -2142,7 +2182,8 @@ def _snapshot_age(stamp: float | None, now: float | None = None) -> float | None
     return max(0.0, (time.monotonic() if now is None else now) - stamp)
 
 
-def _prompts_header(prompts: "PromptsState", now: float | None = None) -> Text:
+def _prompts_header(prompts: "PromptsState", now: float | None = None,
+                    name_map: dict[str, str] | None = None) -> Text:
     """The line above the turn list: how fresh the snapshot is, how much of it is
     on screen, what it is scoped to, and any store status.
 
@@ -2150,6 +2191,10 @@ def _prompts_header(prompts: "PromptsState", now: float | None = None) -> Text:
     current wall clock, rather than stored alongside it: one stamp then answers
     both "how old" and "as of when", with no second timestamp to drift out of
     sync with it.
+
+    `name_map` is the feed's, so the scope names the session the same way the
+    Session column does (`session_label`): the header used to show a raw id prefix
+    next to a column of resolved names, which read as two different sessions.
     """
     line = Text("  ")
     age = _snapshot_age(prompts.loaded_at, now)
@@ -2165,7 +2210,8 @@ def _prompts_header(prompts: "PromptsState", now: float | None = None) -> Text:
     if hidden:
         line.append(f" ({hidden} hidden)", style="dim italic")
     if prompts.session_filter:
-        line.append(f"  ·  session {prompts.session_filter[:8]}", style="dim")
+        line.append(f"  ·  session {session_label(prompts.session_filter, name_map)}",
+                    style="dim")
     if prompts.status:
         line.append(f"  ·  {prompts.status}", style="yellow")
     return line
@@ -2174,12 +2220,22 @@ def _prompts_header(prompts: "PromptsState", now: float | None = None) -> Text:
 def _prompts_empty_state(prompts: "PromptsState") -> Text:
     """The body when no turn is on screen, saying WHY and what would fix it.
 
-    Four different empties, and telling them apart is the point: advising
-    `claude-trail ingest` when the store is already current, or when `x` is simply
-    hiding every row, would be wrong advice on a working store.
+    Five different empties, and telling them apart is the point: advising
+    `claude-trail ingest` when the store is already current, when the store is
+    there but unreadable, or when `x` is simply hiding every row, would be wrong
+    advice on a working store.
     """
     text = Text()
-    if prompts.loaded_at is None:
+    if prompts.status and not prompts.rows:
+        # The store could not answer at all (no file, unreadable, or held by the
+        # ingest with nothing kept). `status` already says which, and it must be
+        # said HERE too: the "no prompts in the store" fallback below would blame
+        # an empty store for a read that never happened. Gated on `not rows` so a
+        # kept snapshot filtered empty by `x` still gets the un-hide advice.
+        text.append("The audit store could not be read.\n\n", style="dim italic")
+        text.append(f"{prompts.status}\n\n", style="dim")
+        text.append("Press r to try again.", style="dim")
+    elif prompts.loaded_at is None:
         text.append("No prompts read yet.\n\n", style="dim italic")
         text.append(
             "This tab reads the audit store, not the live command feed.\n", style="dim")
@@ -2238,7 +2294,8 @@ def build_prompts_panel(
     status.append(f"  {prompts.cursor + 1}/{len(rows)}" if rows else "  0/0",
                   style="dim")
 
-    body = Group(_tab_strip("prompts"), Text(""), _prompts_header(prompts, now),
+    body = Group(_tab_strip("prompts"), Text(""),
+                 _prompts_header(prompts, now, name_map),
                  content, Text(""), status, _tab_status("prompts", cols))
 
     return Panel(
@@ -3191,7 +3248,9 @@ def _with_store(fn, on_error=None):
     or a query error) so a caller can simply omit the Tokens row rather than
     crash the TUI. `on_error(exc)` is called with the exception first, for the one
     caller that must tell a transient lock collision apart from an empty answer;
-    it does not widen what is caught, it only stops the reason being lost.
+    it does not widen what is caught, it only stops the reason being lost. A hook
+    that raises is swallowed too: the contract here is "never raise at the caller",
+    and a diagnostic callback must not be the one thing that breaks it.
     """
     try:
         from claude_trail_store import STORE_PATH, connect
@@ -3207,7 +3266,10 @@ def _with_store(fn, on_error=None):
             con.close()
     except Exception as e:
         if on_error is not None:
-            on_error(e)
+            try:
+                on_error(e)
+            except Exception:
+                pass
         return None
 
 
@@ -3329,17 +3391,27 @@ def _refresh_prompts(prompts: PromptsState, max_rows: int) -> None:
 
     Kept out of main()'s loop so the three store outcomes land in one testable
     place. `loaded_at` records when the tab last got an ANSWER from the store, so
-    a busy collision leaves it (and the rows) alone: the header keeps counting up
-    from the last good read, which is exactly the staleness the user needs to see.
+    NO failure advances it (a busy collision or an unreadable store leaves it, and
+    the rows, alone): the header keeps counting up from the last good read, which
+    is exactly the staleness the user needs to see. Advancing it for a read that
+    answered nothing would date an empty list as fresh - `as of 22:30:04 (0s ago)
+    · 0 turns` over a body explaining that the store could not be read.
     """
     rows, status = _load_prompt_turns(prompts.session_filter)
     prompts.checked_at = time.monotonic()
     if rows is None:
+        # The store is held by the running ingest: no answer, so keep the rows.
         prompts.status = STORE_BUSY_KEPT_HINT if prompts.rows else status
+        return
+    prompts.status = status
+    if status:
+        # A failure that answered nothing (missing store, unreadable store):
+        # `_load_prompt_turns` pairs those with an empty list, so writing it here
+        # would blank a good snapshot for what may be a transient error - the
+        # same snapshot a lock collision above deliberately keeps.
         return
     prompts.rows = rows
     prompts.loaded_at = prompts.checked_at
-    prompts.status = status
     prompts.clamp(max_rows)
 
 
@@ -3526,6 +3598,9 @@ def main():
                     max_rows = _tab_row_count(state.tab, console.height)
                     quit_now = False
                     acted = False
+                    # Set by LOAD_PROMPTS in the drain below, performed once
+                    # after it (see the refresh block further down).
+                    reload_prompts = False
                     if interactive:
                         ready, _, _ = select.select([fd], [], [], POLL_INTERVAL)
                         # Drain every buffered keystroke before rendering, so
@@ -3581,9 +3656,13 @@ def main():
                                 state.session_tokens = _load_session_tokens(
                                     state.session_detail)
                             elif action is Action.LOAD_PROMPTS:
-                                _refresh_prompts(
-                                    state.prompts,
-                                    prompts_row_count(console.height))
+                                # Only FLAG it: the store read is ~275ms and this
+                                # loop exists to coalesce a burst of buffered
+                                # keys into one render, so reading here made a
+                                # held `r` (auto key-repeat) spend a query per
+                                # press - 10 buffered `r` measured 3.21s frozen
+                                # inside one drain, with no redraw.
+                                reload_prompts = True
                             ready, _, _ = select.select([fd], [], [], 0)
                         if quit_now:
                             break
@@ -3599,15 +3678,28 @@ def main():
                     prompt_rows = prompts_row_count(console.height)
                     state.prompts.clamp(prompt_rows)
 
-                    # Idle refresh of the prompts snapshot, only while that tab is
-                    # the one being looked at and nothing is modal over it. It is a
-                    # synchronous query (measured ~70-120ms warm, up to ~0.5s right
-                    # after an ingest write), which the codebase prefers over a
-                    # background thread: state stays pure and main() keeps every
-                    # side effect. PROMPTS_AUTO_REFRESH is the ingest cadence, so
-                    # this fires rarely enough that the stall is not felt.
-                    if (state.tab == "prompts" and not state.modal_open()
-                            and _prompts_refresh_due(state.prompts)):
+                    # The prompts snapshot, at most ONE store read per frame:
+                    # either an explicit request coalesced out of the drain loop
+                    # (`r`, `S`, entering the tab) or the idle auto-refresh.
+                    # `_load_prompt_turns` connects, queries and closes on every
+                    # call (there is no warm-connection path), measured ~270-310ms
+                    # steady state and ~600-660ms cold on a 1.08 GiB store - which
+                    # is why the drain only sets a flag: a held `r` used to spend
+                    # one such query per buffered press. Still synchronous, which
+                    # the codebase prefers over a background thread (state stays
+                    # pure and main() keeps every side effect); and
+                    # PROMPTS_AUTO_REFRESH is the ingest cadence, so the idle case
+                    # fires rarely enough that the stall is not felt. Both are
+                    # gated on the tab being the one on screen, so a drain that
+                    # entered and left it again pays nothing. Only the idle case is
+                    # modal-gated: an explicit request stands even if a later key in
+                    # the same drain opened a modal over the list (one read, unseen
+                    # until it closes), while a modal can never make the tab poll
+                    # the store on its own.
+                    if state.tab == "prompts" and (
+                            reload_prompts
+                            or (not state.modal_open()
+                                and _prompts_refresh_due(state.prompts))):
                         _refresh_prompts(state.prompts, prompt_rows)
 
                     name_map = load_session_names()
