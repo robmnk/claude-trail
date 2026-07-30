@@ -36,7 +36,7 @@ import termios
 import time
 import tty
 from dataclasses import dataclass, field, fields, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 from pathlib import Path
 from typing import Callable, TypedDict
@@ -99,6 +99,13 @@ def _env_int(key: str, default: int) -> int:
 MAX_ENTRIES = 1000
 POLL_INTERVAL = 0.3
 CHROME_ROWS = 12  # title, tab strip + its blank, status, padding
+# Same accounting for the Prompts tab, which adds one line the feed does not
+# have: the snapshot header (`as of HH:MM:SS (12s ago)` plus the row counts and
+# any store status). Everything else is identical, including the single slack
+# line that absorbs the key hints wrapping to a second line on a narrow
+# terminal - so like CHROME_ROWS this is the worst case, and a wide terminal
+# spends one row on slack it does not need.
+PROMPTS_CHROME_ROWS = CHROME_ROWS + 1
 # Non-body lines around the search-results table (borders, padding, header/root
 # rows, table header, blank spacers, hint); the results window is sized so the
 # table body never overflows the panel and crops the cursor row out of view.
@@ -134,6 +141,14 @@ AGENT_STYLE = "cyan"  # tint of the Agent column, reused on the detail pages
 # distinctive tail (the actual dir) visible. Feeds both the Directory column and
 # short_path's default, so overriding it here keeps that column consistent.
 DIR_LABEL_WIDTH = _env_int("CLAUDE_TRAIL_COL_DIRECTORY_WIDTH", 14)
+# The Prompts tab's Project column, same deal: `short_path` needs the width to
+# left-truncate the project path, so the column and the helper read one constant.
+PROJECT_LABEL_WIDTH = _env_int("CLAUDE_TRAIL_PROMPT_COL_PROJECT_WIDTH", 16)
+# How stale the Prompts tab's snapshot may get before an idle frame re-reads the
+# store. This is the ingest cadence (a systemd timer runs the ingest every 30s,
+# see CLAUDE.md "Ingest cadence"), so a faster tick would spend a query to find
+# nothing new - and would collide with the ingest's write lock more often.
+PROMPTS_AUTO_REFRESH = 30.0
 ACTIVE_WINDOW_SECONDS = 300  # a session counts as active if seen within this window
 SEARCH_RESULT_LIMIT = 500  # max hits kept per search; the rest are dropped (capped)
 SEARCH_TIMEOUT = 5.0  # seconds before rg/grep is killed so a huge tree can't hang the UI
@@ -246,16 +261,21 @@ class Column:
     """One table column.
 
     `key` is a stable digit the toggle keys / status bar use. `style`
-    and `kwargs` are passed to `Table.add_column`. `render(entry, ctx)` produces
-    that column's cell for a single log entry as a `str` or `rich.text.Text`.
+    and `kwargs` are passed to `Table.add_column`. `render(row, ctx)` produces
+    that column's cell for a single row as a `str` or `rich.text.Text`.
     Adding a column is a single entry in the `COLUMNS` list below.
+
+    The record is shared by both tabs, so a row is whatever that tab's list holds:
+    a `LogEntry` for `COLUMNS` (the feed), a `PromptTurn` for `PROMPT_COLUMNS`.
+    A column only ever renders rows from its own list (see `COLUMNS_BY_TAB`), so
+    each `render` may assume one of the two shapes.
     """
 
     key: int
     name: str
     style: str
     kwargs: dict
-    render: Callable[[LogEntry, RenderCtx], object]
+    render: Callable[["LogEntry | PromptTurn", RenderCtx], object]
 
 
 def _danger_prefixed(cmd: str, body: str) -> Text:
@@ -271,11 +291,19 @@ def _render_time(entry: LogEntry, ctx: RenderCtx):
     return format_time(entry.get("timestamp", ""))
 
 
-def _render_session(entry: LogEntry, ctx: RenderCtx):
-    sid = entry.get("session_id", "")
+def _session_cell(sid: str, ctx: RenderCtx):
+    """The Session cell for `sid`: its label, tinted with the session's `/color`.
+
+    Factored out of `_render_session` so the Prompts tab's Session column is the
+    same cell rather than a second copy of the label + tint rules.
+    """
     label = session_label(sid, ctx.name_map)
     color = rich_color(ctx.color_map.get(sid)) if ctx.color_map else None
     return Text(label, style=color) if color else label
+
+
+def _render_session(entry: LogEntry, ctx: RenderCtx):
+    return _session_cell(entry.get("session_id", ""), ctx)
 
 
 def _render_directory(entry: LogEntry, ctx: RenderCtx):
@@ -328,15 +356,154 @@ COLUMNS = [
            {"ratio": 1, "no_wrap": True, "overflow": "ellipsis"}, _render_command),
 ]
 
+
+# ---- Prompts tab columns (rows are PromptTurn, not LogEntry) ----
+
+
+def _abbrev_count(n: int) -> str:
+    """A token count in at most 6 columns: `0`, `912`, `24.2k`, `183k`, `1.34m`.
+
+    The Tokens column is fixed-width, so a turn that generated a million tokens
+    must not need more room than one that generated a hundred. Precision drops as
+    the magnitude grows, which is the right trade: at 183k the hundreds do not
+    change a decision, at 912 they do. Six columns holds for anything up to a
+    billion tokens, which is orders of magnitude past what one turn can bill.
+    """
+    if n < 1000:
+        return str(int(n))
+    if n < 100_000:
+        return f"{n / 1000:.1f}k"
+    if n < 1_000_000:
+        return f"{n / 1000:.0f}k"
+    if n < 10_000_000:
+        return f"{n / 1_000_000:.2f}m"
+    return f"{n / 1_000_000:.0f}m"
+
+
+def _slash_label(text: str) -> str:
+    """`claude_trail_store.slash_label(text)`, or `text` if the store is missing.
+
+    A `/compact` turn is stored as a `<command-name>` block, so without this the
+    Prompt cell would read as raw markup. The store module is imported here
+    rather than at module scope to keep the feed's and the hook's startup free of
+    it (importing it does NOT pull in duckdb - `connect` does that - so this
+    costs a parse at worst, and by the time a turn row exists the prompts loader
+    has already imported the module). An uninstallable store leaves the raw text,
+    which is honest rather than blank.
+    """
+    try:
+        from claude_trail_store import slash_label
+    except Exception:
+        return text
+    return slash_label(text)
+
+
+def _render_turn_time(turn: "PromptTurn", ctx: RenderCtx):
+    return format_time(turn.ts)
+
+
+def _render_turn_session(turn: "PromptTurn", ctx: RenderCtx):
+    return _session_cell(turn.session_id, ctx)
+
+
+def _render_turn_project(turn: "PromptTurn", ctx: RenderCtx):
+    """The session's project dir, left-truncated like the feed's Directory cell.
+
+    `sessions.project` ALONE: `PromptTurn.cwd` is always None (`_upsert_session`
+    never writes that column), so a fallback to it would be dead code.
+    """
+    return short_path(turn.project or "", PROJECT_LABEL_WIDTH)
+
+
+def _render_turn_calls(turn: "PromptTurn", ctx: RenderCtx):
+    """Tool calls in the turn's window: the total, plus how many were Bash.
+
+    `turn.tools` is already INCLUSIVE of `turn.subcalls`, so the total is `tools`
+    and the two are never added. A turn that ran nothing (a question, a `/login`,
+    a resumed session) is real, so it renders a dim `-` rather than a bare `0`
+    that reads like missing data.
+    """
+    if not turn.tools:
+        return Text("-", style="dim")
+    cell = Text(str(turn.tools))
+    if turn.bash:
+        cell.append(f" ({turn.bash} bash)", style="dim")
+    return cell
+
+
+def _render_turn_agents(turn: "PromptTurn", ctx: RenderCtx):
+    """How many subagents ran in the turn, blank when none did (the common case,
+    so a column of zeros would be noise)."""
+    if not turn.agents:
+        return Text("")
+    return Text(str(turn.agents), style=AGENT_STYLE)
+
+
+def _render_turn_tokens(turn: "PromptTurn", ctx: RenderCtx):
+    """The turn's generation cost: output tokens, plus the subagent share.
+
+    The subagent part is shown only when subagents actually generated something;
+    a `+0 sub` would be noise. A turn whose reply carried no usage row honestly
+    reports 0 (the store documents that case), dimmed so it does not read as a
+    real number.
+    """
+    if not turn.output_tokens:
+        return Text("0", style="dim")
+    cell = Text(_abbrev_count(turn.output_tokens))
+    if turn.subagent_output_tokens:
+        cell.append(f" +{_abbrev_count(turn.subagent_output_tokens)} sub", style="dim")
+    return cell
+
+
+def _render_turn_prompt(turn: "PromptTurn", ctx: RenderCtx):
+    """The turn's first line, which is what a one-row-per-prompt list can show.
+
+    `slash_label` is applied HERE rather than in the query: it collapses a whole
+    `<command-name>` block to `/compact`, which is right for a one-line cell and
+    wrong for the full text a detail view shows. The store hands back the raw
+    cleaned preview and each caller decides (see `slash_label`).
+
+    The first line with content, not literally line one: the store trims the
+    preview so line one should already be that line, and taking the first
+    non-blank one means a stray leading newline shows the prompt instead of an
+    empty cell.
+    """
+    label = _slash_label(turn.preview or "")
+    first = next((line.strip() for line in label.splitlines() if line.strip()), "")
+    return first or Text("(empty)", style="dim italic")
+
+
+PROMPT_COLUMNS = [
+    Column(1, "Time", "cyan",
+           {"width": _env_int("CLAUDE_TRAIL_PROMPT_COL_TIME_WIDTH", 8),
+            "no_wrap": True}, _render_turn_time),
+    Column(2, "Session", "magenta",
+           {"width": _env_int("CLAUDE_TRAIL_PROMPT_COL_SESSION_WIDTH", 13),
+            "no_wrap": True, "overflow": "ellipsis"}, _render_turn_session),
+    Column(3, "Project", "green",
+           {"width": PROJECT_LABEL_WIDTH, "no_wrap": True}, _render_turn_project),
+    Column(4, "Calls", "yellow",
+           {"width": _env_int("CLAUDE_TRAIL_PROMPT_COL_CALLS_WIDTH", 12),
+            "no_wrap": True, "overflow": "ellipsis"}, _render_turn_calls),
+    Column(5, "Agents", AGENT_STYLE,
+           {"width": _env_int("CLAUDE_TRAIL_PROMPT_COL_AGENTS_WIDTH", 6),
+            "no_wrap": True}, _render_turn_agents),
+    Column(6, "Tokens", "white",
+           {"width": _env_int("CLAUDE_TRAIL_PROMPT_COL_TOKENS_WIDTH", 16),
+            "no_wrap": True, "overflow": "ellipsis"}, _render_turn_tokens),
+    Column(7, "Prompt", "white",
+           {"ratio": 1, "no_wrap": True, "overflow": "ellipsis"}, _render_turn_prompt),
+]
+
 # The two top-level views. `AppState.tab` holds one and `Tab` cycles them; the
 # feed stays first so the default view is unchanged.
 TABS = ("commands", "prompts")
 
 # Which columns each tab shows. One registry keyed by tab is the single source of
 # truth for the digit toggles, each tab's default visibility dict, and the status
-# bar's `cols:` segment. The prompts tab has no column list registered yet, so
-# its visibility dict is empty and its digit keys are inert.
-COLUMNS_BY_TAB: dict[str, list[Column]] = {"commands": COLUMNS, "prompts": []}
+# bar's `cols:` segment. Each tab's keys are numbered from 1 independently, so
+# `1`-`6` toggle the feed's columns and `1`-`7` the prompts list's.
+COLUMNS_BY_TAB: dict[str, list[Column]] = {"commands": COLUMNS, "prompts": PROMPT_COLUMNS}
 
 
 def _default_cols(tab: str) -> dict[int, bool]:
@@ -1782,6 +1949,13 @@ def visible_row_count(term_height: int) -> int:
     return max(term_height - CHROME_ROWS, MIN_VISIBLE_ROWS)
 
 
+def prompts_row_count(term_height: int) -> int:
+    """Rows available for the Prompts tab's table body (one more chrome line than
+    the feed: its snapshot header). Same floor, so a tiny terminal still shows
+    rows rather than none."""
+    return max(term_height - PROMPTS_CHROME_ROWS, MIN_VISIBLE_ROWS)
+
+
 def count_active_sessions(
     entries: list[LogEntry], now: datetime, window: int = ACTIVE_WINDOW_SECONDS
 ) -> int:
@@ -1818,13 +1992,13 @@ def _tab_strip(active: str) -> Text:
 
 
 # Key hints per tab: the tabs answer different keys (the feed has `/`, `f` and
-# `c`; the prompts list has `r` and `x`), so one shared line would advertise keys
-# that do nothing on the view you are looking at.
+# `c`; the prompts list has `r`, `x` and `S`), so one shared line would advertise
+# keys that do nothing on the view you are looking at.
 _TAB_HINTS = {
     "commands": ("j/k:nav  ↵:view  s:session  d:db  o:log  t:transcript  "
                  "/:search  f:folder  tab:prompts  q:quit  c:clear"),
-    "prompts": ("j/k:nav  ↵:view  r:refresh  x:hide empty  s:session  "
-                "o:log  t:transcript  d:db  tab:commands  q:quit"),
+    "prompts": ("j/k:nav  ↵:view  r:refresh  x:hide empty  S:session only  "
+                "s:session  o:log  t:transcript  d:db  tab:commands  q:quit"),
 }
 
 
@@ -1901,33 +2075,171 @@ def build_panel(
     )
 
 
+def build_prompts_table(
+    rows: list["PromptTurn"],
+    max_rows: int,
+    visible_cols: dict[int, bool],
+    cursor: int,
+    offset: int = 0,
+    name_map: dict[str, str] | None = None,
+    color_map: dict[str, str] | None = None,
+) -> Table:
+    """Render up to `max_rows` turns as a Rich table, newest first.
+
+    Cursor/offset contract, and the one way it differs from `build_table`: the
+    turn list is ALREADY newest-first (that is the order `prompt_turns` returns
+    it), so nothing is reversed here - `cursor` and `offset` index `rows`
+    directly. `offset` skips the N newest turns and the cursor is highlighted at
+    `cursor - offset` inside the displayed slice; with the cursor scrolled out of
+    view that index falls outside the slice and no row is highlighted.
+
+    There is no per-row `RenderCtx`: the agent tree gutter is a feed thing (one
+    row per command), while a turn row is one prompt and names its subagents by
+    count.
+    """
+    table = Table(
+        box=box.SIMPLE_HEAVY,
+        expand=True,
+        show_edge=False,
+        pad_edge=False,
+        row_styles=["", "dim"],
+    )
+
+    ctx = RenderCtx(name_map=name_map, color_map=color_map)
+    active = [col for col in PROMPT_COLUMNS if visible_cols.get(col.key)]
+    for col in active:
+        table.add_column(col.name, style=col.style, **col.kwargs)
+
+    display = rows[offset : offset + max_rows]
+    highlight_idx = cursor - offset
+    for idx, turn in enumerate(display):
+        row_style = "on grey23" if idx == highlight_idx else None
+        table.add_row(*[col.render(turn, ctx) for col in active], style=row_style)
+
+    return table
+
+
+def _format_age(seconds: float) -> str:
+    """A snapshot age as `12s ago` / `4m ago` / `1h 07m ago`."""
+    secs = max(0, int(seconds))
+    if secs < 60:
+        return f"{secs}s ago"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    return f"{secs // 3600}h {(secs % 3600) // 60:02d}m ago"
+
+
+def _snapshot_age(stamp: float | None, now: float | None = None) -> float | None:
+    """Seconds elapsed since a `PromptsState` stamp, or None if it was never set.
+
+    Both `loaded_at` (data freshness, for the header) and `checked_at` (the
+    refresh backoff) go through here. They are `time.monotonic()` values, so the
+    answer is immune to a wall-clock jump: an NTP step must not make a fresh
+    snapshot look an hour old, nor defer the auto-refresh by an hour.
+    """
+    if stamp is None:
+        return None
+    return max(0.0, (time.monotonic() if now is None else now) - stamp)
+
+
+def _prompts_header(prompts: "PromptsState", now: float | None = None) -> Text:
+    """The line above the turn list: how fresh the snapshot is, how much of it is
+    on screen, what it is scoped to, and any store status.
+
+    The `as of` clock time is derived by subtracting the monotonic age from the
+    current wall clock, rather than stored alongside it: one stamp then answers
+    both "how old" and "as of when", with no second timestamp to drift out of
+    sync with it.
+    """
+    line = Text("  ")
+    age = _snapshot_age(prompts.loaded_at, now)
+    if age is None:
+        line.append("not read yet", style="dim italic")
+    else:
+        when = (datetime.now() - timedelta(seconds=age)).strftime("%H:%M:%S")
+        line.append(f"as of {when} ", style="dim")
+        line.append(f"({_format_age(age)})", style="dim italic")
+
+    shown, hidden = len(prompts.visible_rows()), prompts.hidden_count()
+    line.append(f"  ·  {shown} turn{'' if shown == 1 else 's'}", style="dim")
+    if hidden:
+        line.append(f" ({hidden} hidden)", style="dim italic")
+    if prompts.session_filter:
+        line.append(f"  ·  session {prompts.session_filter[:8]}", style="dim")
+    if prompts.status:
+        line.append(f"  ·  {prompts.status}", style="yellow")
+    return line
+
+
+def _prompts_empty_state(prompts: "PromptsState") -> Text:
+    """The body when no turn is on screen, saying WHY and what would fix it.
+
+    Four different empties, and telling them apart is the point: advising
+    `claude-trail ingest` when the store is already current, or when `x` is simply
+    hiding every row, would be wrong advice on a working store.
+    """
+    text = Text()
+    if prompts.loaded_at is None:
+        text.append("No prompts read yet.\n\n", style="dim italic")
+        text.append(
+            "This tab reads the audit store, not the live command feed.\n", style="dim")
+        text.append("Press r to read it, or fill it with: claude-trail ingest",
+                    style="dim")
+    elif prompts.rows:  # loaded rows, all filtered out
+        hidden = prompts.hidden_count()
+        text.append("Every turn is hidden.\n\n", style="dim italic")
+        text.append(f"{hidden} turn{'' if hidden == 1 else 's'} ran no tool call; "
+                    "press x to show them again.", style="dim")
+    elif prompts.session_filter:
+        text.append("No prompts for this session.\n\n", style="dim italic")
+        text.append("Press S to go back to every session.", style="dim")
+    else:
+        text.append("No prompts in the audit store.\n\n", style="dim italic")
+        text.append("Fill it with: claude-trail ingest", style="dim")
+    return text
+
+
 def build_prompts_panel(
     prompts: "PromptsState",
     term_height: int,
     visible_cols: dict[int, bool] | None = None,
+    name_map: dict[str, str] | None = None,
+    color_map: dict[str, str] | None = None,
+    now: float | None = None,
 ) -> Panel:
-    """The Prompts tab: tab strip, the turn list, and the status bar.
+    """The Prompts tab: tab strip, snapshot header, the turn list, and the status
+    bar (cursor position plus this tab's key hints).
 
-    The list is read from the audit store rather than the live command log, so
-    an empty list is the normal state until an ingest has run and the empty state
-    says so (and how to fix it) instead of showing a blank table. A `status` set
-    on the state (a missing store, or a lock collision against a running ingest)
-    is shown above the hint, so the tab always explains itself.
+    Sized from `term_height` exactly like `build_panel`: the body gets
+    `prompts_row_count(term_height)` rows, which is what keeps the status line and
+    the hints on screen on a short terminal instead of being cropped away.
+
+    The list comes from the audit store rather than the live command log, so a
+    stale or absent snapshot is a normal state and the header always says which
+    one it is (see `_prompts_header` / `_prompts_empty_state`). `name_map` and
+    `color_map` are the feed's, so a session the feed has also seen gets its name
+    and `/color` tint and any other falls back to its short id - resolving tints
+    for 200 turns would mean tailing 200 transcripts for a colour.
     """
-    content = Text()
-    if prompts.status:
-        content.append(f"{prompts.status}\n\n", style="dim italic")
-    content.append("No prompts to show.\n\n", style="dim italic")
-    content.append(
-        "This tab reads the audit store, not the live command feed.\n", style="dim")
-    content.append("Fill it with: claude-trail ingest", style="dim")
+    max_rows = prompts_row_count(term_height)
+    rows = prompts.visible_rows()
+    # A falsy dict (an explicit empty one, or none passed) means "this tab's
+    # default", never "hide every column": a table with no columns is not a view.
+    cols = visible_cols or _default_cols("prompts")
 
-    n = len(prompts.rows)
+    if rows:
+        content: Text | Table = build_prompts_table(
+            rows, max_rows, cols, prompts.cursor, prompts.scroll_offset,
+            name_map, color_map)
+    else:
+        content = _prompts_empty_state(prompts)
+
     status = Text()
-    status.append(f"  {prompts.cursor + 1}/{n}" if n else "  0/0", style="dim")
+    status.append(f"  {prompts.cursor + 1}/{len(rows)}" if rows else "  0/0",
+                  style="dim")
 
-    body = Group(_tab_strip("prompts"), Text(""), content, Text(""), status,
-                 _tab_status("prompts", visible_cols or {}))
+    body = Group(_tab_strip("prompts"), Text(""), _prompts_header(prompts, now),
+                 content, Text(""), status, _tab_status("prompts", cols))
 
     return Panel(
         body,
@@ -2120,6 +2432,7 @@ class Action(enum.Enum):
     LOAD_DB_INFO = enum.auto()      # load the audit-store properties for the `d` modal
     OPEN_DETAIL = enum.auto()       # command modal just opened; load its token cost + prompt
     OPEN_SESSION_DETAIL = enum.auto()  # session modal just opened; load its token total
+    LOAD_PROMPTS = enum.auto()      # (re)read the prompts tab's turn list from the store
     NONE = enum.auto()
 
 
@@ -2240,8 +2553,9 @@ class PromptsState:
     and so this tab's cursor/scroll are separate from the feed's: switching tabs
     leaves each view where the user left it.
 
-    The first block is the list (`rows` newest-first, as the query returns them,
-    with `cursor` indexing it directly - no reversal, unlike the feed). The
+    The first block is the list (`rows` newest-first, as the query returns them).
+    `cursor`/`scroll_offset` index `visible_rows()` directly - no reversal,
+    unlike the feed, whose cursor indexes a reversed view of `entries`. The
     second block is the open turn's modal; `AppState.close_modals` resets it
     through `close_detail` so every modal is still dropped in one place.
     """
@@ -2249,7 +2563,14 @@ class PromptsState:
     rows: list[PromptTurn] = field(default_factory=list)
     cursor: int = 0
     scroll_offset: int = 0
-    loaded_at: float | None = None      # time.monotonic() of the last load, for the age line
+    # Two monotonic stamps, because "how fresh is this data" and "when did we last
+    # try" are different questions once the store can refuse to answer: a lock
+    # collision against the running ingest updates `checked_at` (so the retry
+    # backs off to the auto-refresh interval instead of hammering a locked file
+    # every poll) and leaves `loaded_at` alone (so the age line keeps counting up
+    # from the snapshot actually on screen).
+    loaded_at: float | None = None      # time.monotonic() of the last ANSWER, for the age line
+    checked_at: float | None = None     # time.monotonic() of the last attempt, for the backoff
     status: str | None = None           # why the list is empty/stale (missing store, busy store)
     session_filter: str | None = None   # None = every session, interleaved newest-first
     hide_empty: bool = False            # drop turns with 0 tool calls
@@ -2269,24 +2590,75 @@ class PromptsState:
         self.prompt_open = False
         self.prompt_scroll = 0
 
+    def visible_rows(self) -> list[PromptTurn]:
+        """The rows actually on screen: `rows`, minus zero-call turns while
+        `hide_empty` is on. Every cursor/scroll operation goes through this, so
+        `x` and the list agree by construction.
+
+        `x` filters HERE instead of re-querying, for two reasons. The predicate is
+        `tools == 0` on a field the row already carries, so a query would spend
+        tens to hundreds of milliseconds (measured 0.65s on a 1 GB store), plus a
+        chance of colliding with the ingest's write lock, to compute what is
+        already in memory. More importantly `prompt_turns` applies its `LIMIT` to
+        the raw turn list, so a store-side filter would return a DIFFERENT 200
+        turns - reaching further back in history - and toggling `x` twice would not
+        come back to the list you started on. Client-side keeps `x` a lens over one
+        snapshot, which is what lets the header say `149 turns (51 hidden)` and
+        mean it. The session filter is the opposite case and does re-query (see
+        `_apply_prompts_key`).
+        """
+        if not self.hide_empty:
+            return self.rows
+        return [row for row in self.rows if row.tools]
+
+    def hidden_count(self) -> int:
+        """How many loaded rows the current filters keep off screen (0 when none),
+        so the header can say what it is not showing."""
+        return len(self.rows) - len(self.visible_rows())
+
     def selected(self) -> PromptTurn | None:
-        """The row the cursor points at, or None when the list is empty."""
-        if not self.rows or self.cursor < 0 or self.cursor >= len(self.rows):
+        """The row the cursor points at, or None when nothing is on screen."""
+        rows = self.visible_rows()
+        if not rows or self.cursor < 0 or self.cursor >= len(rows):
             return None
-        return self.rows[self.cursor]
+        return rows[self.cursor]
+
+    def clamp(self, max_rows: int) -> None:
+        """Keep `cursor` in `[0, len-1]` and `scroll_offset` so the cursor is
+        visible, over the VISIBLE rows.
+
+        Same contract as `AppState.clamp`, and called from the same places: after
+        every cursor move, after a reload (which can shorten the list under a
+        parked cursor), after `x` (which changes the list's length), and once per
+        frame so a terminal resize re-anchors. Without it `G` on a long list
+        followed by a shorter reload would leave the cursor past the end,
+        selecting nothing and scrolling the window off the list.
+        """
+        rows = self.visible_rows()
+        if not rows:
+            self.cursor = 0
+            self.scroll_offset = 0
+            return
+        self.cursor = max(0, min(self.cursor, len(rows) - 1))
+        if self.cursor < self.scroll_offset:
+            self.scroll_offset = self.cursor
+        elif self.cursor >= self.scroll_offset + max_rows:
+            self.scroll_offset = self.cursor - max_rows + 1
+        max_offset = max(0, len(rows) - max_rows)
+        self.scroll_offset = max(0, min(self.scroll_offset, max_offset))
 
     def move_up(self) -> None:
         self.cursor = max(0, self.cursor - 1)
 
     def move_down(self) -> None:
-        self.cursor = min(max(0, len(self.rows) - 1), self.cursor + 1)
+        self.cursor = min(max(0, len(self.visible_rows()) - 1), self.cursor + 1)
 
     def goto_top(self) -> None:
         self.cursor = 0
         self.scroll_offset = 0
 
     def goto_bottom(self) -> None:
-        self.cursor = max(0, len(self.rows) - 1)
+        self.cursor = max(0, len(self.visible_rows()) - 1)
 
 
 @dataclass
@@ -2593,18 +2965,25 @@ def _apply_modal_key(state: AppState, ch: str) -> Action:
     return Action.NONE
 
 
-def _apply_prompts_key(state: AppState, prompts: PromptsState, ch: str) -> Action:
+def _apply_prompts_key(state: AppState, prompts: PromptsState, ch: str,
+                       max_rows: int) -> Action:
     """Handle one keypress while the Prompts tab is active (mutation only).
 
     Mirrors `_apply_search_key`: it mutates state and returns an Action for
-    main() to perform, doing no I/O itself. An open modal is handed to the shared
-    `_apply_modal_key`, since `s` and `d` open those panels from this tab too.
+    main() to perform, doing no I/O itself - the store reads all happen in main()
+    under `Action.LOAD_PROMPTS`, so this stays pure and testable. An open modal is
+    handed to the shared `_apply_modal_key`, since `s` and `d` open those panels
+    from this tab too.
+
+    `max_rows` is the body height, needed because every cursor move is paired with
+    `prompts.clamp(max_rows)` (the same pairing the feed does with `AppState.clamp`).
 
     The feed-only keys are deliberately absent: `c` (clear) belongs to the log
     tail, and `/` (search) and `f` (folder) need a row's cwd and a command's file
-    list, which a turn row does not carry. `↵` (open a turn), `r` (refresh) and
-    `x` (hide empty turns) are advertised in the status hints and fall through to
-    NONE until the list itself reads the store.
+    list, which a turn row does not carry. `↵` (open a turn) is advertised in the
+    status hints and still falls through to NONE: the turn view is not built yet,
+    and setting `prompts.detail` with no renderer for it would swallow every key
+    with nothing to show.
     """
     if state.modal_open():
         return _apply_modal_key(state, ch)
@@ -2614,15 +2993,45 @@ def _apply_prompts_key(state: AppState, prompts: PromptsState, ch: str) -> Actio
         state.cycle_tab()
     elif ch in ("k", "up"):
         prompts.move_up()
+        prompts.clamp(max_rows)
     elif ch in ("j", "down"):
         prompts.move_down()
+        prompts.clamp(max_rows)
     elif ch == "g":
         prompts.goto_top()
+        prompts.clamp(max_rows)
     elif ch == "G":
         prompts.goto_bottom()
+        prompts.clamp(max_rows)
+    elif ch == "r":
+        # Force a re-read: the store is only as fresh as the last ingest, so this
+        # is how the user pulls in a turn that finished since the snapshot.
+        return Action.LOAD_PROMPTS
+    elif ch == "x":
+        # Hide/show the turns that ran no tool call. Filtered in place over the
+        # loaded snapshot (see `PromptsState.visible_rows`), so no store read -
+        # but the visible list just changed length, so re-anchor the cursor.
+        prompts.hide_empty = not prompts.hide_empty
+        prompts.clamp(max_rows)
+    elif ch == "S":
+        # Scope the list to the selected row's session, or back to every session.
+        # Unlike `x` this DOES re-query: `prompt_turns` applies the session filter
+        # inside its bounded raw scan, so a scoped list reaches back through that
+        # session's own history instead of showing whichever of its turns made the
+        # global newest-N cut. Start the scoped list at the top; it is a new list.
+        if prompts.session_filter:
+            prompts.session_filter = None
+        else:
+            sid = state.selected_session_id()
+            if not sid:
+                return Action.NONE
+            prompts.session_filter = sid
+        prompts.cursor = 0
+        prompts.scroll_offset = 0
+        return Action.LOAD_PROMPTS
     elif ch.isdigit():
-        # Inert while this tab has no columns registered; toggle_col ignores a
-        # key it has no column for, so no digit can hide a column of the feed.
+        # toggle_col resolves this tab's own column dict and ignores a key it has
+        # no column for, so no digit here can hide a column of the feed.
         state.toggle_col(int(ch))
     elif ch == "s":
         # A turn row is a main-thread turn, so there is no subagent to spotlight.
@@ -2639,10 +3048,24 @@ def _apply_prompts_key(state: AppState, prompts: PromptsState, ch: str) -> Actio
     return Action.NONE
 
 
+def _tab_row_count(tab: str, term_height: int) -> int:
+    """The body height of `tab`'s list: what its cursor clamps against.
+
+    The two tabs have different chrome, so `apply_key`'s `max_rows` is whichever
+    one is active (`main()` resolves it through here).
+    """
+    if tab == "prompts":
+        return prompts_row_count(term_height)
+    return visible_row_count(term_height)
+
+
 def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
     """Apply one keypress to `state`, returning the Action main() must perform.
 
     Mutates `state` but spawns no processes and touches no terminal.
+
+    `max_rows` is the ACTIVE tab's body height (see `_tab_row_count`), used to
+    keep that tab's cursor and scroll offset in range.
 
     Dispatch order: the search modal (it owns every key, including `Tab`, while
     open), then the active tab's handler, then - on the Commands tab - any open
@@ -2653,7 +3076,7 @@ def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
         # and takes precedence: it owns every key while open.
         return _apply_search_key(state, state.search, ch)
     if state.tab == "prompts":
-        return _apply_prompts_key(state, state.prompts, ch)
+        return _apply_prompts_key(state, state.prompts, ch, max_rows)
     if state.modal_open():
         return _apply_modal_key(state, ch)
     if ch in ("q", "\x03"):
@@ -2675,6 +3098,10 @@ def apply_key(state: AppState, ch: str, max_rows: int) -> Action:
         state.clamp(max_rows)
     elif ch == "\t":
         state.cycle_tab()
+        if state.tab == "prompts":
+            # Entering the tab reads the store right away, so the list is there
+            # on the first frame instead of waiting for the idle auto-refresh.
+            return Action.LOAD_PROMPTS
     elif ch.isdigit() and int(ch) in state.visible_cols:
         state.toggle_col(int(ch))
     elif ch in ("\r", "\n"):
@@ -2750,14 +3177,22 @@ def _load_db_info() -> list:
         return [("connection", str(STORE_PATH)), ("error", str(e))]
 
 
-def _with_store(fn):
+def _with_store(fn, on_error=None):
     """Open the audit store read-only, call `fn(con)`, and return its result.
 
-    Shared plumbing for the token lookups the command/session modals trigger:
-    the store (and duckdb) is imported lazily on the keypress, so the normal feed
-    and the hook never load duckdb. Returns None on any failure (duckdb/module
-    not importable, no store file yet, or a query error) so a caller can simply
-    omit the Tokens row rather than crash the TUI."""
+    Shared plumbing for every on-demand store read (the command/session modals'
+    Tokens rows and prompt panel, the prompts list): the store (and duckdb) is
+    imported lazily on the keypress, so the normal feed and the hook never load
+    duckdb. The connection is closed immediately - DuckDB's file lock excludes in
+    BOTH directions, so a reader held open would block the ingest (CLAUDE.md,
+    "Why not `ingest --watch`").
+
+    Returns None on any failure (duckdb/module not importable, no store file yet,
+    or a query error) so a caller can simply omit the Tokens row rather than
+    crash the TUI. `on_error(exc)` is called with the exception first, for the one
+    caller that must tell a transient lock collision apart from an empty answer;
+    it does not widen what is caught, it only stops the reason being lost.
+    """
     try:
         from claude_trail_store import STORE_PATH, connect
     except Exception:
@@ -2770,8 +3205,20 @@ def _with_store(fn):
             return fn(con)
         finally:
             con.close()
-    except Exception:
+    except Exception as e:
+        if on_error is not None:
+            on_error(e)
         return None
+
+
+# Status/hint lines for a store that cannot answer. One definition each, so the
+# modals, the prompts header and the empty states never drift apart in wording.
+NO_STORE_HINT = "no audit store yet - run: claude-trail ingest"
+PENDING_INGEST_HINT = "pending ingest (store lags the live feed)"
+# Matches the CLI's `store busy:` prefix for the same condition (a lock collision
+# against the single writer), which is routine at the 30s ingest cadence.
+STORE_BUSY_HINT = "store busy: an ingest is writing"
+STORE_BUSY_KEPT_HINT = f"{STORE_BUSY_HINT} - kept the last snapshot"
 
 
 def _tokens_unavailable() -> dict:
@@ -2785,9 +3232,7 @@ def _tokens_unavailable() -> dict:
         missing = not STORE_PATH.exists()
     except Exception:
         missing = True
-    hint = ("no audit store yet - run: claude-trail ingest" if missing
-            else "pending ingest (store lags the live feed)")
-    return {"unavailable": hint}
+    return {"unavailable": NO_STORE_HINT if missing else PENDING_INGEST_HINT}
 
 
 def _load_command_detail(entry: LogEntry | None) -> tuple[dict | None, dict | None]:
@@ -2830,6 +3275,85 @@ def _load_session_tokens(sid: str | None) -> dict | None:
         return session_token_totals(con, sid)
 
     return _with_store(query) or _tokens_unavailable()
+
+
+def _load_prompt_turns(
+    session_id: str | None = None,
+) -> tuple[list[PromptTurn] | None, str | None]:
+    """`(rows, status)` for the Prompts tab, from ONE read-only store open.
+
+    Loaded when Action.LOAD_PROMPTS fires (tab entry, `r`, a session-filter
+    toggle, the idle auto-refresh), so `apply_key` stays pure and the store is
+    opened, read and closed inside a single call - never held (see `_with_store`).
+
+    Three outcomes, each distinguishable by the caller, because a tab that showed
+    the same blank list for all three would look broken:
+
+    - a successful read: `(rows, None)`, possibly an empty list when the store
+      genuinely holds no turn for this scope;
+    - no store file (or no duckdb): `([], NO_STORE_HINT)` - there is nothing to
+      show and the hint says how to create it;
+    - the store is locked by the running ingest: `(None, STORE_BUSY_HINT)`. `rows`
+      is None to mean "no answer, keep what is on screen": DuckDB's lock excludes
+      in both directions, so at the 30s ingest cadence this is routine, and
+      blanking a good snapshot for it would be worse than showing a stale one.
+    """
+    try:
+        from claude_trail_store import STORE_PATH, is_lock_conflict
+    except Exception:
+        return [], NO_STORE_HINT      # no duckdb / no store module: same dead end
+    if not STORE_PATH.exists():
+        return [], NO_STORE_HINT
+
+    def query(con):
+        from claude_trail_store import prompt_turns
+        rows = prompt_turns(con, session_id=session_id) if session_id else prompt_turns(con)
+        return [PromptTurn.from_row(row) for row in rows]
+
+    # _with_store swallows the exception into None; collect it here so a lock
+    # collision can be told from an empty read without widening that catch.
+    failure: list = []
+    rows = _with_store(query, on_error=failure.append)
+    if rows is None:
+        exc = failure[0] if failure else None
+        if exc is not None and is_lock_conflict(exc):
+            return None, STORE_BUSY_HINT
+        # Anything else (a vanished file, an unreadable store) is a real failure
+        # and says so rather than posing as an empty list of prompts.
+        return [], (f"store unreadable: {exc}" if exc else NO_STORE_HINT)
+    return rows, None
+
+
+def _refresh_prompts(prompts: PromptsState, max_rows: int) -> None:
+    """Re-read the Prompts tab's snapshot in place (the LOAD_PROMPTS action).
+
+    Kept out of main()'s loop so the three store outcomes land in one testable
+    place. `loaded_at` records when the tab last got an ANSWER from the store, so
+    a busy collision leaves it (and the rows) alone: the header keeps counting up
+    from the last good read, which is exactly the staleness the user needs to see.
+    """
+    rows, status = _load_prompt_turns(prompts.session_filter)
+    prompts.checked_at = time.monotonic()
+    if rows is None:
+        prompts.status = STORE_BUSY_KEPT_HINT if prompts.rows else status
+        return
+    prompts.rows = rows
+    prompts.loaded_at = prompts.checked_at
+    prompts.status = status
+    prompts.clamp(max_rows)
+
+
+def _prompts_refresh_due(prompts: PromptsState, now: float | None = None) -> bool:
+    """True when the Prompts tab should read the store again: never tried, or the
+    last attempt was more than PROMPTS_AUTO_REFRESH ago.
+
+    Checked once per idle frame while that tab is on screen, which is what keeps a
+    live session's newest turn appearing without the user pressing `r`. It gates on
+    the last ATTEMPT, not the last answer, so a store held by the ingest is retried
+    on the same slow cadence rather than on every 300ms poll.
+    """
+    age = _snapshot_age(prompts.checked_at, now)
+    return age is None or age >= PROMPTS_AUTO_REFRESH
 
 
 def _signal_exit(signum, frame):
@@ -2912,6 +3436,7 @@ def main():
         if state.tab == "prompts":
             return build_prompts_panel(
                 state.prompts, console.height, state.visible_cols_for("prompts"),
+                name_map, color_map,
             )
         return build_panel(
             state.entries, console.height, state.visible_cols,
@@ -2996,7 +3521,9 @@ def main():
 
             try:
                 while True:
-                    max_rows = visible_row_count(console.height)
+                    # The active tab's body height: each tab's cursor clamps
+                    # against its own list, and the two panels differ by a row.
+                    max_rows = _tab_row_count(state.tab, console.height)
                     quit_now = False
                     acted = False
                     if interactive:
@@ -3053,6 +3580,10 @@ def main():
                             elif action is Action.OPEN_SESSION_DETAIL:
                                 state.session_tokens = _load_session_tokens(
                                     state.session_detail)
+                            elif action is Action.LOAD_PROMPTS:
+                                _refresh_prompts(
+                                    state.prompts,
+                                    prompts_row_count(console.height))
                             ready, _, _ = select.select([fd], [], [], 0)
                         if quit_now:
                             break
@@ -3065,6 +3596,19 @@ def main():
                     # this frame's clamp (the old per-clamp code read it live).
                     max_rows = visible_row_count(console.height)
                     state.clamp(max_rows)
+                    prompt_rows = prompts_row_count(console.height)
+                    state.prompts.clamp(prompt_rows)
+
+                    # Idle refresh of the prompts snapshot, only while that tab is
+                    # the one being looked at and nothing is modal over it. It is a
+                    # synchronous query (measured ~70-120ms warm, up to ~0.5s right
+                    # after an ingest write), which the codebase prefers over a
+                    # background thread: state stays pure and main() keeps every
+                    # side effect. PROMPTS_AUTO_REFRESH is the ingest cadence, so
+                    # this fires rarely enough that the stall is not felt.
+                    if (state.tab == "prompts" and not state.modal_open()
+                            and _prompts_refresh_due(state.prompts)):
+                        _refresh_prompts(state.prompts, prompt_rows)
 
                     name_map = load_session_names()
                     session_ids = {e.get("session_id", "") for e in state.entries}
