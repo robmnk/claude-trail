@@ -331,7 +331,7 @@ depend on the TUI.
     `modal_open`/`close_modals` coverage. Prompts tab renders an empty-state hint only.
   - Tests: `Tab` cycles and preserves each tab's cursor, prompts keys are inert on the
     commands tab and vice versa, `s`/`o`/`t`/`d` resolve a sid on both tabs.
-- [ ] 3. TUI: prompts list
+- [x] 3. TUI: prompts list
   - `PROMPT_COLUMNS` + renderers, `build_prompts_table` / `build_prompts_panel`,
     `_load_prompt_turns` via `_with_store`, `LOAD_PROMPTS`, age line, `r`, `x`,
     `session_filter`, unavailable/busy hints.
