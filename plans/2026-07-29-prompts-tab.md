@@ -385,9 +385,14 @@ reused (phase 1's reviewer overwrote `REVIEW-phase-1.md`; it was restored from `
 
 ## Verify
 
+Run the suite with the PROJECT VENV, not the system interpreter: `duckdb` is installed only in
+`.venv`, so `python3 -m pytest` (a pyenv shim onto system 3.14) fails 85 store tests with
+`ModuleNotFoundError: No module named 'duckdb'` while still reporting the other 643 as passed.
+That reads as a real regression and is not one. Caught during phase 4.
+
 ```bash
 cd /home/naka/Projects/personal/claude-trail
-python3 -m pytest tests/ -q
+.venv/bin/python -m pytest tests/ -q
 python3 claude_trail.py prompts --limit 20
 python3 claude_trail.py prompts --session <sid> --limit 5
 python3 claude_trail.py                     # Tab into Prompts, Enter a turn with subagents
