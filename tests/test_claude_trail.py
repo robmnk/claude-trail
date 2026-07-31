@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import sys
@@ -2596,11 +2597,17 @@ class TestConsoleMarkupIsNeverParsed:
 
     def test_full_prompt_panel_is_literal(self):
         self._literal(lambda p: feed.build_prompt_panel(
-            self._entry(), 40, {"text": f"ask {p}", "ts": "2026-07-29 10:00:00"}))
+            "s1", 40, f"ask {p}", ts="2026-07-29 10:00:00"))
         # The `Sent` row is a store timestamp: no `[` is reachable today, but it
         # is outside text and a bare str crashed on one.
+        self._literal(lambda p: feed.build_prompt_panel("s1", 40, "b", ts=p))
+        # The Session and Agent rows, which both tabs' callers feed from outside
+        # values (a pid.json name, a Task description).
         self._literal(lambda p: feed.build_prompt_panel(
-            self._entry(), 40, {"text": "b", "ts": p}))
+            "s1", 40, "b", name_map={"s1": f"n{p}"}))
+        self._literal(lambda p: feed.build_prompt_panel(
+            "s1", 40, "b", agent_id="aid1",
+            agent_map={"aid1": {"description": p, "type": "gp"}}))
 
     def test_session_panel_rows_are_literal(self):
         for build in (
@@ -2638,6 +2645,53 @@ class TestConsoleMarkupIsNeverParsed:
         self._literal(lambda p: hit(results=[("/tmp/a.py", 3, f"x = list{p}")]))
         self._literal(lambda p: hit(results=[(f"/tmp/{p}.py", 3, "hit")]))
 
+    # ---- the turn detail page ----
+
+    def test_turn_page_header_rows_are_literal(self):
+        self._literal(lambda p: feed.build_turn_panel(
+            feed.PromptsState(detail=_turn(project=f"/p/{p}", tools=1)), 40))
+        self._literal(lambda p: feed.build_turn_panel(
+            feed.PromptsState(detail=_turn(tools=1)), 40, name_map={"sid-p": f"n{p}"}))
+
+    def test_turn_page_prompt_box_is_literal(self):
+        # Both sources: the text the store loaded, and the row's own preview,
+        # which is what the box falls back to when that load answered nothing.
+        self._literal(lambda p: feed.build_turn_panel(
+            feed.PromptsState(detail=_turn(tools=1), detail_text=f"ask {p}"), 40))
+        self._literal(lambda p: feed.build_turn_panel(
+            feed.PromptsState(detail=_turn(preview=f"ask {p}", tools=1)), 40))
+
+    def test_action_cells_are_literal(self):
+        # A tool call's label is a command, a path, a regex or a subagent's
+        # description - every one of them outside text.
+        self._literal(lambda p: feed.build_action_table(
+            [feed.TurnAction(ts="2026-07-29 10:00:00-03", tool_name="Bash",
+                             text=f"echo {p}")]))
+        self._literal(lambda p: feed.build_action_table(
+            [feed.TurnAction(ts="2026-07-29 10:00:00-03", tool_name="Agent",
+                             tool_input=json.dumps({"description": f"do {p}"}))]))
+        self._literal(lambda p: feed.build_action_table(
+            [feed.TurnAction(ts="2026-07-29 10:00:00-03", tool_name=f"mcp__x__y{p}")]))
+        self._literal(lambda p: feed.build_action_table(
+            [feed.TurnAction(ts="2026-07-29 10:00:00-03", agent_id="aid1",
+                             tool_name="Read", text="/x/a.py")],
+            agent_map={"aid1": {"description": p, "type": "gp"}}))
+
+    def test_every_action_cell_survives_a_bracketed_row(self):
+        # Whole-row sweep: every cell of one row carries a probe at once, so a
+        # cell added to this table later fails here rather than in whichever
+        # test happens to look at it. Width is generous so nothing is ellipsized
+        # away and passes for markup-safe.
+        for probe in (self.BRACKET, self.DELETE):
+            action = feed.TurnAction(
+                ts="2026-07-29 10:00:00-03", agent_id="aid1",
+                tool_name=f"tool{probe}", text=f"echo {probe}",
+                tool_input=json.dumps({"command": f"echo {probe}"}))
+            out = self._out(feed.build_action_table(
+                [action], agent_map={"aid1": {"description": probe, "type": "gp"}}),
+                width=400)
+            assert out.count(probe) == 3, (probe, out)   # agent, tool, detail
+
     def test_prompts_panel_chrome_is_literal(self):
         self._literal(lambda p: feed.build_prompts_panel(
             feed.PromptsState(rows=[_turn(preview=f"ask {p}", tools=1)],
@@ -2659,7 +2713,7 @@ class TestConsoleMarkupIsNeverParsed:
             lambda: feed.build_panel([self._entry()], 40, self.FEED_COLS, 0)))
         self._literal(subtitled(lambda: feed.build_detail_panel(self._entry(), 40)))
         self._literal(subtitled(lambda: feed.build_prompt_panel(
-            self._entry(), 40, {"text": "b", "ts": "2026-07-29 10:00:00"})))
+            "s1", 40, "b", ts="2026-07-29 10:00:00")))
 
     def test_a_live_driven_render_of_every_panel_survives_a_bracket_prompt(self):
         """The crash exactly where the TUI hits it: `live.update(render_panel())`.
@@ -2673,14 +2727,24 @@ class TestConsoleMarkupIsNeverParsed:
         from rich.live import Live
         probe = "look in [/tmp/x] now"
         entry = self._entry(command=f"echo {probe}", cwd=f"/tmp/{probe}")
-        prompts = feed.PromptsState(rows=[_turn(preview=probe, tools=1)],
-                                    loaded_at=1.0, checked_at=1.0)
+        turn = _turn(preview=probe, project=f"/p/{probe}", tools=2, bash=1,
+                     subcalls=1, agents=1, requests=1, output_tokens=9)
+        prompts = feed.PromptsState(rows=[turn], loaded_at=1.0, checked_at=1.0)
+        open_turn = feed.PromptsState(
+            rows=[turn], detail=turn, detail_text=probe,
+            actions=[feed.TurnAction(ts="2026-07-29 10:00:00-03", tool_name="Bash",
+                                     text=f"echo {probe}"),
+                     feed.TurnAction(ts="2026-07-29 10:00:01-03", agent_id="aid1",
+                                     tool_name="Agent",
+                                     tool_input='{"description": "look in [/tmp/x]"}')])
         panels = [
             feed.build_prompts_panel(prompts, 24, now=1.0),
+            feed.build_turn_panel(open_turn, 24,
+                                  agent_map={"aid1": {"description": probe, "type": "gp"}}),
             feed.build_panel([entry], 24, self.FEED_COLS, 0),
             feed.build_detail_panel(entry, 24,
                                     prompt={"text": probe, "ts": "2026-07-29 10:00"}),
-            feed.build_prompt_panel(entry, 24, {"text": probe, "ts": "2026-07-29 10:00"}),
+            feed.build_prompt_panel("s1", 24, probe, ts="2026-07-29 10:00"),
             feed.build_session_panel(self._model(
                 cwd=f"/tmp/{probe}", subagents=(self._sub(description=probe),))),
             feed.build_db_panel([("error", probe)]),
@@ -2831,17 +2895,73 @@ class TestPromptsTabKeys:
         assert state.tab == "commands"
         assert state.prompts == feed.PromptsState()   # the other tab is untouched
 
-    def test_enter_is_still_inert_on_the_prompts_tab(self):
-        # `↵` is advertised, and the turn view it opens is not built yet: it must
-        # stay a pure no-op rather than set `prompts.detail`, which modal_open()
-        # already counts and no panel renders (every key would be swallowed with
-        # nothing on screen to explain it).
-        state = _prompts_state(rows=2)
+    def test_enter_opens_the_selected_turn_and_asks_for_its_detail(self):
+        # apply_key stays pure: it parks the turn in `detail` and hands main()
+        # the action that reads the store.
         for ch in ("\r", "\n"):
-            assert feed.apply_key(state, ch, 10) is feed.Action.NONE
+            state = _prompts_state(rows=3)
+            state.prompts.cursor = 1
+            assert feed.apply_key(state, ch, 10) is feed.Action.OPEN_PROMPT
+            assert state.prompts.detail is state.prompts.rows[1]
+            assert state.prompts.actions is None      # main() loads them
+            assert state.prompts.detail_text is None
+            assert state.modal_open() is True
+            assert state.prompts.cursor == 1          # the list keeps its place
+
+    def test_enter_is_inert_with_no_turn_under_the_cursor(self):
+        state = _prompts_state(rows=0)
+        assert feed.apply_key(state, "\r", 10) is feed.Action.NONE
         assert state.prompts.detail is None
         assert state.modal_open() is False
-        assert state.prompts.cursor == 0
+
+    def test_opening_a_turn_starts_from_a_clean_page(self):
+        """Opening a turn resets the page's sub-state, whatever was left behind.
+
+        The leftovers are set by hand rather than by driving a previous turn,
+        because every way OUT of a turn goes through `close_detail` and would
+        clean up first: this pins the reset as the invariant it is ("`detail` and
+        its sub-state are written together"), so a future path that leaves half a
+        page behind cannot show the last turn's calls under this turn's prompt.
+        """
+        state = _prompts_state(rows=2)
+        state.prompts.actions = [feed.TurnAction(ts="t", tool_name="Bash")]
+        state.prompts.detail_text = "the previous turn's prompt"
+        state.prompts.detail_scroll = 7
+        state.prompts.bash_only = True
+        state.prompts.prompt_open = True
+        state.prompts.prompt_scroll = 4
+        feed.apply_key(state, "j", 10)
+        assert feed.apply_key(state, "\r", 10) is feed.Action.OPEN_PROMPT
+        assert state.prompts.detail is state.prompts.rows[1]
+        assert (state.prompts.actions, state.prompts.detail_text) == (None, None)
+        assert (state.prompts.detail_scroll, state.prompts.prompt_scroll) == (0, 0)
+        assert state.prompts.bash_only is False
+        assert state.prompts.prompt_open is False
+
+    def test_a_held_enter_is_not_self_limiting_which_is_why_main_coalesces(self):
+        """Opening a turn is NOT self-limiting the way `d` and `s` are.
+
+        Their modals swallow the repeat, so they read the store once. Here, a
+        turn whose prompt text has not loaded (the store was busy, or the turn
+        cleaned to nothing) gives `↵` back its close-the-page meaning, so a
+        key-repeat burst alternates close/open and asks for the read again -
+        which is why main() coalesces OPEN_PROMPT out of the drain loop into one
+        read per frame, exactly as it does for LOAD_PROMPTS (10 buffered `r` once
+        measured 3.21s frozen inside a single drain).
+
+        With the text loaded, `↵` drills into the prompt and back instead, and
+        those depths ask for nothing.
+        """
+        state = _prompts_state(rows=3)
+        opens = [feed.apply_key(state, "\r", 10) for _ in range(4)]
+        assert opens == [feed.Action.OPEN_PROMPT, feed.Action.NONE,
+                         feed.Action.OPEN_PROMPT, feed.Action.NONE]
+
+        feed.apply_key(state, "\r", 10)               # open it once more
+        state.prompts.detail_text = "the ask"         # what main() loaded
+        for _ in range(6):
+            assert feed.apply_key(state, "\r", 10) is feed.Action.NONE
+        assert state.prompts.detail is not None       # still on the page
 
     def test_selected_session_id_resolves_per_tab(self):
         state = _prompts_state(rows=2, entries=3)
@@ -2921,17 +3041,17 @@ class TestPromptsTabKeys:
 
     # ---- refresh / filter keys: every one of them stays pure ----
 
-    def test_no_prompts_key_opens_a_modal_there_is_no_panel_for(self):
-        """EVERY key this tab answers must leave `modal_open()` False.
+    def test_only_enter_opens_the_turn_modal(self):
+        """`↵` is the ONE key on this tab that may open the turn page.
 
-        `prompts.detail` is counted by `modal_open()` and no panel renders it yet,
-        so setting it in any branch turns the tab into a key trap: every key but
-        esc/q/enter dead, nothing on screen to explain it. Asserted over the whole
-        key set in one loop rather than per-key, so a future rewrite of any single
-        test cannot quietly drop the guard (it did once - phase 3's `r`/`x`
-        rewrite).
+        `prompts.detail` is counted by `modal_open()`, so any other branch setting
+        it turns the tab into a key trap: every key but esc/q/enter dead, and
+        (before this page existed) nothing on screen to explain it. Asserted over
+        the whole key set in one loop rather than per-key, so a future rewrite of
+        any single test cannot quietly drop the guard (it did once - phase 3's
+        `r`/`x` rewrite).
         """
-        for ch in ("r", "x", "S", "\r", "\n", "j", "k", "g", "G", "\t",
+        for ch in ("r", "x", "S", "j", "k", "g", "G", "\t",
                    "1", "2", "7", "c", "f", "/", "o", "t"):
             state = _prompts_state(rows=0)
             # tools=1 so the rows survive `x`: with an empty filtered list
@@ -2941,6 +3061,16 @@ class TestPromptsTabKeys:
             feed.apply_key(state, ch, 10)
             assert state.prompts.detail is None, ch
             assert state.modal_open() is False, ch
+
+    def test_the_turn_modal_has_a_panel_to_render(self):
+        # The other half of the guard above: the key that DOES set `detail` must
+        # have a renderer, or it is the same trap with a different trigger.
+        state = _prompts_state(rows=0)
+        state.prompts.rows = [_turn(sid="sid-p0", tools=1, preview="do the thing")]
+        feed.apply_key(state, "\r", 10)
+        console = Console(width=120, record=True)
+        console.print(feed.build_turn_panel(state.prompts, 24))
+        assert "do the thing" in console.export_text()
 
     def test_r_asks_for_a_reload_without_touching_the_list(self):
         state = _prompts_state(rows=3)
@@ -3272,6 +3402,7 @@ class TestModalExclusion:
         state.prompts.actions = [feed.TurnAction(ts="t")]
         state.prompts.detail_text = "the whole prompt"
         state.prompts.detail_scroll = 3
+        state.prompts.bash_only = True
         state.prompts.prompt_open = True
         state.prompts.prompt_scroll = 5
 
@@ -3356,6 +3487,715 @@ class TestModalExclusion:
                 assert state.modal_open() is True, (tab, which)
 
 
+# ---- Prompts tab: one turn's detail page (phase 4) ----
+
+
+def _action(ts="2026-07-29 10:00:05-03", **kw):
+    """One TurnAction without a DB, defaulting to a main-thread Bash call."""
+    kw.setdefault("tool_name", "Bash")
+    return feed.TurnAction(ts=ts, **kw)
+
+
+def _turn_state(turn=None, actions=(), text="the whole ask", **kw):
+    """A PromptsState with a turn open, as it looks after main() has loaded it."""
+    turn = turn or _turn(tools=1)
+    return feed.PromptsState(rows=[turn], detail=turn, detail_text=text,
+                             actions=list(actions) if actions is not None else None,
+                             **kw)
+
+
+def _panel_text(panel, width=120):
+    console = Console(width=width, record=True)
+    console.print(panel)
+    return console.export_text()
+
+
+def action_of(tool_name, text, tool_input):
+    return feed.action_label(tool_name, text, tool_input)
+
+
+class TestActionLabel:
+    """`action_label`: the store's `text` when it has one, else the first known
+    field of the raw `tool_input`. That fallback is what makes the text-less
+    tools (Agent, Skill, MCP, ...) readable at all."""
+
+    def test_text_wins_when_the_store_has_one(self):
+        assert action_of("Bash", "wc -l x.py", '{"command": "other"}') == "wc -l x.py"
+
+    def test_agent_row_falls_back_to_its_description(self):
+        # 644 Agent rows in a real store, every one with text NULL and a
+        # description in tool_input: the case the fallback exists for.
+        label = action_of("Agent", None,
+                          '{"description": "explore the store", '
+                          '"subagent_type": "Explore", "prompt": "long..."}')
+        assert label == "explore the store"
+
+    def test_each_known_field_is_reachable_in_order(self):
+        # One case per field, and the order matters: a tool carrying several
+        # (Artifact has file_path AND description) must resolve deterministically.
+        cases = [
+            ("Skill", '{"skill": "dataviz", "args": "x"}', "dataviz"),
+            ("ToolSearch", '{"query": "notebook", "max_results": 5}', "notebook"),
+            ("WebFetch", '{"url": "https://x.dev", "prompt": "read it"}', "https://x.dev"),
+            ("Artifact", '{"file_path": "/tmp/a.html", "description": "a page"}',
+             "a page"),
+            ("Read", '{"file_path": "/tmp/a.py"}', "/tmp/a.py"),
+            ("Grep", '{"pattern": "def build_"}', "def build_"),
+            ("NotebookEdit", '{"notebook_path": "/tmp/n.ipynb"}', "/tmp/n.ipynb"),
+            ("Monitor", '{"command": "tail -f log"}', "tail -f log"),
+            ("mcp__x__y", '{"path": "/srv/x"}', "/srv/x"),
+        ]
+        for tool, tool_input, expected in cases:
+            assert action_of(tool, None, tool_input) == expected, tool
+
+    def test_no_text_and_no_usable_input_is_empty(self):
+        # Malformed JSON, a non-object, a missing input, and an object whose keys
+        # are all unknown (the MCP long tail: page_id, channel_id, taskId).
+        assert action_of("Skill", None, "{not json") == ""
+        assert action_of("Skill", None, "[1, 2]") == ""
+        assert action_of("Skill", None, '"a string"') == ""
+        assert action_of("Skill", None, None) == ""
+        assert action_of("Skill", None, "") == ""
+        assert action_of("TaskUpdate", None, '{"taskId": "t1", "status": "done"}') == ""
+
+    def test_a_known_field_holding_a_container_is_skipped(self):
+        # AskUserQuestion's `questions` is a list; dumping JSON into the cell
+        # would be noise, so a non-string value falls through to the next field.
+        assert action_of("X", None, '{"description": {"a": 1}, "path": "/tmp/x"}') \
+            == "/tmp/x"
+        assert action_of("X", None, '{"query": ["a", "b"]}') == ""
+        assert action_of("X", None, '{"query": "   "}') == ""      # blank is not a label
+
+    def test_short_tool_name_drops_the_mcp_server_prefix(self):
+        assert feed._short_tool_name(
+            "mcp__plugin_chrome-devtools-mcp_chrome-devtools__evaluate_script") \
+            == "evaluate_script"
+        assert feed._short_tool_name("mcp__notion__notion-fetch") == "notion-fetch"
+        assert feed._short_tool_name("Bash") == "Bash"     # plain names untouched
+        assert feed._short_tool_name("") == ""
+
+
+class TestTurnPanelHeader:
+    """The turn page's three header rows. The Work row is the one with a trap in
+    it: `tools` already INCLUDES `subcalls`."""
+
+    def test_work_row_subtracts_to_get_the_main_thread_count(self):
+        # The measured shape: 1 main-thread Bash + 2 subagent calls is
+        # tools=3, subcalls=2. Adding them would report 5 calls for 3.
+        line = feed._turn_work_line(_turn(tools=3, subcalls=2, agents=1, bash=1))
+        assert "3 tool calls" in line.plain
+        assert "1 main, 2 across 1 subagent" in line.plain
+        assert "5 tool calls" not in line.plain
+
+    def test_work_row_scales_to_the_real_example(self):
+        # session 29dea45c's turn: 73 calls of which 41 across 3 subagents.
+        line = feed._turn_work_line(
+            _turn(tools=73, subcalls=41, agents=3, bash=14))
+        assert line.plain == "73 tool calls: 32 main, 41 across 3 subagents  ·  14 Bash"
+
+    def test_work_row_omits_the_split_when_no_subagent_ran(self):
+        line = feed._turn_work_line(_turn(tools=9, subcalls=0, agents=0, bash=4))
+        assert line.plain == "9 tool calls  ·  4 Bash"
+
+    def test_work_row_omits_bash_when_none_ran(self):
+        assert feed._turn_work_line(_turn(tools=2, bash=0)).plain == "2 tool calls"
+
+    def test_work_row_says_a_zero_call_turn_ran_nothing(self):
+        line = feed._turn_work_line(_turn(tools=0))
+        assert line.plain == "no tool calls"
+        assert line.style == "dim"
+
+    def test_bash_is_never_claimed_for_the_main_thread(self):
+        """`bash` counts the WHOLE window, subagents included (the store's query
+        filters `tool_name='Bash'` over every call in the window), so it may not
+        be nested under the main-thread count. Here every Bash call was a
+        subagent's: `1 main (3 Bash)` would be arithmetically impossible."""
+        line = feed._turn_work_line(_turn(tools=4, subcalls=3, agents=1, bash=3))
+        assert "1 main, 3 across 1 subagent" in line.plain
+        assert "1 main (3 Bash)" not in line.plain
+        assert line.plain.endswith("3 Bash")
+
+    def test_tokens_row_reports_output_subagents_and_requests(self):
+        line = feed._turn_tokens_line(
+            _turn(output_tokens=24_200, subagent_output_tokens=3_100, requests=15))
+        assert line.plain == "24,200 output  ·  3,100 by subagents  ·  15 requests"
+
+    def test_tokens_row_omits_the_subagent_part_when_none_generated(self):
+        line = feed._turn_tokens_line(_turn(output_tokens=900, requests=1))
+        assert line.plain == "900 output  ·  1 request"
+
+    def test_tokens_row_degrades_to_the_dim_hint_with_no_requests(self):
+        # The store attributed no API request to the window: the row says why
+        # instead of printing a confident 0, reusing the modals' one wording.
+        line = feed._turn_tokens_line(_turn(output_tokens=0, requests=0))
+        assert line.plain == feed.PENDING_INGEST_HINT
+        assert line.style == "dim italic"
+
+    def test_duration_runs_from_the_prompt_to_the_last_request(self):
+        assert feed._turn_duration("2026-07-29 18:58:55-03",
+                                   "2026-07-29 19:05:07-03") == "6m 12s"
+        assert feed._turn_duration("2026-07-29 18:58:55-03",
+                                   "2026-07-29 18:59:07-03") == "12s"
+        assert feed._turn_duration("2026-07-29 18:58:55-03",
+                                   "2026-07-29 20:05:07-03") == "1h 06m"
+
+    def test_duration_is_none_when_it_cannot_be_computed(self):
+        assert feed._turn_duration("2026-07-29 18:58:55-03", None) is None  # no request
+        assert feed._turn_duration("", "2026-07-29 19:05:07-03") is None
+        assert feed._turn_duration("nonsense", "2026-07-29 19:05:07-03") is None
+        # A clock that went backwards is not a negative turn.
+        assert feed._turn_duration("2026-07-29 19:05:07-03",
+                                   "2026-07-29 18:58:55-03") is None
+
+    def test_header_renders_the_identity_the_page_is_about(self):
+        turn = _turn(sid="4be57694-c1f0", ts="2026-07-29 18:58:55-03",
+                     last_ts="2026-07-29 19:05:07-03",
+                     project="/home/naka/Projects/personal/claude-trail",
+                     tools=3, subcalls=2, agents=1, bash=1,
+                     output_tokens=2400, requests=4)
+        out = _panel_text(feed.build_turn_panel(_turn_state(turn), 40))
+        assert "4be57694" in out                       # session label
+        assert "claude-trail" in out                   # project tail
+        assert f"sent {feed.format_time(turn.ts)}" in out
+        assert "ran 6m 12s" in out
+        assert "1 main, 2 across 1 subagent" in out
+        assert "2,400 output" in out
+
+    def test_header_drops_the_duration_when_the_turn_made_no_request(self):
+        out = _panel_text(feed.build_turn_panel(_turn_state(_turn(tools=1)), 40))
+        assert "ran " not in out
+        assert feed.PENDING_INGEST_HINT in out
+
+    def test_the_prompt_box_quotes_the_loaded_text_and_counts_the_rest(self):
+        text = "\n".join(f"line {i}" for i in range(30))
+        out = _panel_text(feed.build_turn_panel(
+            _turn_state(_turn(tools=1), text=text), 40))
+        assert "line 0" in out and "line 1" in out
+        assert "line 5" not in out                      # only the opening lines
+        assert f"+{30 - feed.TURN_PROMPT_PREVIEW_LINES} more lines" in out
+        assert "↵ : full prompt" in out                 # there IS one to open
+
+    def test_the_prompt_box_falls_back_to_the_rows_own_preview(self):
+        # The full text did not load, so the page quotes the 400-char preview the
+        # list query already returned - and must NOT advertise `↵`, which up here
+        # would close the page rather than open anything.
+        turn = _turn(tools=1, preview="do the thing\nthen the other\nand a third\nand more")
+        out = _panel_text(feed.build_turn_panel(_turn_state(turn, text=None), 40))
+        assert "do the thing" in out
+        assert "+2 more lines" in out
+        assert "↵ : full prompt" not in out
+        assert "esc / q / ↵ : back" in out              # the hint agrees with it
+
+
+class TestTurnActionTable:
+    """The action list: the agent gutter over the real (oldest-first) order, the
+    tool and detail cells, and what an empty list says."""
+
+    def _rows(self):
+        # main, then a three-call subagent run, then main again.
+        return [
+            _action("2026-07-29 10:00:01-03", text="wc -l claude_trail.py"),
+            _action("2026-07-29 10:00:02-03", agent_id="ag1", tool_name="Read",
+                    text="/x/claude_trail.py"),
+            _action("2026-07-29 10:00:03-03", agent_id="ag1", tool_name="Grep",
+                    text="def build_"),
+            _action("2026-07-29 10:00:04-03", agent_id="ag1", tool_name="Read",
+                    text="/x/store.py"),
+            _action("2026-07-29 10:00:05-03", text="pytest -q"),
+        ]
+
+    AGENTS = {"ag1": {"description": "explore", "type": "Explore"}}
+
+    def _gutters(self, actions, agent_map=None):
+        table = feed.build_action_table(actions, agent_map or self.AGENTS)
+        return [cell.plain for cell in list(table.columns[1].cells)]
+
+    def test_gutter_brackets_a_run_and_labels_it_once(self):
+        assert self._gutters(self._rows()) == ["", "┌ ag1 explore", "│ ", "└ ", ""]
+
+    def test_a_single_call_run_gets_the_standalone_glyph(self):
+        rows = [_action(agent_id="ag1", tool_name="Read", text="/x/a.py")]
+        assert self._gutters(rows) == ["─ ag1 explore"]
+
+    def test_two_subagents_back_to_back_are_separate_runs(self):
+        # Adjacent rows with DIFFERENT agent ids must not be joined into one
+        # bracket, or two subagents read as one.
+        rows = [_action(agent_id="ag1", tool_name="Read", text="a"),
+                _action(agent_id="ag2", tool_name="Read", text="b")]
+        agents = {**self.AGENTS, "ag2": {"description": "review", "type": "gp"}}
+        assert self._gutters(rows, agents) == ["─ ag1 explore", "─ ag2 review"]
+
+    def test_an_unknown_agent_still_gets_its_short_id(self):
+        rows = [_action(agent_id="deadbeef", tool_name="Read", text="a")]
+        assert self._gutters(rows, {}) == ["─ dead"]
+
+    def test_runs_are_computed_over_the_rows_actually_passed_in(self):
+        """The caller windows before calling, so a run cut by the window closes
+        at the screen edge rather than pointing off it."""
+        window = self._rows()[1:3]        # the first two of the three-call run
+        assert self._gutters(window) == ["┌ ag1 explore", "└ "]
+
+    def test_tool_cell_shortens_mcp_names_and_marks_failures(self):
+        rows = [_action(tool_name="mcp__plugin_slack_slack__slack_search_public",
+                        tool_input='{"query": "deploy"}', is_error=True),
+                _action(tool_name="Bash", text="ls", is_error=False)]
+        table = feed.build_action_table(rows)
+        cells = list(table.columns[2].cells)
+        assert cells[0].plain == "slack_search_public"
+        assert cells[0].style == "dim red"            # the call failed
+        assert cells[1].style == ""                   # it did not
+
+    def test_a_call_with_no_result_yet_is_not_marked_failed(self):
+        # is_error is NULL until the tool_result lands; nothing has gone wrong.
+        table = feed.build_action_table([_action(text="ls", is_error=None)])
+        assert list(table.columns[2].cells)[0].style == ""
+
+    def test_detail_cell_keeps_the_bash_danger_marker(self):
+        table = feed.build_action_table(
+            [_action(text="rm -rf /tmp/x"), _action(text="ls -la")])
+        cells = list(table.columns[3].cells)
+        assert cells[0].plain == "* rm -rf /tmp/x"
+        assert cells[1].plain == "ls -la"
+
+    def test_the_danger_marker_is_bash_only(self):
+        # A file named after a dangerous verb is not a dangerous command.
+        table = feed.build_action_table(
+            [_action(tool_name="Read", text="/tmp/rm -rf notes.txt")])
+        assert list(table.columns[3].cells)[0].plain == "/tmp/rm -rf notes.txt"
+
+    def test_detail_cell_collapses_whitespace_to_one_line(self):
+        table = feed.build_action_table(
+            [_action(text="git commit -m 'one\n\ntwo'")])
+        assert list(table.columns[3].cells)[0].plain == "git commit -m 'one two'"
+
+    def test_detail_cell_falls_back_to_tool_input(self):
+        table = feed.build_action_table(
+            [_action(tool_name="Agent", text=None,
+                     tool_input='{"description": "explore the store"}')])
+        assert list(table.columns[3].cells)[0].plain == "explore the store"
+
+    def test_an_unlabellable_call_shows_a_dim_dash(self):
+        table = feed.build_action_table(
+            [_action(tool_name="TaskList", text=None, tool_input="{}")])
+        cell = list(table.columns[3].cells)[0]
+        assert cell.plain == "-"
+        assert cell.style == "dim"
+
+    def test_rows_render_oldest_first_the_way_the_work_happened(self):
+        out = _panel_text(feed.build_turn_panel(
+            _turn_state(actions=self._rows()), 40, agent_map=self.AGENTS))
+        assert out.index("wc -l claude_trail.py") < out.index("pytest -q")
+
+    def test_unreadable_actions_say_so_rather_than_showing_an_empty_turn(self):
+        # actions is None: the store could not answer. Blaming the turn for
+        # running nothing would be a different (and wrong) statement.
+        out = _panel_text(feed.build_turn_panel(_turn_state(actions=None), 40))
+        assert feed.TURN_UNREADABLE_HINT in out
+        assert "No tool calls in this turn" not in out
+
+    def test_a_genuinely_empty_turn_says_that_instead(self):
+        out = _panel_text(feed.build_turn_panel(_turn_state(actions=[]), 40))
+        assert "No tool calls in this turn" in out
+        assert feed.TURN_UNREADABLE_HINT not in out
+
+
+class TestTurnBashFilter:
+    """`b`: a lens over the loaded actions, never a second query."""
+
+    ACTIONS = [_action(text="ls"),
+               _action(tool_name="Read", text="/x/a.py"),
+               _action(text="pytest -q"),
+               _action(tool_name="Edit", text="/x/b.py")]
+
+    def _open(self, rows=2):
+        state = _prompts_state(rows=rows)
+        feed.apply_key(state, "\r", 10)
+        state.prompts.actions = list(self.ACTIONS)
+        state.prompts.detail_text = "the ask"
+        return state
+
+    def test_visible_actions_is_everything_by_default(self):
+        prompts = _turn_state(actions=self.ACTIONS)
+        assert prompts.visible_actions() == self.ACTIONS
+
+    def test_bash_only_keeps_only_bash_calls(self):
+        prompts = _turn_state(actions=self.ACTIONS, bash_only=True)
+        assert [a.text for a in prompts.visible_actions()] == ["ls", "pytest -q"]
+        assert len(prompts.actions) == 4          # the loaded list is untouched
+
+    def test_visible_actions_is_empty_when_none_loaded(self):
+        assert _turn_state(actions=None).visible_actions() == []
+
+    def test_b_toggles_the_filter_without_asking_for_a_store_read(self):
+        state = self._open()
+        assert feed.apply_key(state, "b", 10) is feed.Action.NONE
+        assert state.prompts.bash_only is True
+        assert state.prompts.actions == self.ACTIONS      # nothing was re-fetched
+        assert feed.apply_key(state, "b", 10) is feed.Action.NONE
+        assert state.prompts.bash_only is False
+
+    def test_b_re_anchors_the_scroll_onto_the_shorter_list(self):
+        state = self._open()
+        feed.apply_key(state, "G", 10)
+        state.prompts.detail_scroll = 3
+        feed.apply_key(state, "b", 10)
+        assert state.prompts.detail_scroll == 0
+
+    def test_the_filter_is_reset_by_the_next_turn(self):
+        # `bash_only` belongs to the turn being read, not to the tab.
+        state = self._open()
+        feed.apply_key(state, "b", 10)
+        feed.apply_key(state, "q", 10)
+        feed.apply_key(state, "\r", 10)
+        assert state.prompts.bash_only is False
+
+    def test_the_panel_shows_what_the_filter_is_hiding(self):
+        prompts = _turn_state(actions=self.ACTIONS, bash_only=True)
+        out = _panel_text(feed.build_turn_panel(prompts, 40))
+        assert "Actions (2)" in out
+        assert "bash only, 2 hidden" in out
+        assert "/x/a.py" not in out
+        assert "b : all tools" in out             # the hint says how to undo it
+
+    def test_the_filter_says_nothing_about_hiding_when_it_hides_nothing(self):
+        prompts = _turn_state(actions=[_action(text="ls")], bash_only=True)
+        out = _panel_text(feed.build_turn_panel(prompts, 40))
+        assert "bash only" in out
+        assert "0 hidden" not in out
+
+    def test_a_turn_with_no_bash_says_so_and_how_to_get_back(self):
+        prompts = _turn_state(actions=[_action(tool_name="Read", text="/x/a.py")],
+                              bash_only=True)
+        out = _panel_text(feed.build_turn_panel(prompts, 40))
+        assert "No Bash calls in this turn" in out
+        assert "1 other tool call hidden" in out         # singular, not "1 calls"
+        assert "press b to show everything" in out
+        assert "No tool calls in this turn" not in out   # it ran one
+
+
+class TestTurnScroll:
+    """The action list's scroll: the same clamp-and-write-back contract as the
+    session modal, driven through apply_key."""
+
+    def _open(self, n=40):
+        state = _prompts_state(rows=2)
+        feed.apply_key(state, "\r", 10)
+        state.prompts.actions = [_action(text=f"cmd {i}") for i in range(n)]
+        state.prompts.detail_text = "the ask"
+        return state
+
+    def test_j_k_scroll_and_never_go_negative(self):
+        state = self._open()
+        feed.apply_key(state, "j", 10)
+        feed.apply_key(state, "j", 10)
+        assert state.prompts.detail_scroll == 2
+        feed.apply_key(state, "k", 10)
+        assert state.prompts.detail_scroll == 1
+        for _ in range(5):
+            feed.apply_key(state, "k", 10)
+        assert state.prompts.detail_scroll == 0
+        feed.apply_key(state, "g", 10)
+        assert state.prompts.detail_scroll == 0
+        feed.apply_key(state, "G", 10)
+        assert state.prompts.detail_scroll == 10**9      # clamped at render
+
+    def test_arrow_keys_scroll_like_j_and_k(self):
+        state = self._open()
+        feed.apply_key(state, "down", 10)
+        assert state.prompts.detail_scroll == 1
+        feed.apply_key(state, "up", 10)
+        assert state.prompts.detail_scroll == 0
+
+    def test_clamp_bounds_the_offset_to_the_last_screenful(self):
+        capacity = feed._turn_capacity(30)
+        assert feed._clamp_turn_scroll(10**9, 40, 30) == 40 - capacity
+        assert feed._clamp_turn_scroll(-5, 40, 30) == 0
+        assert feed._clamp_turn_scroll(3, 2, 30) == 0     # fewer rows than fit
+        assert feed._clamp_turn_scroll(0, 0, 30) == 0     # no rows at all
+
+    def test_a_shrinking_list_pulls_the_window_back(self):
+        # `b` can cut the list under a parked offset; the panel clamps for
+        # display and render_panel writes the same value back.
+        assert feed._clamp_turn_scroll(35, 40, 30) == 40 - feed._turn_capacity(30)
+        assert feed._clamp_turn_scroll(35, 4, 30) == 0
+
+    def test_the_panel_windows_the_rows_and_reports_the_range(self):
+        prompts = _turn_state(actions=[_action(text=f"cmd {i}") for i in range(40)],
+                              detail_scroll=5)
+        out = _panel_text(feed.build_turn_panel(prompts, 30), width=100)
+        capacity = feed._turn_capacity(30)
+        assert "cmd 5" in out and "cmd 4" not in out       # window starts at 5
+        assert f"6-{5 + capacity} of 40" in out
+        assert "Actions (40)" in out
+
+    def test_a_list_that_fits_gets_no_range_chip(self):
+        prompts = _turn_state(actions=[_action(text=f"cmd {i}") for i in range(3)])
+        out = _panel_text(feed.build_turn_panel(prompts, 40))
+        assert "Actions (3)" in out
+        assert "of 3" not in out
+
+
+class TestTurnDepths:
+    """Enter -> turn page -> Enter -> full prompt, and every way back out."""
+
+    def _open(self, text="line a\nline b"):
+        state = _prompts_state(rows=3)
+        feed.apply_key(state, "\r", 10)
+        state.prompts.actions = [_action(text="ls")]
+        state.prompts.detail_text = text          # what main() loaded
+        return state
+
+    def test_enter_drills_into_the_full_prompt(self):
+        state = self._open()
+        assert feed.apply_key(state, "\r", 10) is feed.Action.NONE
+        assert state.prompts.prompt_open is True
+        assert state.prompts.detail is not None   # the turn page stays under it
+
+    def test_enter_closes_the_page_when_there_is_no_prompt_to_open(self):
+        # Same rule the command modal follows: with nothing to open, Enter keeps
+        # its one-key exit.
+        state = self._open(text=None)
+        assert feed.apply_key(state, "\r", 10) is feed.Action.NONE
+        assert state.prompts.prompt_open is False
+        assert state.prompts.detail is None
+
+    def test_esc_steps_back_one_level_at_a_time(self):
+        state = self._open()
+        feed.apply_key(state, "\r", 10)                    # into the prompt
+        feed.apply_key(state, "\x1b", 10)
+        assert state.prompts.prompt_open is False
+        assert state.prompts.detail is not None            # back on the turn page
+        feed.apply_key(state, "\x1b", 10)
+        assert state.prompts.detail is None                # back to the list
+        assert state.tab == "prompts"
+        assert state.prompts.rows                          # the snapshot survives
+
+    def test_enter_also_steps_back_from_the_full_prompt(self):
+        state = self._open()
+        feed.apply_key(state, "\r", 10)
+        feed.apply_key(state, "\r", 10)
+        assert state.prompts.prompt_open is False
+        assert state.prompts.detail is not None
+
+    def test_q_closes_everything_from_either_depth(self):
+        for depth in (0, 1):
+            state = self._open()
+            for _ in range(depth):
+                feed.apply_key(state, "\r", 10)
+            assert feed.apply_key(state, "q", 10) is feed.Action.NONE
+            assert state.prompts.detail is None
+            assert state.prompts.prompt_open is False
+            assert state.prompts.detail_text is None
+            assert state.modal_open() is False
+
+    def test_ctrl_c_quits_from_either_depth(self):
+        for depth in (0, 1):
+            state = self._open()
+            for _ in range(depth):
+                feed.apply_key(state, "\r", 10)
+            assert feed.apply_key(state, "\x03", 10) is feed.Action.QUIT
+
+    def test_the_prompt_scroll_resets_when_the_view_reopens(self):
+        state = self._open()
+        feed.apply_key(state, "\r", 10)
+        feed.apply_key(state, "j", 10)
+        assert state.prompts.prompt_scroll == 1
+        feed.apply_key(state, "\x1b", 10)
+        feed.apply_key(state, "\r", 10)
+        assert state.prompts.prompt_scroll == 0
+
+    def test_the_two_scrolls_do_not_bleed_into_each_other(self):
+        state = self._open()
+        feed.apply_key(state, "j", 10)                     # the action list
+        feed.apply_key(state, "j", 10)
+        feed.apply_key(state, "\r", 10)                    # into the prompt
+        feed.apply_key(state, "j", 10)
+        assert (state.prompts.detail_scroll, state.prompts.prompt_scroll) == (2, 1)
+
+    def test_the_turn_page_swallows_the_list_keys(self):
+        # `r`, `x`, `S` and the digits belong to the list under it.
+        state = self._open()
+        for ch in ("r", "x", "S", "1", "7", "\t", "/", "f", "c", "s", "d", "o"):
+            assert feed.apply_key(state, ch, 10) is feed.Action.NONE, ch
+            assert state.prompts.detail is not None, ch
+        assert state.prompts.hide_empty is False
+        assert state.prompts.session_filter is None
+        assert state.tab == "prompts"
+        assert all(state.prompt_cols.values())
+
+    def test_the_full_prompt_view_swallows_b(self):
+        # `b` filters the list under the prompt; up here it must do nothing.
+        state = self._open()
+        feed.apply_key(state, "\r", 10)
+        assert feed.apply_key(state, "b", 10) is feed.Action.NONE
+        assert state.prompts.bash_only is False
+
+    def test_the_full_prompt_renders_the_turns_identity(self):
+        state = self._open(text="\n".join(f"line {i}" for i in range(30)))
+        feed.apply_key(state, "\r", 10)
+        turn = state.prompts.detail
+        out = _panel_text(feed.build_prompt_panel(
+            turn.session_id, 30, state.prompts.detail_text, ts=turn.ts))
+        assert "30 lines" in out
+        assert turn.session_id[:8] in out
+        assert turn.ts[:19] in out                          # the Sent row
+
+
+class TestTurnPromptCap:
+    """The full-prompt view caps what it materializes, and says what it cut."""
+
+    def test_a_normal_prompt_is_untouched(self):
+        assert feed._cap_prompt_text("short") == "short"
+        assert feed._cap_prompt_text(None) is None
+        assert feed._cap_prompt_text("") == ""
+        exact = "x" * feed.PROMPT_TEXT_CHAR_CAP
+        assert feed._cap_prompt_text(exact) == exact       # the boundary is kept
+
+    def test_an_oversized_prompt_is_cut_and_says_how_much(self):
+        # The store-wide longest main-thread turn measured 646,245 chars, 30x the
+        # 21,697 max of the window the list scans - and turn_prompt_text has no
+        # cap of its own, so this is the only place that bounds it.
+        text = "y" * 646_245
+        capped = feed._cap_prompt_text(text)
+        assert len(capped) < len(text)
+        assert capped.startswith("y" * feed.PROMPT_TEXT_CHAR_CAP)
+        dropped = 646_245 - feed.PROMPT_TEXT_CHAR_CAP
+        assert f"{dropped:,} more characters not shown" in capped
+        assert f"{feed.PROMPT_TEXT_CHAR_CAP:,} of 646,245 kept" in capped
+
+    def test_the_cut_is_visible_in_the_view_itself(self):
+        # Not just in the string: the reader must see it on the last page.
+        capped = feed._cap_prompt_text("z" * 300_000, cap=200)
+        out = _panel_text(feed.build_prompt_panel("s1", 40, capped, scroll=10**9))
+        assert "more characters not shown" in out
+
+    def test_the_loader_caps_before_the_text_reaches_the_view(self, tmp_path, monkeypatch):
+        import claude_trail_store as store
+        db = tmp_path / "trail.duckdb"
+        db.touch()
+        monkeypatch.setattr(store, "STORE_PATH", db)
+        monkeypatch.setattr(feed, "_with_store",
+                            lambda fn, **kw: ([], "w" * 300_000))
+        _actions, text = feed._load_turn_detail(_turn(tools=0))
+        assert len(text) < 300_000
+        assert "more characters not shown" in text
+
+
+class TestTurnDetailLoader:
+    """`_load_turn_detail`: one read-only store open per opened turn, and the
+    three answers the page tells apart."""
+
+    def _store_at(self, tmp_path, monkeypatch, exists=True):
+        import claude_trail_store as store
+        db = tmp_path / "trail.duckdb"
+        if exists:
+            db.touch()
+        monkeypatch.setattr(store, "STORE_PATH", db)
+        return store
+
+    def test_no_turn_or_a_turn_with_no_key_loads_nothing(self):
+        assert feed._load_turn_detail(None) == (None, None)
+        assert feed._load_turn_detail(feed.PromptTurn(session_id="", ts="t")) \
+            == (None, None)
+        assert feed._load_turn_detail(feed.PromptTurn(session_id="s", ts="")) \
+            == (None, None)
+
+    def test_both_halves_come_from_one_store_open(self, tmp_path, monkeypatch):
+        # A second open per modal would double what `↵` costs.
+        self._store_at(tmp_path, monkeypatch)
+        opens = []
+
+        def fake_with_store(fn, **kw):
+            opens.append(fn)
+            return [feed.TurnAction(ts="t", tool_name="Bash")], "the ask"
+
+        monkeypatch.setattr(feed, "_with_store", fake_with_store)
+        actions, text = feed._load_turn_detail(_turn(tools=1))
+        assert len(opens) == 1
+        assert [a.tool_name for a in actions] == ["Bash"]
+        assert text == "the ask"
+
+    def test_it_passes_the_turns_own_window_to_the_query(self, tmp_path, monkeypatch):
+        # The window bounds and the event id are what make this ONE turn rather
+        # than the session's whole history.
+        store = self._store_at(tmp_path, monkeypatch)
+        seen = {}
+
+        def fake_turn_actions(con, sid, ts, next_ts=None, **kw):
+            seen.update(sid=sid, ts=ts, next_ts=next_ts)
+            return [{"ts": "2026-07-29 10:00:01-03", "agent_id": None,
+                     "tool_name": "Bash", "text": "ls", "tool_input": None,
+                     "is_error": False}]
+
+        monkeypatch.setattr(store, "turn_actions", fake_turn_actions)
+        monkeypatch.setattr(store, "turn_prompt_text",
+                            lambda con, event_id: f"text of {event_id}")
+        monkeypatch.setattr(feed, "_with_store", lambda fn, **kw: fn(None))
+        turn = _turn(sid="s1", ts="2026-07-29 10:00:00-03",
+                     next_ts="2026-07-29 10:30:00-03", event_id="ev-9")
+        actions, text = feed._load_turn_detail(turn)
+        assert seen == {"sid": "s1", "ts": "2026-07-29 10:00:00-03",
+                        "next_ts": "2026-07-29 10:30:00-03"}
+        assert [a.text for a in actions] == ["ls"]      # mapped onto the record
+        assert text == "text of ev-9"
+
+    def test_a_store_that_cannot_answer_gives_none_not_an_empty_list(
+            self, tmp_path, monkeypatch):
+        # None and [] are different statements on the page (see the panel tests),
+        # so the loader must not flatten them.
+        self._store_at(tmp_path, monkeypatch, exists=False)
+        assert feed._load_turn_detail(_turn(tools=1)) == (None, None)
+
+    def test_an_empty_turn_answers_with_an_empty_list(self, tmp_path, monkeypatch):
+        self._store_at(tmp_path, monkeypatch)
+        monkeypatch.setattr(feed, "_with_store", lambda fn, **kw: ([], None))
+        assert feed._load_turn_detail(_turn(tools=0)) == ([], None)
+
+    def test_a_turn_with_no_event_id_skips_the_prompt_query(self, tmp_path, monkeypatch):
+        store = self._store_at(tmp_path, monkeypatch)
+        called = []
+        monkeypatch.setattr(store, "turn_actions", lambda *a, **k: [])
+        monkeypatch.setattr(store, "turn_prompt_text",
+                            lambda *a, **k: called.append(a) or "x")
+        monkeypatch.setattr(feed, "_with_store", lambda fn, **kw: fn(None))
+        turn = feed.PromptTurn(session_id="s", ts="2026-07-29 10:00:00-03",
+                               event_id="")
+        assert feed._load_turn_detail(turn) == ([], None)
+        assert called == []
+
+
+class TestTurnPanelGeometry:
+    """TURN_CHROME_ROWS, measured by rendering rather than counted: the page's
+    header is tall, so one row too few silently eats the key hints."""
+
+    def _panel(self, height, width, actions=40):
+        prompts = _turn_state(
+            actions=[_action(text=f"cmd {i}") for i in range(actions)],
+            text="\n".join(f"line {i}" for i in range(30)))
+        console = Console(width=width, record=True)
+        console.print(feed.build_turn_panel(prompts, height))
+        return console.export_text()
+
+    def test_the_hint_and_the_header_survive_at_24_rows(self):
+        for width in (80, 110, 160):
+            out = self._panel(24, width)
+            assert "b : bash only" in out, width      # the hint line
+            assert "Actions (40)" in out, width
+            assert "Session" in out, width
+            assert len(out.splitlines()) == 24, width
+
+    def test_chrome_one_row_too_small_crops_the_hint(self):
+        # The pin from below: at TURN_CHROME_ROWS - 1 the body claims the hint's
+        # row at every width, so the current value is minimal, not padded.
+        with patch.object(feed, "TURN_CHROME_ROWS", feed.TURN_CHROME_ROWS - 1):
+            for width in (80, 110, 160):
+                assert "b : bash only" not in self._panel(24, width), width
+
+    def test_capacity_grows_with_the_terminal_and_has_a_floor(self):
+        assert feed._turn_capacity(40) == 40 - feed.TURN_CHROME_ROWS
+        assert feed._turn_capacity(10) == feed.MIN_VISIBLE_ROWS   # tiny terminal
+
+
 class TestPromptView:
     """The full-prompt view drilled into from the command modal with Enter:
     key handling (drill in, step back, close) and build_prompt_panel windowing."""
@@ -3437,9 +4277,8 @@ class TestPromptView:
         assert state.detail_prompt_scroll == 0
 
     def test_panel_windows_the_body_and_reports_the_range(self):
-        entry = {"command": "ls", "session_id": "sid-0", "cwd": "/work",
-                 "timestamp": "2026-06-30T12:00:00+00:00"}
-        out = self._text(feed.build_prompt_panel(entry, 30, self.PROMPT, scroll=5))
+        out = self._text(feed.build_prompt_panel(
+            "sid-0", 30, self.PROMPT["text"], ts=self.PROMPT["ts"], scroll=5))
         capacity = feed._prompt_capacity(30)
         assert "line 6" in out                       # window starts at the offset
         assert f"6-{5 + capacity} of 40" in out
@@ -3448,11 +4287,24 @@ class TestPromptView:
         assert "2026-06-30 09:00:00" in out          # Sent row, offset sliced off
 
     def test_panel_shows_whole_prompt_when_it_fits(self):
-        short = {"text": "a\nb\nc", "ts": ""}
-        out = self._text(feed.build_prompt_panel({"session_id": "s"}, 40, short))
+        out = self._text(feed.build_prompt_panel("s", 40, "a\nb\nc"))
         assert "a" in out and "b" in out and "c" in out
         assert "of 3" not in out                     # no range chip when unwindowed
         assert "Sent" not in out                     # no ts, no row
+
+    def test_panel_takes_plain_values_so_both_tabs_can_call_it(self):
+        """The refactor: identity comes in as `(session_id, agent_id, ts)` rather
+        than a LogEntry, because a Prompts-tab turn has no log entry to derive it
+        from. Both shapes of caller are exercised here."""
+        agent_map = {"aid1": {"description": "explore", "type": "Explore"}}
+        subagent = self._text(feed.build_prompt_panel(
+            "sid-0", 40, "ask", ts="2026-06-30 09:00:00-03", agent_id="aid1",
+            name_map={"sid-0": "my-session"}, agent_map=agent_map))
+        assert "my-session" in subagent                  # resolved like the feed
+        assert "aid1 explore" in subagent                # Agent row from the id
+        # A main-thread turn (the Prompts tab's only kind) has no Agent row.
+        assert "Agent" not in self._text(feed.build_prompt_panel(
+            "sid-0", 40, "ask", ts="2026-06-30 09:00:00-03", agent_map=agent_map))
 
     def test_clamp_bounds_the_scroll_to_the_last_screenful(self):
         capacity = feed._prompt_capacity(30)

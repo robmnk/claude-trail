@@ -123,10 +123,30 @@ SESSION_CHROME_ROWS = 17
 # the body panel's own 2 borders + 2 padding. Prompt lines wrap, so a windowful
 # can still outgrow its rows; the crop then eats body lines, never the header.
 PROMPT_CHROME_ROWS = 14
+# Same accounting for the turn-detail page (`↵` on the Prompts tab), whose body
+# is an action table under a fixed header: 2 outer borders + 2 outer padding +
+# 3 meta rows (Session / Work / Tokens) + 1 blank + the prompt box (2 borders +
+# TURN_PROMPT_PREVIEW_LINES lines + 1 blank + 1 "+N lines" footer) + the Actions
+# header + the table's own header row and rule + 1 hint. Worst case like
+# SESSION_CHROME_ROWS: a short prompt loses the box's footer and its blank, and
+# those two rows go unused. Measured by rendering, not counted: 17 crops the hint
+# at every width, 18 keeps it from 76 columns up (below that the meta rows wrap
+# and take the hint's row, the same narrow-terminal trade the other panels make).
+TURN_CHROME_ROWS = 18
 MIN_VISIBLE_ROWS = 3
 # Lines of the triggering prompt shown in the command modal before it says how
 # many are hidden; `Enter` opens the rest in the scrollable full-prompt view.
 PROMPT_PREVIEW_LINES = 10
+# The same for the turn page, which quotes the prompt above a table and so can
+# spend far fewer rows on it.
+TURN_PROMPT_PREVIEW_LINES = 2
+# Cap on the prompt text the full-prompt view materializes. `turn_prompt_text`
+# has none, and the longest main-thread turn in a real store is 646,245 chars (a
+# summarization hook prompt), 30x the 21,697 max of the newest-400 window the
+# list scans. The view re-splits that text into lines on every frame to window
+# it, so an uncapped one would chew through half a megabyte four times a second.
+# What is dropped is stated in the text itself, never silently cut.
+PROMPT_TEXT_CHAR_CAP = 100_000
 SESSION_NAME_CACHE_TTL = 2.0  # seconds
 SESSION_COLOR_CACHE_TTL = 5.0  # seconds
 AGENT_LABEL_CACHE_TTL = 2.0  # seconds
@@ -154,6 +174,21 @@ SEARCH_RESULT_LIMIT = 500  # max hits kept per search; the rest are dropped (cap
 SEARCH_TIMEOUT = 5.0  # seconds before rg/grep is killed so a huge tree can't hang the UI
 # Editors that accept a `+<line>` argument to open a file at a line (vi family).
 _VI_FAMILY = frozenset({"vi", "vim", "nvim", "view", "vimdiff", "nvi", "gvim"})
+
+# Status/hint lines for a store that cannot answer. One definition each, so the
+# modals, the prompts header and the empty states never drift apart in wording.
+# Up here with the other constants rather than beside the loaders that produce
+# them, because the turn page's Tokens row renders one directly.
+NO_STORE_HINT = "no audit store yet - run: claude-trail ingest"
+PENDING_INGEST_HINT = "pending ingest (store lags the live feed)"
+# Matches the CLI's `store busy:` prefix for the same condition (a lock collision
+# against the single writer), which is routine at the 30s ingest cadence.
+STORE_BUSY_HINT = "store busy: an ingest is writing"
+STORE_BUSY_KEPT_HINT = f"{STORE_BUSY_HINT} - kept the last snapshot"
+# The turn page's own "no answer" line. Its list query answered moments ago, so
+# the store exists; what is left is a store held by the running ingest or one
+# that failed mid-read, and `esc` then `r` is the way back from both.
+TURN_UNREADABLE_HINT = "could not read this turn's tool calls - esc, then r to retry"
 
 
 class LogEntry(TypedDict):
@@ -338,22 +373,31 @@ def _render_command(entry: LogEntry, ctx: RenderCtx):
     return _danger_prefixed(cmd, normalize_cmd(cmd))
 
 
-def _render_agent(entry: LogEntry, ctx: RenderCtx):
-    """The agent tree-gutter cell for one row.
+def _agent_gutter(label: str | None, run_first: bool, run_last: bool) -> Text:
+    """One tree-gutter cell attributing a row to a subagent run.
 
-    Main-agent rows (`ctx.agent_label is None`) render blank. A subagent row
-    draws a connector glyph chosen by its position in the run: `─` for a
-    single-row run, `┌` at the top (newest), `└` at the bottom (oldest), `│`
-    for the rows between. The run's label is shown only on its first (`┌`/`─`)
-    row; continuation rows carry the connector alone.
+    A main-agent row (`label is None`) renders blank. A subagent row draws the
+    connector glyph its position in the run calls for: `─` for a single-row run,
+    `┌` on the run's first row, `└` on its last, `│` on the rows between. The
+    label rides on the first row alone, so a run reads as one block.
+
+    Factored out of `_render_agent` so the turn-detail page draws the same gutter
+    over its action list instead of a second copy of these rules. That list is
+    oldest-first where the feed is newest-first, which the glyphs do not care
+    about: they bracket a run from its first displayed row to its last.
     """
-    label = ctx.agent_label
     if label is None:
         return Text("")
-    glyph = ("─ " if ctx.run_first and ctx.run_last else
-             "┌ " if ctx.run_first else
-             "└ " if ctx.run_last else "│ ")
-    return Text(glyph + (label if ctx.run_first else ""), style=AGENT_STYLE)
+    glyph = ("─ " if run_first and run_last else
+             "┌ " if run_first else
+             "└ " if run_last else "│ ")
+    return Text(glyph + (label if run_first else ""), style=AGENT_STYLE)
+
+
+def _render_agent(entry: LogEntry, ctx: RenderCtx):
+    """The feed's agent tree-gutter cell for one row (see `_agent_gutter`), from
+    the per-row run state `build_table` puts on the ctx."""
+    return _agent_gutter(ctx.agent_label, ctx.run_first, ctx.run_last)
 
 
 COLUMNS = [
@@ -868,21 +912,29 @@ def short_agent_id(agent_id: str) -> str:
     return agent_id[:AGENT_ID_LABEL_LEN]
 
 
-def agent_label(entry: dict, agent_map: dict[str, dict]) -> str | None:
-    """Feed label for the agent that ran this command, or None for the main agent.
+def agent_id_label(agent_id: str | None, agent_map: dict[str, dict]) -> str | None:
+    """Label for one agent id, or None when it is the main agent (a falsy id).
 
     Formatted `"<short-id> <name>"`, id first so it survives the Agent column's
     ellipsis: two subagents sharing a description are still distinguishable by
     their ids. `name` is the description, falling back to the agent type, and is
     dropped when neither is known (leaving the short id alone). The full
-    description/type live on the session-detail modal (`s`)."""
-    aid = entry_agent_id(entry)
-    if not aid:
+    description/type live on the session-detail modal (`s`).
+
+    Split out of `agent_label` because the turn-detail page already HAS the id
+    (the store's `agent_id` column) rather than a log entry to read it out of."""
+    if not agent_id:
         return None
-    info = agent_map.get(aid) or {}
+    info = agent_map.get(agent_id) or {}
     name = info.get("description") or info.get("type") or ""
-    short = short_agent_id(aid)
+    short = short_agent_id(agent_id)
     return f"{short} {name}" if name else short
+
+
+def agent_label(entry: dict, agent_map: dict[str, dict]) -> str | None:
+    """Feed label for the agent that ran this command, or None for the main
+    agent (see `agent_id_label`)."""
+    return agent_id_label(entry_agent_id(entry), agent_map)
 
 
 def _find_session_pid_info(sid: str) -> dict | None:
@@ -1433,19 +1485,54 @@ def _format_command_tokens(tokens: dict) -> Text:
     return text
 
 
+def _text_lines(text: str | None) -> list[str]:
+    """A prompt body as display lines ([] for None or empty).
+
+    One definition, so the command modal (which carries its prompt as a dict) and
+    the turn page (which carries a plain string) window identical line lists."""
+    return (text or "").splitlines()
+
+
 def _prompt_lines(prompt: dict | None) -> list[str]:
-    """The prompt's text as display lines ([] when there is nothing to show)."""
+    """The prompt's text as display lines ([] when there is nothing to show,
+    including the `_tokens_unavailable` sentinel, which is a hint, not a
+    prompt)."""
     if not prompt or "unavailable" in prompt:
         return []
-    return (prompt.get("text") or "").splitlines()
+    return _text_lines(prompt.get("text"))
 
 
-def _prompt_preview(prompt: dict, limit: int = PROMPT_PREVIEW_LINES) -> tuple[list[str], int]:
-    """`(first `limit` lines, how many were left out)` for the command modal's
-    prompt panel. The remainder is reachable with Enter, so the count is shown
-    rather than dropped silently."""
-    lines = _prompt_lines(prompt)
-    return lines[:limit], max(0, len(lines) - limit)
+def _prompt_box(body, padding: tuple[int, int] = (1, 2)) -> Panel:
+    """The bordered `prompt` box shared by the command modal's preview, the
+    turn page's preview and the full-prompt view, so the three quote a prompt
+    the same way. `padding` is the one thing that varies: the turn page packs
+    a table under its box and cannot spend two rows on blank padding."""
+    return Panel(
+        body,
+        title="[dim]prompt[/dim]",
+        title_align="left",
+        border_style="grey50",
+        box=box.ROUNDED,
+        padding=padding,
+    )
+
+
+def _preview_body(lines: list[str], limit: int, can_open: bool = True):
+    """The `prompt` box's body: the first `limit` lines plus a dim footer
+    counting the ones left out, so a clipped prompt says it is clipped.
+
+    The footer names `↵` only when there is a full text to open (`can_open`):
+    on a page whose Enter would close rather than drill in, advertising it would
+    be a lie."""
+    shown, hidden = lines[:limit], max(0, len(lines) - limit)
+    text = Text("\n".join(shown)) if shown else Text("(empty)", style="dim italic")
+    if not hidden:
+        return text
+    plural = "" if hidden == 1 else "s"
+    more = f"+{hidden} more line{plural}"
+    if can_open:
+        more += "  ·  ↵ : full prompt"
+    return Group(text, Text(""), Text.from_markup(f"[dim italic]{more}[/dim italic]"))
 
 
 def _build_prompt_preview(prompt: dict) -> Panel:
@@ -1454,24 +1541,10 @@ def _build_prompt_preview(prompt: dict) -> Panel:
     lines. The `_tokens_unavailable` sentinel renders as its dim hint instead,
     so a lagging store explains itself rather than showing an empty box."""
     if "unavailable" in prompt:
-        body: Text | Group = Text(prompt["unavailable"], style="dim italic")
+        body = Text(prompt["unavailable"], style="dim italic")
     else:
-        lines, hidden = _prompt_preview(prompt)
-        text = Text("\n".join(lines)) if lines else Text("(empty)", style="dim italic")
-        if hidden:
-            plural = "" if hidden == 1 else "s"
-            body = Group(text, Text(""), Text.from_markup(
-                f"[dim italic]+{hidden} more line{plural}  ·  ↵ : full prompt[/dim italic]"))
-        else:
-            body = text
-    return Panel(
-        body,
-        title="[dim]prompt[/dim]",
-        title_align="left",
-        border_style="grey50",
-        box=box.ROUNDED,
-        padding=(1, 2),
-    )
+        body = _preview_body(_prompt_lines(prompt), PROMPT_PREVIEW_LINES)
+    return _prompt_box(body)
 
 
 def build_detail_panel(
@@ -1566,16 +1639,24 @@ def _clamp_prompt_scroll(scroll: int, line_count: int, term_height: int) -> int:
 
 
 def build_prompt_panel(
-    entry: LogEntry,
+    session_id: str,
     term_height: int,
-    prompt: dict,
+    text: str | None,
+    ts: str = "",
+    agent_id: str | None = None,
     name_map: dict[str, str] | None = None,
     color_map: dict[str, str] | None = None,
     agent_map: dict[str, dict] | None = None,
     scroll: int = 0,
 ) -> Panel:
-    """Full-screen view of the whole prompt behind a command (Enter from the
-    command modal).
+    """Full-screen view of one whole prompt (Enter from the command modal, and
+    Enter again from a Prompts-tab turn).
+
+    Takes the identity it shows (`session_id`, `agent_id`, `ts`) and the body
+    (`text`) as plain values rather than a `LogEntry`, because the two callers
+    have different rows: the command modal derives them from its log entry and
+    the store's prompt dict, the turn page from the turn itself. `agent_id` is
+    None on a main-thread turn, which drops the Agent row.
 
     A prompt runs to thousands of characters, so the body is windowed around
     `scroll` (j/k/g/G) exactly like the session modal's subagent list rather than
@@ -1583,18 +1664,18 @@ def build_prompt_panel(
     (session, subagent, prompt time) visible so it is clear WHICH turn this is.
     """
     ctx = RenderCtx(name_map=name_map, color_map=color_map)
-    lines = _prompt_lines(prompt)
+    lines = _text_lines(text)
 
     meta = Table.grid(padding=(0, 2))
     meta.add_column(style="dim", justify="right", no_wrap=True)
     meta.add_column(ratio=1)
-    meta.add_row("Session", _render_session(entry, ctx))
-    label = agent_label(entry, agent_map or {})
+    meta.add_row("Session", _session_cell(session_id, ctx))
+    label = agent_id_label(agent_id, agent_map or {})
     if label is not None:
         meta.add_row("Agent", Text(label, style=AGENT_STYLE))
     # The store hands back its own timestamp string; slice off the sub-second and
     # offset tail rather than parsing it (no fromisoformat, no pytz).
-    when = (prompt.get("ts") or "")[:19]
+    when = (ts or "")[:19]
     if when:
         meta.add_row("Sent", Text(when))
 
@@ -1615,17 +1696,9 @@ def build_prompt_panel(
 
     body = (Text("\n".join(lines[win_start:win_end])) if lines
             else Text("(empty)", style="dim italic"))
-    prompt_panel = Panel(
-        body,
-        title="[dim]prompt[/dim]",
-        title_align="left",
-        border_style="grey50",
-        box=box.ROUNDED,
-        padding=(1, 2),
-    )
 
     return Panel(
-        Group(meta, Text(""), header, prompt_panel),
+        Group(meta, Text(""), header, _prompt_box(body)),
         title=_panel_title("· prompt"),
         subtitle=Text(str(LOG_PATH), style="dim"),
         box=box.ROUNDED,
@@ -2307,6 +2380,341 @@ def build_prompts_panel(
     )
 
 
+# ---- Prompts tab: one turn's detail page (`↵`) ----
+
+# Fields a tool call's `tool_input` may carry that say what the call did, in the
+# order the turn page prefers them. Measured on a real store: `events.text` is
+# NULL for every tool the store has no `_COMMAND_FIELD` entry for (Agent - 644
+# rows - plus ToolSearch, WebFetch, WebSearch, Skill, AskUserQuestion and the MCP
+# tools), while `tool_input` is populated for every single `tool_use` row (0
+# NULLs). This list labels 1,935 of those 2,818 text-less calls, so 97% of all
+# calls end up with a label; the rest are MCP tools with keys of their own
+# (`page_id`, `channel_id`, `taskId`) and render a dim `-`.
+_ACTION_FIELDS = ("description", "file_path", "path", "pattern", "query", "url",
+                  "skill", "notebook_path", "command")
+
+
+def action_label(tool_name: str, text: str | None, tool_input: str | None) -> str:
+    """What one tool call did, in a line: the store's `text` when it has one,
+    else the first `_ACTION_FIELDS` entry of the raw `tool_input` JSON.
+
+    Resolved at RENDER time rather than at ingest on purpose: extending the
+    store's `_COMMAND_FIELD` would only label newly ingested rows, and `events`
+    can no longer be re-derived from `raw_events` (the raw payload is pruned for
+    non-snapshot lines), so every already-stored row would stay blank until a
+    full re-ingest.
+
+    `tool_name` selects nothing today - the field order above is tool-agnostic
+    and already puts `description` (the Agent tool's only useful field) first -
+    but it is what a per-tool rule would key off, and it keeps the call site
+    reading as "label this row".
+
+    Returns "" when neither source says anything: a `tool_input` that is absent,
+    is not JSON, is not an object, or carries none of the known fields. The
+    caller renders that as a dim placeholder rather than an empty cell.
+    """
+    if text:
+        return text
+    try:
+        data = json.loads(tool_input) if tool_input else None
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    for key in _ACTION_FIELDS:
+        value = data.get(key)
+        # Strings only: every field above is a path, a pattern or prose. A dict
+        # or a list under one of those names means a tool this list does not
+        # know, and dumping its JSON into the cell would be noise, not a label.
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def _short_tool_name(tool_name: str) -> str:
+    """An MCP tool's own name, without its server prefix.
+
+    Real tool names run to 63 characters
+    (`mcp__plugin_chrome-devtools-mcp_chrome-devtools__evaluate_script`), all of
+    which is server routing until the last `__`. The Tool column is narrow, so
+    keeping the prefix would ellipsize every MCP row to the same `mcp__plugin…`.
+    A plain tool name has no `__` and is returned unchanged.
+    """
+    return tool_name.rsplit("__", 1)[-1] if "__" in tool_name else tool_name
+
+
+def _action_tool_cell(action: "TurnAction") -> Text:
+    """The Tool cell: the (shortened) tool name, dim red when the call failed.
+
+    `is_error` comes from the joined `tool_result`, so a call still awaiting its
+    result renders like a successful one - which is right, since nothing has gone
+    wrong yet."""
+    name = _short_tool_name(action.tool_name or "?")
+    return Text(name, style="dim red" if action.is_error else "")
+
+
+def _action_detail_cell(action: "TurnAction") -> Text:
+    """The Detail cell: what the call did, on one line.
+
+    Bash keeps the feed's danger marker (`_danger_prefixed`), so a `rm -rf` is as
+    loud here as it is in the command feed. Whitespace is collapsed like the
+    feed's Command column, because a label can be a multi-line heredoc or a
+    subagent's paragraph-long description and this is a one-row cell.
+    """
+    label = action_label(action.tool_name, action.text, action.tool_input)
+    if not label:
+        return Text("-", style="dim")
+    body = normalize_cmd(label)
+    if action.tool_name == "Bash":
+        return _danger_prefixed(label, body)
+    return Text(body)
+
+
+def _format_duration(seconds: float) -> str:
+    """An elapsed time as `12s` / `6m 12s` / `1h 07m`."""
+    secs = max(0, int(seconds))
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m {secs % 60:02d}s"
+    return f"{secs // 3600}h {(secs % 3600) // 60:02d}m"
+
+
+def _turn_duration(start: str, end: str | None) -> str | None:
+    """How long the turn's work ran: from its prompt to the last API request the
+    store attributed to its window, or None when there is no such request or
+    either end will not parse.
+
+    `last_ts` and not `next_ts`: `next_ts` is when the user next typed, so a turn
+    answered in seconds and left on screen overnight would report 14 hours.
+    """
+    if not start or not end:
+        return None
+    try:
+        elapsed = (datetime.fromisoformat(end)
+                   - datetime.fromisoformat(start)).total_seconds()
+    except (ValueError, TypeError):
+        return None
+    return _format_duration(elapsed) if elapsed >= 0 else None
+
+
+def _turn_work_line(turn: "PromptTurn") -> Text:
+    """The Work row: `64 tool calls: 23 main, 41 across 2 subagents  ·  14 Bash`.
+
+    `turn.tools` is INCLUSIVE of `turn.subcalls` (one main-thread Bash plus two
+    subagent calls is `tools=3, subcalls=2`), so the main-thread count is a
+    SUBTRACTION. Adding the two would report 105 calls for a turn that made 64.
+
+    The Bash count is window-wide for the same reason the list's Calls column
+    says so - the query filters the whole window, subagents included - so it is
+    called out on its own rather than nested under the main-thread count, which
+    would claim subagent Bash calls for the main thread.
+    """
+    if not turn.tools:
+        return Text("no tool calls", style="dim")
+    line = Text()
+    line.append(f"{turn.tools} tool call{'' if turn.tools == 1 else 's'}", style="bold")
+    if turn.subcalls:
+        main = max(0, turn.tools - turn.subcalls)
+        line.append(
+            f": {main} main, {turn.subcalls} across {turn.agents} "
+            f"subagent{'' if turn.agents == 1 else 's'}", style="dim")
+    if turn.bash:
+        line.append(f"  ·  {turn.bash} Bash", style="dim")
+    return line
+
+
+def _turn_tokens_line(turn: "PromptTurn") -> Text:
+    """The Tokens row: the turn's generation cost and how many requests it took.
+
+    The numbers are the ones the list query already computed for this row, so
+    opening a turn costs no extra token query. `requests == 0` means the store
+    attributed no API request to the window, normally because the ingest has not
+    caught up with the turn yet - which is what PENDING_INGEST_HINT says. The
+    other half of `_tokens_unavailable` (no store at all) is unreachable here:
+    this page only exists because the store answered the list query.
+    """
+    if not turn.requests:
+        return Text(PENDING_INGEST_HINT, style="dim italic")
+    line = Text()
+    line.append(f"{turn.output_tokens:,}", style="bold")
+    line.append(" output", style="dim")
+    if turn.subagent_output_tokens:
+        line.append(f"  ·  {turn.subagent_output_tokens:,} by subagents", style="dim")
+    line.append(f"  ·  {turn.requests:,} request{'' if turn.requests == 1 else 's'}",
+                style="dim")
+    return line
+
+
+def _turn_capacity(term_height: int) -> int:
+    """Action rows that fit under the turn page's fixed header (mirrors
+    `_session_capacity`)."""
+    return max(term_height - TURN_CHROME_ROWS, MIN_VISIBLE_ROWS)
+
+
+def _clamp_turn_scroll(scroll: int, count: int, term_height: int) -> int:
+    """Clamp an action-list scroll offset to `[0, count - capacity]`.
+
+    Shared by `build_turn_panel` (display safety) and `render_panel`, which
+    writes the clamped value back so `G`'s sentinel settles on the true bottom
+    and `k` then steps up one row at a time (same contract as
+    `_clamp_session_scroll`)."""
+    capacity = _turn_capacity(term_height)
+    return max(0, min(scroll, max(0, count - capacity)))
+
+
+def build_action_table(
+    actions: list["TurnAction"],
+    agent_map: dict[str, dict] | None = None,
+) -> Table:
+    """The turn page's action list: one row per tool call, oldest-first.
+
+    Oldest-first is the order `turn_actions` returns and the order the work
+    happened in, which is what makes the page readable as a story - the opposite
+    of the feed, which is a tail and so is newest-first.
+
+    The Agent column is the feed's tree gutter (`_agent_gutter`) over runs of
+    adjacent calls sharing an `agent_id`, so a subagent's stretch of work reads
+    as one bracketed block with its label shown once. Attribution here is
+    RETROACTIVE - the ids come from the store's transcripts, so a turn from
+    before the hook learned to tag subagent commands still shows them - where the
+    feed's is forward-only.
+
+    Runs are computed over exactly the rows passed in (already windowed and
+    filtered by the caller), so the bracket closes at the bottom of the screen
+    rather than pointing off it.
+    """
+    table = Table(
+        box=box.SIMPLE_HEAVY,
+        expand=True,
+        show_edge=False,
+        pad_edge=False,
+        row_styles=["", "dim"],
+    )
+    table.add_column("Time", style="cyan", width=8, no_wrap=True)
+    table.add_column("Agent", style=AGENT_STYLE, width=20,
+                     no_wrap=True, overflow="ellipsis")
+    table.add_column("Tool", style="magenta", width=16,
+                     no_wrap=True, overflow="ellipsis")
+    table.add_column("Detail", style="white", ratio=1,
+                     no_wrap=True, overflow="ellipsis")
+
+    ids = [action.agent_id or None for action in actions]
+    labels = [agent_id_label(aid, agent_map or {}) for aid in ids]
+    for idx, action in enumerate(actions):
+        run_first = idx == 0 or ids[idx] != ids[idx - 1]
+        run_last = idx == len(actions) - 1 or ids[idx] != ids[idx + 1]
+        table.add_row(
+            Text(format_time(action.ts)),
+            _agent_gutter(labels[idx], run_first, run_last),
+            _action_tool_cell(action),
+            _action_detail_cell(action),
+        )
+    return table
+
+
+def _action_empty_state(prompts: "PromptsState") -> Text:
+    """The body when the action list has no row, saying which of the three
+    reasons it is: the store could not answer, the turn genuinely ran nothing, or
+    `b` is hiding every call."""
+    if prompts.actions is None:
+        return Text(TURN_UNREADABLE_HINT, style="dim italic")
+    if not prompts.actions:
+        text = Text("No tool calls in this turn.\n\n", style="dim italic")
+        text.append("A question, a slash command or a resumed session runs none.",
+                    style="dim")
+        return text
+    hidden = len(prompts.actions)
+    text = Text("No Bash calls in this turn.\n\n", style="dim italic")
+    text.append(f"{hidden} other tool call{'' if hidden == 1 else 's'} hidden - "
+                "press b to show everything.", style="dim")
+    return text
+
+
+def build_turn_panel(
+    prompts: "PromptsState",
+    term_height: int,
+    name_map: dict[str, str] | None = None,
+    color_map: dict[str, str] | None = None,
+    agent_map: dict[str, dict] | None = None,
+) -> Panel:
+    """One turn's detail page: what the main agent and its subagents did in
+    response to a single prompt (`↵` on the Prompts tab).
+
+    Takes the tab's state because everything on the page is in it: `detail` is
+    the turn (and must be set - this is only rendered while that modal is open),
+    `actions`/`detail_text` are what the one store open on `↵` loaded,
+    `bash_only` and `detail_scroll` are the view's own keys.
+
+    Header rows are the turn's identity, the Work line (which SUBTRACTS to get
+    the main-thread count, see `_turn_work_line`) and the Tokens line, then the
+    prompt quoted in a box, then the action list windowed around `detail_scroll`
+    like the session modal's subagent list. The prompt box falls back to the
+    row's own 400-char preview if the full text did not load, so the page always
+    says which prompt it is describing.
+    """
+    turn = prompts.detail
+    ctx = RenderCtx(name_map=name_map, color_map=color_map)
+
+    meta = Table.grid(padding=(0, 2))
+    meta.add_column(style="dim", justify="right", no_wrap=True)
+    meta.add_column(ratio=1)
+    ident = Text()
+    ident.append_text(_session_cell(turn.session_id, ctx))
+    if turn.project:
+        # append (not from_markup) does not parse markup, so a project dir named
+        # `[wip]` survives (see the note under `Column`).
+        ident.append(f"  {short_path(turn.project, PROJECT_LABEL_WIDTH)}", style="dim")
+    ident.append(f"  ·  sent {format_time(turn.ts)}", style="dim")
+    took = _turn_duration(turn.ts, turn.last_ts)
+    if took:
+        ident.append(f"  ·  ran {took}", style="dim")
+    meta.add_row("Session", ident)
+    meta.add_row("Work", _turn_work_line(turn))
+    meta.add_row("Tokens", _turn_tokens_line(turn))
+
+    lines = _text_lines(prompts.detail_text) or _text_lines(turn.preview)
+    prompt_box = _prompt_box(
+        _preview_body(lines, TURN_PROMPT_PREVIEW_LINES,
+                      can_open=bool(prompts.detail_text)),
+        padding=(0, 2),
+    )
+
+    actions = prompts.visible_actions()
+    shown = len(actions)
+    scroll = _clamp_turn_scroll(prompts.detail_scroll, shown, term_height)
+    win_start = scroll
+    win_end = min(shown, scroll + _turn_capacity(term_height))
+
+    header = Text.from_markup(f"[bold]Actions[/bold] [dim]({shown})[/dim]")
+    if prompts.bash_only:
+        hidden = len(prompts.actions or ()) - shown
+        header.append(f"  bash only, {hidden} hidden" if hidden else "  bash only",
+                      style="dim italic")
+    if (win_start, win_end) != (0, shown):
+        header.append(f"  {win_start + 1}-{win_end} of {shown}", style="dim")
+
+    content: Text | Table = (
+        build_action_table(actions[win_start:win_end], agent_map) if actions
+        else _action_empty_state(prompts))
+
+    # `↵` drills into the full prompt when there is one and closes the page when
+    # there is not, so the hint has to say which of the two it is doing here.
+    keys = ("esc / q : back    ↵ : full prompt" if prompts.detail_text
+            else "esc / q / ↵ : back")
+    keys += "    j/k g/G : scroll    b : "
+    keys += "all tools" if prompts.bash_only else "bash only"
+
+    return Panel(
+        Group(meta, Text(""), prompt_box, header, content,
+              Text.from_markup(f"[dim italic]{keys}[/dim italic]")),
+        title=_panel_title("· turn"),
+        box=box.ROUNDED,
+        padding=(1, 2),
+        height=term_height,
+    )
+
+
 # ==== Input decoding (read_key) ====
 
 
@@ -2490,6 +2898,7 @@ class Action(enum.Enum):
     OPEN_DETAIL = enum.auto()       # command modal just opened; load its token cost + prompt
     OPEN_SESSION_DETAIL = enum.auto()  # session modal just opened; load its token total
     LOAD_PROMPTS = enum.auto()      # (re)read the prompts tab's turn list from the store
+    OPEN_PROMPT = enum.auto()       # turn modal just opened; load its actions + full prompt
     NONE = enum.auto()
 
 
@@ -2632,18 +3041,26 @@ class PromptsState:
     session_filter: str | None = None   # None = every session, interleaved newest-first
     hide_empty: bool = False            # drop turns with 0 tool calls
     detail: PromptTurn | None = None    # the open turn (modal)
+    # None until the store answers, and again if it could not: an empty list is a
+    # turn that really ran no tool call, which the page says differently.
     actions: list[TurnAction] | None = None
     detail_text: str | None = None      # full prompt text for the open turn
     detail_scroll: int = 0
+    bash_only: bool = False             # `b`: show only the turn's Bash calls
     prompt_open: bool = False           # the nested full-prompt view
     prompt_scroll: int = 0
 
     def close_detail(self) -> None:
-        """Drop the open turn's modal state, keeping the loaded list intact."""
+        """Drop the open turn's modal state, keeping the loaded list intact.
+
+        Everything the turn page owns resets, `bash_only` included: the filter
+        belongs to the turn being read, not to the tab, so the next turn opens
+        showing everything it did."""
         self.detail = None
         self.actions = None
         self.detail_text = None
         self.detail_scroll = 0
+        self.bash_only = False
         self.prompt_open = False
         self.prompt_scroll = 0
 
@@ -2672,6 +3089,22 @@ class PromptsState:
         """How many loaded rows the current filters keep off screen (0 when none),
         so the header can say what it is not showing."""
         return len(self.rows) - len(self.visible_rows())
+
+    def visible_actions(self) -> list[TurnAction]:
+        """The open turn's calls, minus the non-Bash ones while `bash_only` is on.
+
+        Filtered in memory over what `↵` already loaded, exactly like
+        `visible_rows`: the predicate is `tool_name == 'Bash'` on a field every
+        action carries, so re-querying the store for it would cost a connection
+        (and a chance of colliding with the ingest's write lock) to compute what
+        is already here. Empty for a turn whose actions never loaded, so the
+        panel's empty state - not this - is what tells those two apart.
+        """
+        if self.actions is None:
+            return []
+        if not self.bash_only:
+            return list(self.actions)
+        return [a for a in self.actions if a.tool_name == "Bash"]
 
     def selected(self) -> PromptTurn | None:
         """The row the cursor points at, or None when nothing is on screen."""
@@ -2965,6 +3398,60 @@ def _apply_search_key(state: AppState, search: SearchState, ch: str) -> Action:
     return Action.NONE
 
 
+def _apply_turn_key(state: AppState, prompts: PromptsState, ch: str) -> Action:
+    """Handle one keypress while a Prompts-tab turn is open (mutation only).
+
+    Two depths, the same contract the command modal's full-prompt view has: on
+    the turn page `↵` drills into the whole prompt (when there is one to open),
+    `esc` steps back to the list and `q` closes outright; inside the prompt view
+    `esc`/`↵` step back ONE level to the turn and `q` still closes everything.
+    Ctrl-C quits from either.
+
+    `j`/`k`/`g`/`G` scroll whichever list is on top - the actions or the prompt
+    lines - and `b` filters the actions to Bash. Both offsets are clamped for
+    display in the builders and written back by `render_panel`, so `G`'s sentinel
+    settles on the true bottom and `k` then steps up one row.
+    """
+    if prompts.prompt_open:
+        if ch in ("\x1b", "\r", "\n"):
+            prompts.prompt_open = False
+            prompts.prompt_scroll = 0
+        elif ch == "q":
+            state.close_modals()
+        elif ch in ("j", "down"):
+            prompts.prompt_scroll += 1
+        elif ch in ("k", "up"):
+            prompts.prompt_scroll = max(0, prompts.prompt_scroll - 1)
+        elif ch == "g":
+            prompts.prompt_scroll = 0
+        elif ch == "G":
+            prompts.prompt_scroll = 10**9  # clamped in build_prompt_panel
+        return Action.NONE
+    if ch in ("\r", "\n") and prompts.detail_text:
+        # Enter opens the full prompt when this turn HAS one; with nothing to
+        # open it keeps the one-key exit every other modal gives it.
+        prompts.prompt_open = True
+        prompts.prompt_scroll = 0
+        return Action.NONE
+    if ch in ("\x1b", "q", "\r", "\n"):
+        state.close_modals()
+    elif ch in ("j", "down"):
+        prompts.detail_scroll += 1
+    elif ch in ("k", "up"):
+        prompts.detail_scroll = max(0, prompts.detail_scroll - 1)
+    elif ch == "g":
+        prompts.detail_scroll = 0
+    elif ch == "G":
+        prompts.detail_scroll = 10**9  # clamped in build_turn_panel
+    elif ch == "b":
+        # Bash-only, filtered in memory (see `visible_actions`): no store read,
+        # so the key is free to be held. The list just changed length, so start
+        # the shorter one at the top rather than mid-way down a list that ended.
+        prompts.bash_only = not prompts.bash_only
+        prompts.detail_scroll = 0
+    return Action.NONE
+
+
 def _apply_modal_key(state: AppState, ch: str) -> Action:
     """Handle one keypress while a full-screen modal is open (mutation only).
 
@@ -2976,9 +3463,14 @@ def _apply_modal_key(state: AppState, ch: str) -> Action:
     prompts list too, so one handler answers wherever the modal was opened from
     (otherwise a modal opened on the prompts tab would be a trap, since that
     tab's branch runs before this one).
+
+    The prompts turn has keys of its own (scroll, `b`, its own drill-in), so it
+    is handed to `_apply_turn_key` before the shared rules below.
     """
     if ch == "\x03":
         return Action.QUIT
+    if state.prompts.detail is not None:
+        return _apply_turn_key(state, state.prompts, ch)
     if state.detail_prompt_open:
         # The full-prompt view (drilled into from the command modal) owns its
         # keys: esc / enter step back one level to the command, `q` still
@@ -3037,10 +3529,7 @@ def _apply_prompts_key(state: AppState, prompts: PromptsState, ch: str,
 
     The feed-only keys are deliberately absent: `c` (clear) belongs to the log
     tail, and `/` (search) and `f` (folder) need a row's cwd and a command's file
-    list, which a turn row does not carry. `↵` (open a turn) is advertised in the
-    status hints and still falls through to NONE: the turn view is not built yet,
-    and setting `prompts.detail` with no renderer for it would swallow every key
-    with nothing to show.
+    list, which a turn row does not carry.
     """
     if state.modal_open():
         return _apply_modal_key(state, ch)
@@ -3086,6 +3575,17 @@ def _apply_prompts_key(state: AppState, prompts: PromptsState, ch: str,
         prompts.cursor = 0
         prompts.scroll_offset = 0
         return Action.LOAD_PROMPTS
+    elif ch in ("\r", "\n"):
+        # Open the turn's detail page; main() loads its actions and full prompt
+        # (OPEN_PROMPT) so this stays pure and never touches duckdb itself. Once
+        # `detail` is set `modal_open()` swallows the rest of a held Enter, so a
+        # key-repeat burst costs exactly one store read.
+        turn = prompts.selected()
+        if turn is None:
+            return Action.NONE
+        prompts.close_detail()   # a fresh page: no scroll, no filter, no stale text
+        prompts.detail = turn
+        return Action.OPEN_PROMPT
     elif ch.isdigit():
         # toggle_col resolves this tab's own column dict and ignores a key it has
         # no column for, so no digit here can hide a column of the feed.
@@ -3273,16 +3773,6 @@ def _with_store(fn, on_error=None):
         return None
 
 
-# Status/hint lines for a store that cannot answer. One definition each, so the
-# modals, the prompts header and the empty states never drift apart in wording.
-NO_STORE_HINT = "no audit store yet - run: claude-trail ingest"
-PENDING_INGEST_HINT = "pending ingest (store lags the live feed)"
-# Matches the CLI's `store busy:` prefix for the same condition (a lock collision
-# against the single writer), which is routine at the 30s ingest cadence.
-STORE_BUSY_HINT = "store busy: an ingest is writing"
-STORE_BUSY_KEPT_HINT = f"{STORE_BUSY_HINT} - kept the last snapshot"
-
-
 def _tokens_unavailable() -> dict:
     """Sentinel value for when the store has no answer (shared by the Tokens
     rows and the prompt panel): says WHY the data is missing instead of silently
@@ -3415,6 +3905,50 @@ def _refresh_prompts(prompts: PromptsState, max_rows: int) -> None:
     prompts.clamp(max_rows)
 
 
+def _cap_prompt_text(text: str | None, cap: int = PROMPT_TEXT_CHAR_CAP) -> str | None:
+    """`text`, truncated to `cap` chars with a line saying what was dropped.
+
+    `turn_prompt_text` has no cap of its own and the longest main-thread turn
+    measured in a real store is 646,245 chars, so this is where the TUI decides
+    how much it is willing to hold and re-split every frame. The cut is stated in
+    the text rather than made silently: a prompt that just stops mid-sentence
+    reads like data loss.
+    """
+    if not text or len(text) <= cap:
+        return text
+    dropped = len(text) - cap
+    return (text[:cap]
+            + f"\n\n… {dropped:,} more characters not shown "
+              f"({cap:,} of {len(text):,} kept)")
+
+
+def _load_turn_detail(
+    turn: PromptTurn | None,
+) -> tuple[list[TurnAction] | None, str | None]:
+    """`(actions, prompt_text)` for one turn, from ONE read-only store open.
+
+    Loaded when Action.OPEN_PROMPT fires (`↵` on a turn row), so `apply_key`
+    stays pure and both halves of the page come from a single connect/query/close
+    - the same one-open-per-modal rule `_load_command_detail` follows.
+
+    `actions` is None when the store could not answer at all (missing, busy,
+    unreadable) and `[]` when the turn genuinely ran no tool call; the page says
+    those differently, so the distinction has to survive this far. `prompt_text`
+    is capped (see `_cap_prompt_text`) before it ever reaches the view.
+    """
+    if turn is None or not turn.session_id or not turn.ts:
+        return None, None
+
+    def query(con):
+        from claude_trail_store import turn_actions, turn_prompt_text
+        rows = turn_actions(con, turn.session_id, turn.ts, turn.next_ts)
+        text = turn_prompt_text(con, turn.event_id) if turn.event_id else None
+        return [TurnAction.from_row(row) for row in rows], text
+
+    actions, text = _with_store(query) or (None, None)
+    return actions, _cap_prompt_text(text)
+
+
 def _prompts_refresh_due(prompts: PromptsState, now: float | None = None) -> bool:
     """True when the Prompts tab should read the store again: never tried, or the
     last attempt was more than PROMPTS_AUTO_REFRESH ago.
@@ -3495,8 +4029,11 @@ def main():
                     console.height,
                 )
                 return build_prompt_panel(
-                    state.detail_entry, console.height, state.detail_prompt,
-                    name_map, color_map, agent_map,
+                    state.detail_entry.get("session_id", ""), console.height,
+                    (state.detail_prompt or {}).get("text"),
+                    ts=(state.detail_prompt or {}).get("ts") or "",
+                    agent_id=entry_agent_id(state.detail_entry),
+                    name_map=name_map, color_map=color_map, agent_map=agent_map,
                     scroll=state.detail_prompt_scroll,
                 )
             return build_detail_panel(
@@ -3505,6 +4042,28 @@ def main():
             )
         if state.db_info is not None:
             return build_db_panel(state.db_info, console.height)
+        if state.prompts.detail is not None:
+            turn = state.prompts.detail
+            if state.prompts.prompt_open:
+                # Same clamp-and-write-back contract as the command modal's
+                # full-prompt view, over this turn's own text.
+                state.prompts.prompt_scroll = _clamp_prompt_scroll(
+                    state.prompts.prompt_scroll,
+                    len(_text_lines(state.prompts.detail_text)),
+                    console.height,
+                )
+                return build_prompt_panel(
+                    turn.session_id, console.height, state.prompts.detail_text,
+                    ts=turn.ts, name_map=name_map, color_map=color_map,
+                    agent_map=agent_map, scroll=state.prompts.prompt_scroll,
+                )
+            state.prompts.detail_scroll = _clamp_turn_scroll(
+                state.prompts.detail_scroll,
+                len(state.prompts.visible_actions()),
+                console.height,
+            )
+            return build_turn_panel(
+                state.prompts, console.height, name_map, color_map, agent_map)
         if state.tab == "prompts":
             return build_prompts_panel(
                 state.prompts, console.height, state.visible_cols_for("prompts"),
@@ -3598,9 +4157,10 @@ def main():
                     max_rows = _tab_row_count(state.tab, console.height)
                     quit_now = False
                     acted = False
-                    # Set by LOAD_PROMPTS in the drain below, performed once
-                    # after it (see the refresh block further down).
+                    # Set by LOAD_PROMPTS / OPEN_PROMPT in the drain below, each
+                    # performed once after it (see the refresh block below).
                     reload_prompts = False
+                    reload_turn = False
                     if interactive:
                         ready, _, _ = select.select([fd], [], [], POLL_INTERVAL)
                         # Drain every buffered keystroke before rendering, so
@@ -3655,6 +4215,14 @@ def main():
                             elif action is Action.OPEN_SESSION_DETAIL:
                                 state.session_tokens = _load_session_tokens(
                                     state.session_detail)
+                            elif action is Action.OPEN_PROMPT:
+                                # Only FLAG it, like LOAD_PROMPTS. Opening this
+                                # modal is NOT self-limiting the way `d`/`s` are:
+                                # a turn with no prompt text to drill into gives
+                                # `↵` back its close-the-page meaning, so a held
+                                # key alternates open/close and would ask for a
+                                # fresh store read every other press.
+                                reload_turn = True
                             elif action is Action.LOAD_PROMPTS:
                                 # Only FLAG it: the store read is ~275ms and this
                                 # loop exists to coalesce a burst of buffered
@@ -3702,8 +4270,27 @@ def main():
                                 and _prompts_refresh_due(state.prompts))):
                         _refresh_prompts(state.prompts, prompt_rows)
 
+                    # The open turn's page, same one-read-per-frame rule. Loaded
+                    # for whatever turn the drain ENDED on, so a burst that
+                    # walked through several of them pays for the last one only;
+                    # a drain that closed the page again loads nothing (
+                    # `_load_turn_detail(None)` is a no-op returning None, None).
+                    if reload_turn:
+                        (state.prompts.actions,
+                         state.prompts.detail_text) = _load_turn_detail(
+                             state.prompts.detail)
+
                     name_map = load_session_names()
                     session_ids = {e.get("session_id", "") for e in state.entries}
+                    # An open turn's session is usually NOT in the feed (the
+                    # prompts list interleaves every session in the store, the
+                    # feed only those that ran a Bash command), so add it while
+                    # its page is up: without it the action gutter would have no
+                    # descriptions for that session's subagents. Both loaders are
+                    # cached and accumulate, so this costs one directory scan per
+                    # cache window and the labels stay resolvable afterwards.
+                    if state.prompts.detail is not None:
+                        session_ids.add(state.prompts.detail.session_id)
                     color_map = load_session_colors(session_ids)
                     agent_map = load_agent_labels(session_ids)
 
