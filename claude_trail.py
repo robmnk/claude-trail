@@ -124,15 +124,18 @@ SESSION_CHROME_ROWS = 17
 # can still outgrow its rows; the crop then eats body lines, never the header.
 PROMPT_CHROME_ROWS = 14
 # Same accounting for the turn-detail page (`↵` on the Prompts tab), whose body
-# is an action table under a fixed header: 2 outer borders + 2 outer padding +
-# 3 meta rows (Session / Work / Tokens) + 1 blank + the prompt box (2 borders +
-# TURN_PROMPT_PREVIEW_LINES lines + 1 blank + 1 "+N lines" footer) + the Actions
-# header + the table's own header row and rule + 1 hint. Worst case like
-# SESSION_CHROME_ROWS: a short prompt loses the box's footer and its blank, and
-# those two rows go unused. Measured by rendering, not counted: 17 crops the hint
-# at every width, 18 keeps it from 76 columns up (below that the meta rows wrap
-# and take the hint's row, the same narrow-terminal trade the other panels make).
-TURN_CHROME_ROWS = 18
+# is an action table under a fixed header - but only the FIXED part of it:
+# 2 outer borders + 2 outer padding + 3 meta rows (Session / Work / Tokens) +
+# 1 blank + the Actions header + the table's own header row and rule + 1 hint.
+# The prompt box on top of that is not a constant, because its height follows the
+# prompt: `_prompt_box_rows` measures it, and `_turn_capacity` subtracts both.
+# Reserving the box's 6-row worst case here instead (the old `18`) cost the list
+# 3 rows on every one-line prompt, which is 135 of the newest 200 turns in a real
+# store - a third of the usable rows at h=24. Measured by rendering, not counted:
+# one row less crops the hint at every width, this keeps it from 76 columns up
+# (below that the meta rows wrap and take the hint's row, the same narrow-terminal
+# trade the other panels make).
+TURN_CHROME_ROWS = 12
 MIN_VISIBLE_ROWS = 3
 # Lines of the triggering prompt shown in the command modal before it says how
 # many are hidden; `Enter` opens the rest in the scrollable full-prompt view.
@@ -1517,15 +1520,29 @@ def _prompt_box(body, padding: tuple[int, int] = (1, 2)) -> Panel:
     )
 
 
-def _preview_body(lines: list[str], limit: int, can_open: bool = True):
+def _preview_body(lines: list[str], limit: int, can_open: bool = True,
+                  no_wrap: bool = False):
     """The `prompt` box's body: the first `limit` lines plus a dim footer
     counting the ones left out, so a clipped prompt says it is clipped.
 
     The footer names `↵` only when there is a full text to open (`can_open`):
     on a page whose Enter would close rather than drill in, advertising it would
-    be a lie."""
+    be a lie.
+
+    `no_wrap` ellipsizes each quoted line instead of wrapping it, which makes the
+    box exactly one row per line at any width. The turn page needs that: it packs
+    a windowed table underneath and sizes the window from `_prompt_box_rows`, so
+    a prompt whose opening line is 300 characters must not quietly claim three
+    rows and crop the list's last row and the key hints. The command modal has no
+    list under its box and keeps wrapping (the full text is one `↵` away in both).
+    """
     shown, hidden = lines[:limit], max(0, len(lines) - limit)
-    text = Text("\n".join(shown)) if shown else Text("(empty)", style="dim italic")
+    if not shown:
+        text = Text("(empty)", style="dim italic")
+    elif no_wrap:
+        text = Text("\n".join(shown), no_wrap=True, overflow="ellipsis")
+    else:
+        text = Text("\n".join(shown))
     if not hidden:
         return text
     plural = "" if hidden == 1 else "s"
@@ -2437,8 +2454,21 @@ def _short_tool_name(tool_name: str) -> str:
     Real tool names run to 63 characters
     (`mcp__plugin_chrome-devtools-mcp_chrome-devtools__evaluate_script`), all of
     which is server routing until the last `__`. The Tool column is narrow, so
-    keeping the prefix would ellipsize every MCP row to the same `mcp__plugin…`.
-    A plain tool name has no `__` and is returned unchanged.
+    keeping the prefix would ellipsize every MCP row to the same `mcp__plugin…`:
+    18 of the 77 distinct tool names in a real store are MCP ones, and they would
+    all read alike. A plain tool name has no `__` and is returned unchanged.
+
+    Known limit, deliberately not fixed: dropping the server can COLLIDE two
+    tools whose own names match. In a real store that is
+    `mcp__plugin_linear_linear__authenticate`,
+    `mcp__plugin_Notion_notion__authenticate` and
+    `mcp__plugin_slack_slack__authenticate`, which all render `authenticate` -
+    7 rows out of 31,279 tool calls (0.02%). (Two further collisions,
+    `notion-fetch` and `notion-update-page`, are one tool reached under two
+    server aliases, so they are not really collisions at all.) Disambiguating
+    would mean keeping part of the prefix on those rows, which trades a legible
+    column for every MCP call against 0.02% of them; the turn's full detail is
+    one row over in the Detail cell.
     """
     return tool_name.rsplit("__", 1)[-1] if "__" in tool_name else tool_name
 
@@ -2546,20 +2576,53 @@ def _turn_tokens_line(turn: "PromptTurn") -> Text:
     return line
 
 
-def _turn_capacity(term_height: int) -> int:
-    """Action rows that fit under the turn page's fixed header (mirrors
-    `_session_capacity`)."""
-    return max(term_height - TURN_CHROME_ROWS, MIN_VISIBLE_ROWS)
+def _turn_prompt_lines(prompts: "PromptsState") -> list[str]:
+    """The prompt lines the turn page quotes: the full text when `↵` loaded one,
+    else the row's own 400-char preview.
+
+    One definition, because the page's geometry (`_prompt_box_rows`) and its
+    render have to agree on the count - a box measured off the full text while
+    the page quotes the shorter preview would mis-size the action list."""
+    turn = prompts.detail
+    return (_text_lines(prompts.detail_text)
+            or _text_lines(turn.preview if turn else None))
 
 
-def _clamp_turn_scroll(scroll: int, count: int, term_height: int) -> int:
+def _prompt_box_rows(lines: list[str], limit: int = TURN_PROMPT_PREVIEW_LINES) -> int:
+    """Rows the turn page's prompt box occupies: its 2 borders plus the body
+    `_preview_body` builds from `lines` (the quoted lines, or the one-row
+    `(empty)` placeholder, plus a blank and the `+N more lines` footer when it
+    hides any).
+
+    Measured per turn rather than reserved at the worst case, because the worst
+    case is rare: 135 of the newest 200 turns in a real store have a one-line
+    prompt (151 have two or fewer), where a fixed 6-row reservation left 3 of the
+    9 action rows at h=24 permanently blank. It can be exact at any width because
+    the page quotes its prompt `no_wrap` - one display row per line (see
+    `_preview_body`)."""
+    body = min(len(lines), limit) or 1        # `(empty)` still costs its row
+    return 2 + body + (2 if len(lines) > limit else 0)
+
+
+def _turn_capacity(term_height: int, prompt_rows: int) -> int:
+    """Action rows that fit under the turn page's header (mirrors
+    `_session_capacity`).
+
+    `prompt_rows` is what the quoted prompt costs (`_prompt_box_rows`); it is a
+    parameter and not part of TURN_CHROME_ROWS because it varies per turn."""
+    return max(term_height - TURN_CHROME_ROWS - prompt_rows, MIN_VISIBLE_ROWS)
+
+
+def _clamp_turn_scroll(scroll: int, count: int, term_height: int,
+                       prompt_rows: int) -> int:
     """Clamp an action-list scroll offset to `[0, count - capacity]`.
 
     Shared by `build_turn_panel` (display safety) and `render_panel`, which
     writes the clamped value back so `G`'s sentinel settles on the true bottom
     and `k` then steps up one row at a time (same contract as
-    `_clamp_session_scroll`)."""
-    capacity = _turn_capacity(term_height)
+    `_clamp_session_scroll`). Both pass the same `prompt_rows`, or the clamp
+    would stop `G` short of the bottom row the panel actually draws."""
+    capacity = _turn_capacity(term_height, prompt_rows)
     return max(0, min(scroll, max(0, count - capacity)))
 
 
@@ -2652,6 +2715,11 @@ def build_turn_panel(
     like the session modal's subagent list. The prompt box falls back to the
     row's own 400-char preview if the full text did not load, so the page always
     says which prompt it is describing.
+
+    The box's height follows the prompt (a one-line prompt has no `+N more lines`
+    footer), so the window is sized against what the box will actually take
+    (`_prompt_box_rows`) rather than against its worst case - which is where a
+    short prompt got its three blank rows back.
     """
     turn = prompts.detail
     ctx = RenderCtx(name_map=name_map, color_map=color_map)
@@ -2673,18 +2741,19 @@ def build_turn_panel(
     meta.add_row("Work", _turn_work_line(turn))
     meta.add_row("Tokens", _turn_tokens_line(turn))
 
-    lines = _text_lines(prompts.detail_text) or _text_lines(turn.preview)
+    lines = _turn_prompt_lines(prompts)
+    prompt_rows = _prompt_box_rows(lines)
     prompt_box = _prompt_box(
         _preview_body(lines, TURN_PROMPT_PREVIEW_LINES,
-                      can_open=bool(prompts.detail_text)),
+                      can_open=bool(prompts.detail_text), no_wrap=True),
         padding=(0, 2),
     )
 
     actions = prompts.visible_actions()
     shown = len(actions)
-    scroll = _clamp_turn_scroll(prompts.detail_scroll, shown, term_height)
+    scroll = _clamp_turn_scroll(prompts.detail_scroll, shown, term_height, prompt_rows)
     win_start = scroll
-    win_end = min(shown, scroll + _turn_capacity(term_height))
+    win_end = min(shown, scroll + _turn_capacity(term_height, prompt_rows))
 
     header = Text.from_markup(f"[bold]Actions[/bold] [dim]({shown})[/dim]")
     if prompts.bash_only:
@@ -3906,20 +3975,33 @@ def _refresh_prompts(prompts: PromptsState, max_rows: int) -> None:
 
 
 def _cap_prompt_text(text: str | None, cap: int = PROMPT_TEXT_CHAR_CAP) -> str | None:
-    """`text`, truncated to `cap` chars with a line saying what was dropped.
+    """`text`, truncated to `cap` chars, led by a line saying what was cut.
 
     `turn_prompt_text` has no cap of its own and the longest main-thread turn
     measured in a real store is 646,245 chars, so this is where the TUI decides
     how much it is willing to hold and re-split every frame. The cut is stated in
     the text rather than made silently: a prompt that just stops mid-sentence
     reads like data loss.
+
+    The notice goes FIRST, and that placement is the whole point. It used to be
+    appended, which is the one line `build_prompt_panel` cannot show: the view
+    windows by LOGICAL line while the Panel crops by DISPLAY row and prompt lines
+    wrap, so the last window renders fewer lines than it holds and a trailing
+    notice is the first casualty - measured absent at (h,w) of 24x80, 24x120,
+    40x80, 40x120 and 50x100, worse on a taller terminal, and unreachable by any
+    key because `_clamp_prompt_scroll` stops the offset at the last screenful.
+    418 of the 3,716 turns the list can reach (11.2%) are over the cap, so that
+    was a silent cut on better than one turn in ten. The crop eats the BOTTOM of
+    the window, so the first line is the one row it can never take, and the view
+    opens at scroll 0 (`_apply_turn_key` sets it), which puts the notice on the
+    first frame at every geometry down to MIN_VISIBLE_ROWS.
     """
     if not text or len(text) <= cap:
         return text
     dropped = len(text) - cap
-    return (text[:cap]
-            + f"\n\n… {dropped:,} more characters not shown "
-              f"({cap:,} of {len(text):,} kept)")
+    return (f"… showing the first {cap:,} of {len(text):,} characters "
+            f"({dropped:,} not shown)\n\n"
+            + text[:cap])
 
 
 def _load_turn_detail(
@@ -3960,6 +4042,80 @@ def _prompts_refresh_due(prompts: PromptsState, now: float | None = None) -> boo
     """
     age = _snapshot_age(prompts.checked_at, now)
     return age is None or age >= PROMPTS_AUTO_REFRESH
+
+
+@dataclass
+class DrainFlags:
+    """What one drained burst of keys asks the frame to do ONCE, after the loop.
+
+    main() drains every buffered keystroke before rendering, so holding a key is
+    one render instead of one per press. An action whose work is a store open has
+    to be coalesced the same way, or a key-repeat burst spends a query per press
+    inside a single frozen drain.
+    """
+
+    reload_prompts: bool = False   # re-read the tab's turn list (`r`, `S`, tab entry)
+    reload_turn: bool = False      # re-read the open turn's actions + full prompt
+
+
+def _drain_action(action: Action, flags: DrainFlags) -> bool:
+    """Fold one drained action into `flags`; True when it was COALESCED.
+
+    True means main() must not perform the action inline - the work happens once
+    per frame in `_frame_store_reads`. False means the drain performs it itself,
+    which is right for the rest: an editor launch or a search is what the user
+    asked for on that press, and `d`/`s` open a modal that swallows the repeat,
+    so they are self-limiting already.
+
+    The two coalesced ones are the two that are neither.  `LOAD_PROMPTS` reads
+    the list (~275ms; 10 buffered `r` once measured 3.21s frozen inside one
+    drain, with no redraw).  `OPEN_PROMPT` reads one turn (~44ms) and is NOT
+    self-limiting: a turn whose prompt text has not loaded gives `↵` back its
+    close-the-page meaning, so a repeat alternates open/close and would ask for a
+    fresh read every other press.
+    """
+    if action is Action.LOAD_PROMPTS:
+        flags.reload_prompts = True
+        return True
+    if action is Action.OPEN_PROMPT:
+        flags.reload_turn = True
+        return True
+    return False
+
+
+def _frame_store_reads(state: AppState, flags: DrainFlags, list_rows: int) -> None:
+    """Perform the store reads this frame owes: at most one of each.
+
+    The other half of the split `_drain_action` starts, kept out of main()'s loop
+    so both halves are testable - a burst of ten `↵` ends in exactly one
+    `_load_turn_detail`, and nothing here can be reached from the drain's inline
+    branches.
+
+    The prompts snapshot is either an explicit request coalesced out of the drain
+    (`r`, `S`, entering the tab) or the idle auto-refresh. `_load_prompt_turns`
+    connects, queries and closes on every call (there is no warm-connection
+    path), measured ~270-310ms steady state and ~600-660ms cold on a 1.08 GiB
+    store. Still synchronous, which the codebase prefers over a background thread
+    (state stays pure and main() keeps every side effect); PROMPTS_AUTO_REFRESH is
+    the ingest cadence, so the idle case fires rarely enough that the stall is not
+    felt. Both are gated on the tab being the one on screen, so a drain that
+    entered and left it again pays nothing. Only the idle case is modal-gated: an
+    explicit request stands even if a later key in the same drain opened a modal
+    over the list (one read, unseen until it closes), while a modal can never make
+    the tab poll the store on its own.
+
+    The open turn's page follows the same one-read-per-frame rule, for whatever
+    turn the drain ENDED on: a burst that walked through several pays for the
+    last one only, and a drain that closed the page again loads nothing
+    (`_load_turn_detail(None)` is a no-op returning `None, None`).
+    """
+    if state.tab == "prompts" and (
+            flags.reload_prompts
+            or (not state.modal_open() and _prompts_refresh_due(state.prompts))):
+        _refresh_prompts(state.prompts, list_rows)
+    if flags.reload_turn:
+        (state.prompts.actions,
+         state.prompts.detail_text) = _load_turn_detail(state.prompts.detail)
 
 
 def _signal_exit(signum, frame):
@@ -4057,10 +4213,13 @@ def main():
                     ts=turn.ts, name_map=name_map, color_map=color_map,
                     agent_map=agent_map, scroll=state.prompts.prompt_scroll,
                 )
+            # The same prompt-box height build_turn_panel will measure, so the
+            # written-back offset matches the rows it draws.
             state.prompts.detail_scroll = _clamp_turn_scroll(
                 state.prompts.detail_scroll,
                 len(state.prompts.visible_actions()),
                 console.height,
+                _prompt_box_rows(_turn_prompt_lines(state.prompts)),
             )
             return build_turn_panel(
                 state.prompts, console.height, name_map, color_map, agent_map)
@@ -4157,10 +4316,9 @@ def main():
                     max_rows = _tab_row_count(state.tab, console.height)
                     quit_now = False
                     acted = False
-                    # Set by LOAD_PROMPTS / OPEN_PROMPT in the drain below, each
-                    # performed once after it (see the refresh block below).
-                    reload_prompts = False
-                    reload_turn = False
+                    # Set by LOAD_PROMPTS / OPEN_PROMPT in the drain below
+                    # (`_drain_action`), each performed once after it.
+                    flags = DrainFlags()
                     if interactive:
                         ready, _, _ = select.select([fd], [], [], POLL_INTERVAL)
                         # Drain every buffered keystroke before rendering, so
@@ -4175,7 +4333,11 @@ def main():
                             if action is Action.QUIT:
                                 quit_now = True
                                 break
-                            if action is Action.OPEN_SESSION:
+                            if _drain_action(action, flags):
+                                # A store read: only FLAGGED here, performed once
+                                # per frame below, however many keys asked for it.
+                                pass
+                            elif action is Action.OPEN_SESSION:
                                 sid = state.selected_session_id()
                                 if sid:
                                     open_session_log(sid)
@@ -4215,22 +4377,6 @@ def main():
                             elif action is Action.OPEN_SESSION_DETAIL:
                                 state.session_tokens = _load_session_tokens(
                                     state.session_detail)
-                            elif action is Action.OPEN_PROMPT:
-                                # Only FLAG it, like LOAD_PROMPTS. Opening this
-                                # modal is NOT self-limiting the way `d`/`s` are:
-                                # a turn with no prompt text to drill into gives
-                                # `↵` back its close-the-page meaning, so a held
-                                # key alternates open/close and would ask for a
-                                # fresh store read every other press.
-                                reload_turn = True
-                            elif action is Action.LOAD_PROMPTS:
-                                # Only FLAG it: the store read is ~275ms and this
-                                # loop exists to coalesce a burst of buffered
-                                # keys into one render, so reading here made a
-                                # held `r` (auto key-repeat) spend a query per
-                                # press - 10 buffered `r` measured 3.21s frozen
-                                # inside one drain, with no redraw.
-                                reload_prompts = True
                             ready, _, _ = select.select([fd], [], [], 0)
                         if quit_now:
                             break
@@ -4246,39 +4392,9 @@ def main():
                     prompt_rows = prompts_row_count(console.height)
                     state.prompts.clamp(prompt_rows)
 
-                    # The prompts snapshot, at most ONE store read per frame:
-                    # either an explicit request coalesced out of the drain loop
-                    # (`r`, `S`, entering the tab) or the idle auto-refresh.
-                    # `_load_prompt_turns` connects, queries and closes on every
-                    # call (there is no warm-connection path), measured ~270-310ms
-                    # steady state and ~600-660ms cold on a 1.08 GiB store - which
-                    # is why the drain only sets a flag: a held `r` used to spend
-                    # one such query per buffered press. Still synchronous, which
-                    # the codebase prefers over a background thread (state stays
-                    # pure and main() keeps every side effect); and
-                    # PROMPTS_AUTO_REFRESH is the ingest cadence, so the idle case
-                    # fires rarely enough that the stall is not felt. Both are
-                    # gated on the tab being the one on screen, so a drain that
-                    # entered and left it again pays nothing. Only the idle case is
-                    # modal-gated: an explicit request stands even if a later key in
-                    # the same drain opened a modal over the list (one read, unseen
-                    # until it closes), while a modal can never make the tab poll
-                    # the store on its own.
-                    if state.tab == "prompts" and (
-                            reload_prompts
-                            or (not state.modal_open()
-                                and _prompts_refresh_due(state.prompts))):
-                        _refresh_prompts(state.prompts, prompt_rows)
-
-                    # The open turn's page, same one-read-per-frame rule. Loaded
-                    # for whatever turn the drain ENDED on, so a burst that
-                    # walked through several of them pays for the last one only;
-                    # a drain that closed the page again loads nothing (
-                    # `_load_turn_detail(None)` is a no-op returning None, None).
-                    if reload_turn:
-                        (state.prompts.actions,
-                         state.prompts.detail_text) = _load_turn_detail(
-                             state.prompts.detail)
+                    # Every store read this frame owes, at most one of each: what
+                    # the drain flagged, plus the prompts tab's idle refresh.
+                    _frame_store_reads(state, flags, prompt_rows)
 
                     name_map = load_session_names()
                     session_ids = {e.get("session_id", "") for e in state.entries}

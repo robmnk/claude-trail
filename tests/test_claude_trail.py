@@ -3510,6 +3510,13 @@ def _panel_text(panel, width=120):
     return console.export_text()
 
 
+def _turn_rows(prompts, height):
+    """Action rows the turn page has room for, sized off the prompt it quotes -
+    the same two calls `build_turn_panel` and `render_panel` make."""
+    return feed._turn_capacity(height, feed._prompt_box_rows(
+        feed._turn_prompt_lines(prompts)))
+
+
 def action_of(tool_name, text, tool_input):
     return feed.action_label(tool_name, text, tool_input)
 
@@ -3907,23 +3914,35 @@ class TestTurnScroll:
         assert state.prompts.detail_scroll == 0
 
     def test_clamp_bounds_the_offset_to_the_last_screenful(self):
-        capacity = feed._turn_capacity(30)
-        assert feed._clamp_turn_scroll(10**9, 40, 30) == 40 - capacity
-        assert feed._clamp_turn_scroll(-5, 40, 30) == 0
-        assert feed._clamp_turn_scroll(3, 2, 30) == 0     # fewer rows than fit
-        assert feed._clamp_turn_scroll(0, 0, 30) == 0     # no rows at all
+        box = feed._prompt_box_rows(["one line"])          # the smallest box: 3 rows
+        capacity = feed._turn_capacity(30, box)
+        assert feed._clamp_turn_scroll(10**9, 40, 30, box) == 40 - capacity
+        assert feed._clamp_turn_scroll(-5, 40, 30, box) == 0
+        assert feed._clamp_turn_scroll(3, 2, 30, box) == 0     # fewer rows than fit
+        assert feed._clamp_turn_scroll(0, 0, 30, box) == 0     # no rows at all
+
+    def test_the_clamp_follows_the_prompt_box_the_panel_will_draw(self):
+        # A taller box leaves fewer rows, so `G` has to stop FURTHER down. Both
+        # callers pass the same `_prompt_box_rows`, or the written-back offset
+        # would disagree with the rows build_turn_panel actually draws.
+        short = feed._prompt_box_rows(["one line"])
+        tall = feed._prompt_box_rows([f"line {i}" for i in range(30)])
+        assert tall > short
+        assert (feed._clamp_turn_scroll(10**9, 40, 30, tall)
+                > feed._clamp_turn_scroll(10**9, 40, 30, short))
 
     def test_a_shrinking_list_pulls_the_window_back(self):
         # `b` can cut the list under a parked offset; the panel clamps for
         # display and render_panel writes the same value back.
-        assert feed._clamp_turn_scroll(35, 40, 30) == 40 - feed._turn_capacity(30)
-        assert feed._clamp_turn_scroll(35, 4, 30) == 0
+        box = feed._prompt_box_rows(["one line"])
+        assert feed._clamp_turn_scroll(35, 40, 30, box) == 40 - feed._turn_capacity(30, box)
+        assert feed._clamp_turn_scroll(35, 4, 30, box) == 0
 
     def test_the_panel_windows_the_rows_and_reports_the_range(self):
         prompts = _turn_state(actions=[_action(text=f"cmd {i}") for i in range(40)],
                               detail_scroll=5)
         out = _panel_text(feed.build_turn_panel(prompts, 30), width=100)
-        capacity = feed._turn_capacity(30)
+        capacity = _turn_rows(prompts, 30)
         assert "cmd 5" in out and "cmd 4" not in out       # window starts at 5
         assert f"6-{5 + capacity} of 40" in out
         assert "Actions (40)" in out
@@ -4058,16 +4077,29 @@ class TestTurnPromptCap:
         text = "y" * 646_245
         capped = feed._cap_prompt_text(text)
         assert len(capped) < len(text)
-        assert capped.startswith("y" * feed.PROMPT_TEXT_CHAR_CAP)
+        assert capped.endswith("y" * feed.PROMPT_TEXT_CHAR_CAP)   # notice, then the text
         dropped = 646_245 - feed.PROMPT_TEXT_CHAR_CAP
-        assert f"{dropped:,} more characters not shown" in capped
-        assert f"{feed.PROMPT_TEXT_CHAR_CAP:,} of 646,245 kept" in capped
+        assert capped.startswith(
+            f"… showing the first {feed.PROMPT_TEXT_CHAR_CAP:,} of 646,245 characters")
+        assert f"({dropped:,} not shown)" in capped
 
     def test_the_cut_is_visible_in_the_view_itself(self):
-        # Not just in the string: the reader must see it on the last page.
-        capped = feed._cap_prompt_text("z" * 300_000, cap=200)
-        out = _panel_text(feed.build_prompt_panel("s1", 40, capped, scroll=10**9))
-        assert "more characters not shown" in out
+        """The notice has to survive the VIEW, not just live in the string.
+
+        The body here WRAPS at the test width, which is the case a trailing
+        notice could not survive: the view windows by logical line while the
+        Panel crops by display row, so the last window renders fewer lines than
+        it holds and the notice was always among the ones dropped. `line 20` is
+        inside the window and still absent, which is that crop happening - the
+        proof this test is not passing on a body that simply fits.
+        """
+        body = "\n".join(f"line {i} " + "word " * 30 for i in range(200))
+        capped = feed._cap_prompt_text(body, cap=5_000)
+        assert len(capped.splitlines()) > feed._prompt_capacity(40)   # windowed
+        out = _panel_text(feed.build_prompt_panel("s1", 40, capped), width=120)
+        assert "not shown" in out                  # the notice, on the first frame
+        assert "line 0 " in out                    # the body starts under it
+        assert "line 20 " not in out               # ... and the crop ate this one
 
     def test_the_loader_caps_before_the_text_reaches_the_view(self, tmp_path, monkeypatch):
         import claude_trail_store as store
@@ -4078,7 +4110,7 @@ class TestTurnPromptCap:
                             lambda fn, **kw: ([], "w" * 300_000))
         _actions, text = feed._load_turn_detail(_turn(tools=0))
         assert len(text) < 300_000
-        assert "more characters not shown" in text
+        assert "not shown" in text
 
 
 class TestTurnDetailLoader:
@@ -4165,18 +4197,28 @@ class TestTurnDetailLoader:
 
 
 class TestTurnPanelGeometry:
-    """TURN_CHROME_ROWS, measured by rendering rather than counted: the page's
-    header is tall, so one row too few silently eats the key hints."""
+    """TURN_CHROME_ROWS plus the per-turn prompt box, measured by rendering
+    rather than counted: the page's header is tall, so one row too few silently
+    eats the key hints and one row too many leaves the list short."""
 
-    def _panel(self, height, width, actions=40):
+    PROMPT_30 = "\n".join(f"line {i}" for i in range(30))
+
+    def _panel(self, height, width, actions=40, text=PROMPT_30):
         prompts = _turn_state(
             actions=[_action(text=f"cmd {i}") for i in range(actions)],
-            text="\n".join(f"line {i}" for i in range(30)))
+            text=text)
         console = Console(width=width, record=True)
         console.print(feed.build_turn_panel(prompts, height))
         return console.export_text()
 
+    def _rows_drawn(self, out):
+        return len(re.findall(r"cmd \d+", out))
+
     def test_the_hint_and_the_header_survive_at_24_rows(self):
+        # `len(splitlines()) == 24` is NOT the pin here (build_turn_panel passes
+        # height= to the Panel, so it holds at any chrome); the real pins are
+        # test_chrome_one_row_too_small_crops_the_hint below it and the row
+        # counts in test_a_short_prompt_gets_its_rows_back.
         for width in (80, 110, 160):
             out = self._panel(24, width)
             assert "b : bash only" in out, width      # the hint line
@@ -4191,9 +4233,60 @@ class TestTurnPanelGeometry:
             for width in (80, 110, 160):
                 assert "b : bash only" not in self._panel(24, width), width
 
+    def test_a_short_prompt_gets_its_rows_back(self):
+        """The pin from ABOVE: the box is sized from the prompt, not reserved.
+
+        A one-line prompt has no `+N more lines` footer and no blank above it, so
+        its box is 3 rows where the worst case is 6. Reserving the worst case (the
+        old TURN_CHROME_ROWS = 18) left those 3 rows blank on 135 of the newest
+        200 turns in a real store - a third of the usable list at h=24. The
+        literals below are what the panel DRAWS, so over-reserving again fails
+        here even though the hint would still be on screen.
+        """
+        for width in (80, 160):
+            short = self._panel(24, width, text="update the tracker")
+            assert self._rows_drawn(short) == 9, width          # was 6
+            assert "b : bash only" in short, width
+            long = self._panel(24, width, text=self.PROMPT_30)
+            assert self._rows_drawn(long) == 6, width           # the worst case
+            assert "b : bash only" in long, width
+
+    def test_no_row_is_wasted_between_the_list_and_the_hint(self):
+        # The same pin stated as layout: the hint sits DIRECTLY under the last
+        # action row. One row of chrome too many puts a blank line in between.
+        for width in (80, 160):
+            for text, last in (("update the tracker", "cmd 8"),
+                               (self.PROMPT_30, "cmd 5")):
+                lines = self._panel(24, width, text=text).splitlines()
+                hint = next(i for i, ln in enumerate(lines) if "b : bash only" in ln)
+                assert last in lines[hint - 1], (width, text)
+
+    def test_a_long_prompt_line_does_not_steal_the_lists_rows(self):
+        # The box can only be measured exactly if a quoted line takes exactly one
+        # row, so the turn page quotes `no_wrap` (ellipsized). A 300-char opening
+        # line would otherwise wrap to 3-4 rows and crop the hint off the page.
+        for width in (80, 160):
+            out = self._panel(24, width, text="x" * 300)
+            assert self._rows_drawn(out) == 9, width
+            assert "b : bash only" in out, width
+
+    def test_the_box_is_measured_from_what_the_page_will_quote(self):
+        assert feed._prompt_box_rows([]) == 3               # the `(empty)` row
+        assert feed._prompt_box_rows(["one"]) == 3
+        assert feed._prompt_box_rows(["one", "two"]) == 4   # both fit, no footer
+        assert feed._prompt_box_rows(["one", "two", "three"]) == 6  # + blank + footer
+        # And it measures the lines the page actually shows: the full text when
+        # `↵` loaded one, else the row's own preview.
+        turn = _turn(tools=1, preview="a\nb\nc\nd")
+        assert feed._turn_prompt_lines(_turn_state(turn, text="just this")) == ["just this"]
+        assert feed._turn_prompt_lines(_turn_state(turn, text=None)) == ["a", "b", "c", "d"]
+
     def test_capacity_grows_with_the_terminal_and_has_a_floor(self):
-        assert feed._turn_capacity(40) == 40 - feed.TURN_CHROME_ROWS
-        assert feed._turn_capacity(10) == feed.MIN_VISIBLE_ROWS   # tiny terminal
+        box = feed._prompt_box_rows(["one line"])
+        # The floor assert is the meaningful half; the first line restates the
+        # implementation and is here to name the two things that are subtracted.
+        assert feed._turn_capacity(40, box) == 40 - feed.TURN_CHROME_ROWS - box
+        assert feed._turn_capacity(10, box) == feed.MIN_VISIBLE_ROWS   # tiny terminal
 
 
 class TestPromptView:
@@ -5109,6 +5202,112 @@ class TestPromptTurnLoader:
         assert feed._format_age(12.7) == "12s ago"
         assert feed._format_age(60) == "1m ago"
         assert feed._format_age(3600 + 7 * 60) == "1h 07m ago"
+
+
+class TestDrainCoalescing:
+    """`_drain_action` / `_frame_store_reads`: which actions main()'s key drain
+    performs inline, and which are flagged and performed ONCE per frame.
+
+    The drain reads every buffered keystroke before rendering, so a held key is
+    one render rather than one per press. The two actions that open the store
+    have to be coalesced the same way or a key-repeat burst freezes the loop for
+    a query per press; this is the split, out of main() so it can be driven.
+    """
+
+    # By NAME, not by member: other tests in this file reload the module, and a
+    # captured enum member would then be a different object than the one
+    # `_drain_action` compares against.
+    COALESCED = {"LOAD_PROMPTS": "reload_prompts", "OPEN_PROMPT": "reload_turn"}
+
+    def test_the_two_store_reads_are_flagged_not_performed(self):
+        for name, attr in self.COALESCED.items():
+            flags = feed.DrainFlags()
+            assert feed._drain_action(getattr(feed.Action, name), flags) is True, name
+            assert getattr(flags, attr) is True, name
+
+    def test_every_other_action_is_performed_by_the_drain_itself(self):
+        # An editor launch or a search is what the user asked for on THAT press,
+        # and `d`/`s` open a modal that swallows the repeat, so they are already
+        # self-limiting. Only the two above need the frame to hold them.
+        for action in feed.Action:
+            if action.name in self.COALESCED:
+                continue
+            flags = feed.DrainFlags()
+            assert feed._drain_action(action, flags) is False, action
+            assert flags == feed.DrainFlags(), action
+
+    def _state(self, tab="prompts", **kw):
+        state = feed.AppState(entries=[], **kw)
+        state.tab = tab
+        return state
+
+    def test_a_held_enter_costs_one_store_read(self, monkeypatch):
+        """Ten buffered `↵` end in ONE `_load_turn_detail`.
+
+        `↵` is not self-limiting: a turn whose prompt text has not loaded gives
+        the key back its close-the-page meaning, so a repeat alternates
+        open/close and would ask for a fresh read every other press (measured
+        44ms each on a 1.2 GiB store).
+        """
+        calls = []
+        monkeypatch.setattr(feed, "_load_turn_detail",
+                            lambda turn: calls.append(turn) or ([_action()], "the ask"))
+        state = self._state()
+        state.prompts.detail = _turn(tools=1)
+        flags = feed.DrainFlags()
+        for _ in range(10):
+            feed._drain_action(feed.Action.OPEN_PROMPT, flags)
+        feed._frame_store_reads(state, flags, 10)
+        assert len(calls) == 1
+        assert calls[0] is state.prompts.detail          # the turn the drain ended on
+        assert state.prompts.detail_text == "the ask"    # and it lands on the page
+
+    def test_a_frame_that_flagged_nothing_reads_nothing(self, monkeypatch):
+        loads, refreshes = [], []
+        monkeypatch.setattr(feed, "_load_turn_detail", lambda turn: loads.append(turn))
+        monkeypatch.setattr(feed, "_refresh_prompts",
+                            lambda prompts, rows: refreshes.append(rows))
+        state = self._state(tab="commands")
+        feed._frame_store_reads(state, feed.DrainFlags(), 10)
+        assert (loads, refreshes) == ([], [])
+
+    def test_the_list_is_only_read_while_its_tab_is_on_screen(self, monkeypatch):
+        # A drain that entered the tab and left it again pays nothing.
+        refreshes = []
+        monkeypatch.setattr(feed, "_refresh_prompts",
+                            lambda prompts, rows: refreshes.append(rows))
+        state = self._state(tab="commands")
+        feed._frame_store_reads(state, feed.DrainFlags(reload_prompts=True), 10)
+        assert refreshes == []
+        feed._frame_store_reads(self._state(), feed.DrainFlags(reload_prompts=True), 7)
+        assert refreshes == [7]
+
+    def test_an_explicit_request_survives_a_modal_the_idle_refresh_does_not(
+            self, monkeypatch):
+        # `r` then `s` in one drain: the read stands (unseen until the modal
+        # closes). A modal alone must never make the tab poll the store.
+        refreshes = []
+        monkeypatch.setattr(feed, "_refresh_prompts",
+                            lambda prompts, rows: refreshes.append(rows))
+        monkeypatch.setattr(feed, "_prompts_refresh_due", lambda prompts: True)
+        state = self._state(session_detail="sid-1")
+        assert state.modal_open() is True
+        feed._frame_store_reads(state, feed.DrainFlags(), 10)
+        assert refreshes == []                                   # idle: gated
+        feed._frame_store_reads(state, feed.DrainFlags(reload_prompts=True), 10)
+        assert refreshes == [10]                                 # explicit: stands
+
+    def test_an_idle_frame_refreshes_when_the_snapshot_is_due(self, monkeypatch):
+        refreshes = []
+        monkeypatch.setattr(feed, "_refresh_prompts",
+                            lambda prompts, rows: refreshes.append(rows))
+        state = self._state()
+        monkeypatch.setattr(feed, "_prompts_refresh_due", lambda prompts: False)
+        feed._frame_store_reads(state, feed.DrainFlags(), 10)
+        assert refreshes == []
+        monkeypatch.setattr(feed, "_prompts_refresh_due", lambda prompts: True)
+        feed._frame_store_reads(state, feed.DrainFlags(), 10)
+        assert refreshes == [10]
 
 
 class TestPromptsPanelStates:
