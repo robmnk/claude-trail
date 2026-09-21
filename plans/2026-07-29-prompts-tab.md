@@ -407,8 +407,9 @@ depend on the TUI.
       disk and stay on the `project` fallback. The win is forward-looking; the "3 of the 6
       projects" measurement above no longer reproduces.
     - `search --project P` matched only the lossy `sessions.project`, so the name the column now
-      shows found nothing. Document whichever way the phase 5 fix resolved it (widened to match
-      `cwd` too, or recorded as a limit).
+      shows found nothing. The phase 5 fix widened it to `project LIKE ? OR cwd LIKE ?` (same
+      substring match, both columns); CLAUDE.md's Subcommands section does not spell out
+      `--project` today, so this is new text, not a correction.
 
 ## Conventions for this run
 
