@@ -342,7 +342,7 @@ depend on the TUI.
     phase owns the clamp.
   - Tests: column rendering per row shape, hide-empty filter, cursor clamp on reload,
     store-missing and store-busy hints.
-- [ ] 4. TUI: prompt detail
+- [x] 4. TUI: prompt detail
   - `build_turn_panel`, `OPEN_PROMPT`, `action_label`, agent gutter over actions, `b`
     toggle, scroll clamp, `Enter` into the refactored `build_prompt_panel`, `Esc`/`q` depth
     rules.
