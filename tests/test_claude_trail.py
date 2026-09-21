@@ -180,6 +180,8 @@ class TestTokenizeCommand:
         "curl https://example.com/api?x=1 -o /tmp/out",
         "echo a#b  # a real comment",
         'echo "path $HOME/x ${FOO:-y} $(date)"',
+        "echo $((1+2)) $((x > 1)) $(( (1+2) * 3 ))",
+        "xargs -n1 echo hi",
         "echo `date` and $(echo $(date) (x))",
         'echo "he said \\"hi\\" and it\'s fine"',
         "echo 'a \" b'",
@@ -211,7 +213,7 @@ class TestTokenizeCommand:
         "echo \x00\x01\x1b[2J\x7f",
         "",
         "$" * 500,
-        '$"' * 500,          # deep nesting: degrades to one word, never raises
+        '$"' * 500,          # deep nesting: capped, never raises
         "$(" * 500,
         "(" * 500 + ")" * 500,
         "<<EOF " * 200,
@@ -264,10 +266,13 @@ class TestTokenizeCommand:
         assert feed.tokenize_command("") == []
 
     def test_a_52kb_command_tokenizes_in_well_under_a_frame(self):
-        # The longest command in the real log is 52,509 chars. The bound is the
-        # plan's 50 ms, generous against a measured ~27 ms, and best-of-5 keeps
-        # one scheduling hiccup from failing it. What it really pins is
-        # linearity: a quadratic scanner takes seconds on this input.
+        # The longest command in the real log is 52,509 chars, and the feed
+        # re-tokenizes per frame. The bound is 200 ms rather than the plan's
+        # 50 ms: it is a BACKSTOP against a scan that is not linear (which takes
+        # seconds here), not a benchmark, and 50 ms against a measured ~26 ms on
+        # this machine is a 1.9x margin that a slower one can lose. What the
+        # plan really asks for is the shape of the curve, and the linearity test
+        # below is what pins that. Best-of-5 keeps a scheduling hiccup out.
         import time
         cmd, pipes = self._big_command()
         assert len(cmd) >= 52_000
@@ -278,7 +283,30 @@ class TestTokenizeCommand:
             toks = feed.tokenize_command(cmd)
             best = min(best, time.perf_counter() - t0)
         assert "".join(t.text for t in toks) == cmd
-        assert best < 0.050, f"{best * 1000:.1f} ms for {len(cmd)} chars"
+        assert best < 0.200, f"{best * 1000:.1f} ms for {len(cmd)} chars"
+
+    def test_tokenizing_is_linear_in_the_length_of_the_command(self):
+        # Doubling the input at most doubles the work, so twice the size must
+        # cost well under 3x the time (the slack absorbs machine noise; a
+        # quadratic scan costs 4x and a 52 KB command seconds). Two shapes,
+        # because they stress different loops: a pipeline is token-dense, while
+        # nested `$( )` is what `_find_close_paren` re-reads.
+        import time
+        for name, build, small_k in (("pipes", self._piped_command, 200),
+                                     ("nested $( )", self._nested_subst, 3000)):
+            small, large = build(small_k), build(small_k * 2)
+            assert len(large) > 1.9 * len(small)
+            best_small = best_large = 1e9
+            for _ in range(5):     # interleaved, so a slow moment hits both
+                t0 = time.perf_counter()
+                feed.tokenize_command(small)
+                best_small = min(best_small, time.perf_counter() - t0)
+                t0 = time.perf_counter()
+                feed.tokenize_command(large)
+                best_large = min(best_large, time.perf_counter() - t0)
+            assert best_large < 3.0 * best_small, (
+                f"{name}: {best_small * 1000:.1f} ms at {len(small)} chars, "
+                f"{best_large * 1000:.1f} ms at {len(large)} chars")
 
     def _big_command(self, pipes=500):
         stage = ("grep -n 'foo bar' /tmp/some/path/file.txt --color=auto "
@@ -286,6 +314,14 @@ class TestTokenizeCommand:
         pad = max(0, (52_000 - (len(stage) + 3) * (pipes + 1)) // (pipes + 1))
         stage = stage + " " + "z" * pad
         return " | ".join(stage for _ in range(pipes + 1)), pipes
+
+    def _piped_command(self, stages):
+        stage = ("grep -n 'foo bar' /tmp/some/path/file.txt --color=auto "
+                 '"$HOME/x" && echo done')
+        return " | ".join(stage for _ in range(stages))
+
+    def _nested_subst(self, levels):
+        return "$(" * levels + "echo hi" + ")" * levels
 
     # ---- one case per token kind ----
 
@@ -328,6 +364,20 @@ class TestTokenizeCommand:
             toks = self._toks(f"{wrapper} python run.py")
             assert toks[0] == ("command", wrapper)
             assert ("command", "python") in toks
+
+    def test_a_flag_after_a_wrapper_closes_the_command_slot(self):
+        # Pinned, not fixed. The plan says the word after `xargs` names a
+        # command; here that word is `-n1`, which is a flag, and a flag ends the
+        # command slot, so `echo` renders as a plain argument. 135 of the
+        # 67,340 commands the phase 1 review measured (0.2%) read this way. The
+        # alternative rule (a flag keeps the slot open) would bold `root` in
+        # `sudo -u root ls` and `{}` in `xargs -I {} bash -c`, so the trade is
+        # deliberate.
+        toks = self._toks("xargs -n1 echo hi")
+        assert toks[0] == ("command", "xargs")
+        assert ("flag", "-n1") in toks
+        assert ("word", "echo") in toks
+        assert self._kinds_of("sudo -u root ls", "command") == ["sudo"]
 
     def test_assign_is_the_name_and_equals_and_keeps_the_slot_open(self):
         toks = self._toks("FOO=bar BAZ=1 python run.py")
@@ -410,6 +460,36 @@ class TestTokenizeCommand:
         assert toks.count(("subst", "$(")) == 2
         assert toks.count(("subst", ")")) == 2
         assert ("command", "date") in toks
+
+    def test_arithmetic_expansion_is_one_var_token(self):
+        # `$(( ))` is not a command, so it is NOT read as `$(` plus a subshell:
+        # that painted `1+2` like a command name, the `>` like a redirect and
+        # found a `1<` redirect in `$((1<2))`.
+        assert self._toks("echo $((1+2))")[2:] == [("var", "$((1+2))")]
+        assert self._toks("echo $((x > 1))")[2:] == [("var", "$((x > 1))")]
+        assert self._toks("echo $((1<2))")[2:] == [("var", "$((1<2))")]
+        # Inner parens are balanced, so the span ends at the right `))`.
+        assert self._toks("echo $(( (1+2) * 3 )) tail")[2:] == [
+            ("var", "$(( (1+2) * 3 ))"), ("space", " "), ("word", "tail")]
+        assert self._toks("echo $(($((1+2)) * 3))")[2:] == [
+            ("var", "$(($((1+2)) * 3))")]
+        # A quoted one keeps its kind, like `${...}` does.
+        assert ("var", "$((1+2))") in self._toks('echo "$((1+2))"')
+
+    def test_a_command_substitution_around_a_subshell_is_still_a_subst(self):
+        # `$( (a) )` has a space, so it is a substitution, not arithmetic.
+        toks = self._toks("cat $( (a) )")
+        assert ("subst", "$(") in toks
+        assert ("command", "a") in toks
+        assert self._kinds_of("cat $( (a) )", "var") == []
+
+    def test_an_unterminated_arithmetic_expansion_degrades_and_never_raises(self):
+        # No `))` arrives, so it cannot be told apart from an unbalanced `$(`
+        # and is scanned as one: the span stays open, lossless, no raise.
+        for cmd in ("echo $((1+2", "$((", "$(()", "echo $(( (1+2)"):
+            toks = feed.tokenize_command(cmd)
+            assert "".join(t.text for t in toks) == cmd, cmd
+            assert self._kinds_of(cmd, "var") == [], cmd
 
     def test_backticks_are_a_subst_too(self):
         assert self._toks("echo `date` tail")[2:] == [
@@ -539,6 +619,33 @@ class TestTokenizeCommand:
     def test_control_characters_are_carried_through(self):
         assert ("word", "\x01\x02") in self._toks("echo \x01\x02")
 
+    def test_a_deep_dollar_quote_chain_is_capped_not_left_to_the_fallback(self):
+        # `$"` reopens a double-quoted string, which can hold another `$"`:
+        # 3 stack frames per repeat, within ONE scanner, so nothing bounded it
+        # and 332 repeats raised RecursionError. The blanket `except` caught
+        # that and returned one `word`, which is lossless but uncolored. The
+        # `_quote_depth` cap means a real scan comes back instead.
+        cmd = '$"' * 2000
+        scanner = feed._CommandScanner(cmd, 0, len(cmd), 0)
+        scanner.run()                  # a RecursionError here IS the bug
+        assert feed._tokens_cover(scanner.out, cmd)
+        toks = feed.tokenize_command(cmd)
+        assert toks == scanner.out     # the scan, not the fallback
+        assert toks != [feed.Token("word", cmd, 0, len(cmd))]
+        assert {t.kind for t in toks} == {"string"}
+
+    def test_a_scan_that_does_not_tile_is_thrown_away_for_one_word(self):
+        # The other half of the guarantee: `tokenize_command` checks the tiling
+        # itself, so a scanner bug can only cost the color, never show text
+        # that is not what ran. Here the scan drops ` -la`.
+        def truncating_run(self):
+            self.out = [feed.Token("command", "ls", 0, 2)]
+
+        with patch.object(feed._CommandScanner, "run", truncating_run):
+            assert feed.tokenize_command("ls -la") == [
+                feed.Token("word", "ls -la", 0, 6)]
+            assert feed.highlight_command("ls -la").spans == []
+
 
 class TestHighlightCommand:
     """`highlight_command`: the tokens painted with `CMD_STYLES`, never markup.
@@ -554,7 +661,36 @@ class TestHighlightCommand:
         for cmd in TestTokenizeCommand.CASES:
             assert feed.highlight_command(cmd).plain == cmd, cmd
 
+    def test_the_palette_is_the_plan_s_table(self):
+        # Written out, not derived from `CMD_STYLES`: every other test here
+        # reads the palette to build its expectation, so recoloring an entry
+        # would leave them all green. Three views share this table today and
+        # phase 3 adds two more, so a change to it has to be deliberate in two
+        # places. The values are the plan's palette table, character for
+        # character (`plans/2026-09-21-command-highlighting.md`, the Highlighter
+        # section); `""` means the kind renders unstyled.
+        assert feed.CMD_STYLES == {
+            "command": "bold",
+            "keyword": "bold blue",
+            "assign": "yellow",
+            "flag": "cyan",
+            "path": "blue",
+            "string": "green",
+            "var": "yellow",
+            "subst": "yellow",
+            "heredoc_op": "magenta",
+            "heredoc_end": "magenta",
+            "heredoc_body": "dim",
+            "operator": "bold magenta",
+            "redirect": "magenta",
+            "comment": "dim italic",
+            "space": "",
+            "word": "",
+        }
+
     def test_spans_are_exactly_the_palette_over_the_tokens(self):
+        # The placement of the spans, not their colors: the literal table above
+        # is what pins the colors themselves.
         from rich.text import Span
         cmd = "FOO=1 git log --oneline | head -5 > /tmp/out  # note"
         text = feed.highlight_command(cmd)

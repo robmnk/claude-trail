@@ -1413,8 +1413,10 @@ _BLANK_RUN_RE = re.compile(r"[^\S\n]+")
 # Characters that end a word outside quotes (whitespace ends one as well).
 _WORD_BREAK_CHARS = "|&;()<>"
 
-# How deep `$( )` and backtick nesting is followed before the rest is left as a
-# plain word. Bounded so a pathological input cannot exhaust the stack.
+# How deep nesting is followed before the rest is left as one plain span. It
+# caps BOTH ways the scanner descends: `$( )` and backticks, which recurse into
+# a nested scanner (`depth`), and `$"..."`, which recurses within one scanner
+# (`_quote_depth`). Bounded so a pathological input cannot exhaust the stack.
 _MAX_SUBST_DEPTH = 8
 
 
@@ -1538,7 +1540,9 @@ class _CommandScanner:
 
     `pos`/`limit` bound the region being scanned WITHIN the full command, so a
     `$( )` body is tokenized in place by a nested scanner and every offset stays
-    absolute. `depth` is that nesting, capped by `_MAX_SUBST_DEPTH`.
+    absolute. `depth` is that nesting, capped by `_MAX_SUBST_DEPTH`;
+    `_quote_depth` is the one nesting that stays inside a single scanner
+    (`$"..."` holding another `$"..."`), capped by the same number.
     """
 
     def __init__(self, src: str, pos: int, limit: int, depth: int = 0):
@@ -1546,6 +1550,7 @@ class _CommandScanner:
         self.pos = pos
         self.limit = limit
         self.depth = depth
+        self._quote_depth = 0
         self.out: list[Token] = []
         self.expect_command = True
         self.expect_in = False
@@ -1882,7 +1887,8 @@ class _CommandScanner:
         if kind is None:
             return False
         if kind == "subst":
-            self._scan_command_subst()
+            if not self._scan_arithmetic():
+                self._scan_command_subst()
         elif kind == "string":
             self._scan_dollar_quoted()
         elif self.src[self.pos + 1] == "{":
@@ -1923,14 +1929,50 @@ class _CommandScanner:
         self.pos = i
 
     def _scan_dollar_quoted(self) -> None:
-        """`$'...'` (escapes honoured) and `$"..."` (a translated string)."""
+        """`$'...'` (escapes honoured) and `$"..."` (a translated string).
+
+        A `$"` reopens a double-quoted string, which may hold another `$"`, so
+        this is the one place the scanner calls itself without going through
+        `_scan_nested`. `_quote_depth` caps that the way `depth` caps `$( )`:
+        past the cap the whole quoted span is one `string` and nothing inside it
+        is looked at, which keeps a chain of `$"` off the stack.
+        """
         start = self.pos
-        if self.src[start + 1] == '"':
-            self._scan_double_quoted(start, start + 2)
+        if self.src[start + 1] == '"' and self._quote_depth < _MAX_SUBST_DEPTH:
+            self._quote_depth += 1
+            try:
+                self._scan_double_quoted(start, start + 2)
+            finally:
+                self._quote_depth -= 1
             return
         end = _skip_quoted_span(self.src, start + 1, self.limit, escapes=True)
         self._push_span("string", start, end)
         self.pos = end
+
+    def _scan_arithmetic(self) -> bool:
+        """`$(( ... ))` as ONE `var` token. False when this `$((` is not one.
+
+        Arithmetic is not a command, so reading it as a substitution wrapping a
+        subshell paints the wrong thing: `$((1+2))` bolds `1+2` like a command
+        name, `$((x > 1))` paints the `>` like a redirect and `$((1<2))` finds a
+        `1<` there. The whole span is one `var` instead, the treatment
+        `${...}` already gets, and nothing inside it is read as shell.
+
+        Nested parens are balanced (`$(( (1+2) * 3 ))`), so the span ends at the
+        `))` that closes the opening one. A `$((` whose `))` never arrives is
+        not arithmetic as far as this can tell: it returns False and the caller
+        scans it as a command substitution, which leaves the span open rather
+        than raising.
+        """
+        if not self.src.startswith("$((", self.pos):
+            return False
+        close, closed = _find_close_paren(self.src, self.pos + 3, self.limit)
+        if not closed or close + 1 >= self.limit or self.src[close + 1] != ")":
+            return False
+        end = close + 2
+        self._push_span("var", self.pos, end)
+        self.pos = end
+        return True
 
     def _scan_command_subst(self) -> None:
         """`$( ... )`: the delimiters are `subst`, the inside is a command.
