@@ -353,7 +353,7 @@ depend on the TUI.
   - Tests: gutter glyphs over a main+subagent action list, `action_label` fallback for an
     `Agent` row (text NULL, description in `tool_input`), bash-only toggle, scroll clamp,
     Enter/Esc/q depth transitions.
-- [ ] 5. Store: populate `sessions.cwd` at ingest, prefer it for the Project column
+- [x] 5. Store: populate `sessions.cwd` at ingest, prefer it for the Project column
   - Phase 3's review overturned this plan's earlier claim that no better source exists. Every
     transcript line carries an exact top-level `cwd` (verified in a live transcript);
     `sessions.cwd` is dead only because `_upsert_session` never writes it. Meanwhile
