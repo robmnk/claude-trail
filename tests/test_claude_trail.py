@@ -4890,6 +4890,54 @@ class TestDatabaseModal:
         assert self._reverse_segments(panel) == []
 
 
+class TestStoreSubcommandDispatch:
+    """`main()`'s gate: a store subcommand is handed to `cli_main` and the process
+    exits, so the TUI is never started for it. The gate is also what keeps the
+    feed and the hook free of duckdb - `from claude_trail_store import cli_main`
+    is lazy and runs on this path only - so a subcommand missing from it would
+    render a dashboard instead of answering."""
+
+    GATED = ("ingest", "search", "cat", "diff", "stats", "tokens", "prompts",
+             "reset-db", "prune-raw")
+
+    def _route(self, monkeypatch, argv):
+        """Run `main()` on `argv` with cli_main stubbed; returns (code, calls)."""
+        import pytest
+        import claude_trail_store as store
+        seen = []
+        monkeypatch.setattr(store, "cli_main", lambda a: seen.append(a) or 0)
+        # Reaching the TUI is the failure this gate exists to prevent, so make it
+        # loud rather than letting a missed subcommand start a dashboard.
+        def no_tui(*args, **kwargs):
+            raise AssertionError("main() fell through to the TUI")
+        monkeypatch.setattr(feed, "Console", no_tui)
+        monkeypatch.setattr(sys, "argv", ["claude-trail", *argv])
+        with pytest.raises(SystemExit) as exc:
+            feed.main()
+        return exc.value.code, seen
+
+    def test_prompts_reaches_the_store_cli(self, monkeypatch):
+        code, seen = self._route(monkeypatch, ["prompts", "--limit", "3"])
+        assert (code, seen) == (0, [["prompts", "--limit", "3"]])
+
+    def test_every_gated_name_routes(self, monkeypatch):
+        for cmd in self.GATED:
+            assert self._route(monkeypatch, [cmd]) == (0, [[cmd]]), cmd
+
+    def test_every_gated_name_is_one_cli_main_dispatches(self, monkeypatch):
+        # The two tables have to agree: a name main() gates but cli_main does not
+        # know raises KeyError instead of running. Every cmd_* is stubbed so this
+        # asserts the mapping, not the commands.
+        import claude_trail_store as store
+        seen = []
+        for name in [n for n in vars(store) if n.startswith("cmd_")]:
+            monkeypatch.setitem(store.cli_main.__globals__, name,
+                                lambda argv: seen.append(argv[0]) or 0)
+        for cmd in self.GATED:
+            assert store.cli_main([cmd]) == 0, cmd
+        assert seen == list(self.GATED)
+
+
 class TestTokenLoaders:
     """The lazy store loaders behind the command/session modals: they guard bad
     input (None: no Tokens row, no prompt panel) and degrade to the
