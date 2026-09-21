@@ -148,6 +148,70 @@ class TestNormalizeCmd:
         assert feed.normalize_cmd("   ls   ") == "ls"
 
 
+class TestParseTs:
+    """`parse_ts` widens an hours-only UTC offset before parsing.
+
+    DuckDB renders a TIMESTAMPTZ as `2026-07-29 19:18:37.084-03`, so that is the
+    shape every store timestamp reaches the TUI in, and `fromisoformat` rejects
+    it before Python 3.11 - below the package's declared floor, where every Time
+    cell read `??:??:??` and the turn page's duration chip disappeared.
+    """
+
+    def test_hours_only_offset_keeps_the_instant(self):
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        assert feed.parse_ts("2026-07-29 19:18:37.084-03") == _dt(
+            2026, 7, 29, 19, 18, 37, 84000, tzinfo=_tz(_td(hours=-3)))
+
+    def test_positive_hours_only_offset(self):
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        assert feed.parse_ts("2026-07-27 10:30:38+02") == _dt(
+            2026, 7, 27, 10, 30, 38, tzinfo=_tz(_td(hours=2)))
+
+    def test_full_offset_is_left_alone(self):
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        assert feed.parse_ts("2025-01-01T12:00:00-03:00") == _dt(
+            2025, 1, 1, 12, 0, 0, tzinfo=_tz(_td(hours=-3)))
+
+    def test_naive_timestamp_is_left_alone(self):
+        from datetime import datetime as _dt
+        assert feed.parse_ts("2025-01-01T12:34:56") == _dt(2025, 1, 1, 12, 34, 56)
+
+    def test_date_only_is_not_read_as_an_offset(self):
+        # `-29` ends the string, but there is no time in front of it: widening it
+        # to `2026-07-29:00` would turn a valid date into a parse error.
+        from datetime import datetime as _dt
+        assert feed.parse_ts("2026-07-29") == _dt(2026, 7, 29)
+
+    def test_format_time_renders_a_store_timestamp(self):
+        # The user-visible half of the same fix: this cell is what read
+        # `??:??:??` on 3.10 for every row of every table.
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        expected = _dt(2026, 7, 29, 19, 18, 37,
+                       tzinfo=_tz(_td(hours=-3))).astimezone().strftime("%H:%M:%S")
+        assert feed.format_time("2026-07-29 19:18:37.084-03") == expected
+
+
+class TestEnvExampleDocumentsEveryKey:
+    """`.env.example` is where a user learns these keys exist, so every key the
+    module resolves through `_env_int` must appear in it with the code's own
+    default. A width added to COLUMNS / PROMPT_COLUMNS and never written down is
+    undiscoverable, and a default changed in only one of the two files is worse
+    than either value alone."""
+
+    def _pairs(self):
+        source = Path(feed.__file__).resolve().read_text(encoding="utf-8")
+        pairs = re.findall(r'_env_int\("(\w+)", (\d+)\)', source)
+        assert pairs, "no _env_int call sites found; the pattern went stale"
+        return pairs
+
+    def test_every_env_int_key_is_in_the_example(self):
+        example = (Path(feed.__file__).resolve().parent / ".env.example").read_text(
+            encoding="utf-8")
+        for key, default in self._pairs():
+            assert f"{key}={default}" in example, (
+                f"{key}={default} is missing from .env.example")
+
+
 class TestFormatTime:
     def test_valid_iso(self):
         assert feed.format_time("2025-01-01T12:34:56") == "12:34:56"
