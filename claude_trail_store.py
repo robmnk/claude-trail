@@ -2033,6 +2033,84 @@ def slash_label(text):
     return f"{name} {arg}" if arg else name
 
 
+# The fields `action_label` reads off a `tool_use`'s raw input, in priority
+# order. Measured on a real store: `events.text` is NULL for 2,818 of 31,279
+# tool calls (every tool without a `_COMMAND_FIELD` entry - Agent, Task, Skill,
+# ToolSearch, WebFetch, WebSearch, AskUserQuestion and the MCP tools), while
+# `tool_input` is populated for every single `tool_use` row (0 NULLs). This list
+# labels 1,935 of those text-less calls, so 97% of all calls end up with a
+# label; the rest are MCP tools with keys of their own (`page_id`, `channel_id`,
+# `taskId`) and render a dim `-`.
+_ACTION_FIELDS = ("description", "file_path", "path", "pattern", "query", "url",
+                  "skill", "notebook_path", "command")
+
+
+def action_label(tool_name, text, tool_input):
+    """What one tool call did, in a line: the store's `text` when it has one,
+    else the first `_ACTION_FIELDS` entry of the raw `tool_input` JSON.
+
+    Resolved at RENDER time rather than at ingest on purpose: extending
+    `_COMMAND_FIELD` would only label newly ingested rows, and `events` can no
+    longer be re-derived from `raw_events` (the raw payload is pruned for
+    non-snapshot lines), so every already-stored row would stay blank until a
+    full re-ingest.
+
+    `tool_name` selects nothing today - the field order above is tool-agnostic
+    and already puts `description` (the Agent tool's only useful field) first -
+    but it is what a per-tool rule would key off, and it keeps the call site
+    reading as "label this row".
+
+    Returns "" when neither source says anything: a `tool_input` that is absent,
+    is not JSON, is not an object, or carries none of the known fields. The
+    caller renders that as a dim placeholder rather than an empty cell.
+
+    Pure text, so it lives here with the turn model both readers share: the CLI
+    (`prompts --at`) calls it directly and the TUI's turn page imports it lazily,
+    the same way it imports `slash_label`.
+    """
+    if text:
+        return text
+    try:
+        data = json.loads(tool_input) if tool_input else None
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    for key in _ACTION_FIELDS:
+        value = data.get(key)
+        # Strings only: every field above is a path, a pattern or prose. A dict
+        # or a list under one of those names means a tool this list does not
+        # know, and dumping its JSON into the cell would be noise, not a label.
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def short_tool_name(tool_name):
+    """An MCP tool's own name, without its server prefix.
+
+    Real tool names run to 63 characters
+    (`mcp__plugin_chrome-devtools-mcp_chrome-devtools__evaluate_script`), all of
+    which is server routing until the last `__`. A tool column is narrow, so
+    keeping the prefix would ellipsize every MCP row to the same `mcp__plugin…`:
+    18 of the 77 distinct tool names in a real store are MCP ones, and they would
+    all read alike. A plain tool name has no `__` and is returned unchanged.
+
+    Known limit, deliberately not fixed: dropping the server can COLLIDE two
+    tools whose own names match. In a real store that is
+    `mcp__plugin_linear_linear__authenticate`,
+    `mcp__plugin_Notion_notion__authenticate` and
+    `mcp__plugin_slack_slack__authenticate`, which all render `authenticate` -
+    7 rows out of 31,279 tool calls (0.02%). (Two further collisions,
+    `notion-fetch` and `notion-update-page`, are one tool reached under two
+    server aliases, so they are not really collisions at all.) Disambiguating
+    would mean keeping part of the prefix on those rows, which trades a legible
+    column for every MCP call against 0.02% of them; the turn's full detail is
+    one cell over.
+    """
+    return tool_name.rsplit("__", 1)[-1] if "__" in tool_name else tool_name
+
+
 def prompt_for_command(con, session_id, ts=None, agent_id=None):
     """The prompt that led to a command: the newest `user` turn at or before `ts`
     in the same (session, agent) thread. Used by the TUI command-detail modal.
@@ -2118,56 +2196,38 @@ PROMPT_TURN_LIMIT = 200
 TURN_ACTION_LIMIT = 500
 
 
-def prompt_turns(con, limit=PROMPT_TURN_LIMIT, session_id=None,
-                 raw_scan=PROMPT_TURN_RAW_SCAN):
-    """One row per user prompt, newest-first, with what happened in its window.
+# The result keys of one turn row, in the SELECT's column order. Shared by
+# `prompt_turns` and `find_turn` so a caller can render either the same way (the
+# TUI's `PromptTurn` record is pinned against this set in the test suite).
+_TURN_ROW_KEYS = ["session_id", "ts", "next_ts", "event_id", "preview", "full_len",
+                  "tools", "bash", "agents", "subcalls", "output_tokens",
+                  "subagent_output_tokens", "requests", "last_ts", "project", "cwd"]
 
-    Only main-thread turns become rows: a subagent's own turns are its task
-    prompt, which belongs under its parent's turn rather than next to it. A
-    mid-turn user message (Claude Code delivers one as a new `user` event while
-    the turn is still running) starts a NEW group - the correct reading of
-    "grouped by prompt" rather than pretending turns are atomic.
 
-    Harness-generated turns (`TURN_NOISE_PATTERN`, the SQL twin of
-    `TURN_NOISE_RE`) never become rows, and several kept turns sharing one
-    `(session_id, ts)` - an image plus its caption, a `<command-name>` block plus
-    a bare `/compact` - collapse to the longest cleaned text, because left alone
-    they would produce phantom zero-width windows.
+def _turn_rows(con, where, params, pick, pick_params=(), raw_scan=None):
+    """The turn-model query itself: the list (`prompt_turns`) and the single-turn
+    lookup (`find_turn`) are both this, with a different `pick`.
 
-    Returns a list of dicts: `session_id, ts, next_ts, event_id, preview,
-    full_len, tools, bash, agents, subcalls, output_tokens,
-    subagent_output_tokens, requests, last_ts, project, cwd`. Timestamps come
-    back as strings (materializing a raw TIMESTAMPTZ needs the optional `pytz`);
-    `next_ts` is None for each session's newest turn and `last_ts` None for a
-    turn that emitted no API request. Every count coalesces to 0, never None.
-    Token numbers are the turn's generation cost by the same attribute-by-time
-    rule the `command_tokens` view documents, so a turn whose reply carried no
-    usage row honestly reports 0. `cwd` is the session's exact launch dir and
-    `project` the lossy dir-name decoding of it (see `_decode_project`), so a
-    caller showing a path prefers `cwd`. `cwd` is None in two cases: the
-    transcript has left the disk, or it is still there but carries no cwd in its
-    head (measured here: 10 of 127, all sub-300-byte stubs). Everything else
-    `backfill_session_cwd` fills on the next ingest. Read-only; never raises for a
-    caller that already guarded the connection.
+    `where` bounds the raw user-turn scan and `raw_scan` caps it (None = uncapped,
+    which only `find_turn` uses, and only ever scoped to ONE session). `pick` is
+    the SELECT over `win` that decides which windows become result rows. What sits
+    between them - the clean, the noise filter, the same-timestamp collapse, the
+    `lead(ts)` window and the per-window aggregates - is written once here, so the
+    list and a turn opened out of it can never disagree about where that turn
+    starts or ends.
+
+    Bind order is `where`'s params, then the clean/noise params this function
+    owns, then `pick`'s own. Reminder regex, trim charset and noise regex are each
+    bound from their one Python definition (`PROMPT_CLEAN_PARAMS`,
+    `_prefix_alternation`), so the SQL clean cannot drift from
+    `clean_prompt_text`: `preview` is always a prefix of `turn_prompt_text` for
+    the same turn, and the `^` noise anchor sees the same string in both engines.
     """
-    where = ["type = 'user'", "agent_id IS NULL", "ts IS NOT NULL"]
-    params = []
-    # Filter inside the bounded scan, not after it, so `session_id=` sees that
-    # session's newest `raw_scan` turns rather than whatever survives a global cut.
-    if session_id:
-        where.append("session_id = ?")
-        params.append(session_id)
-    # Reminder regex, trim charset and noise regex are each bound from their one
-    # Python definition (`PROMPT_CLEAN_PARAMS`, `_prefix_alternation`), so the SQL
-    # clean cannot drift from `clean_prompt_text`: `preview` is always a prefix of
-    # `turn_prompt_text` for the same turn, and the `^` noise anchor sees the same
-    # string in both engines.
-    params += [*PROMPT_CLEAN_PARAMS, TURN_NOISE_PATTERN]
+    bound = f" ORDER BY ts DESC LIMIT {int(raw_scan)}" if raw_scan else ""
     rows = con.execute(
         f"""WITH raw AS (
                 SELECT session_id, ts, event_id, text FROM events
-                WHERE {' AND '.join(where)}
-                ORDER BY ts DESC LIMIT {int(raw_scan)}),
+                WHERE {' AND '.join(where)}{bound}),
             kept AS (
                 SELECT session_id, ts, event_id, {PROMPT_CLEAN_SQL} AS clean
                 FROM raw),
@@ -2189,7 +2249,7 @@ def prompt_turns(con, limit=PROMPT_TURN_LIMIT, session_id=None,
                        length(clean) AS full_len,
                        lead(ts) OVER (PARTITION BY session_id ORDER BY ts) AS next_ts
                 FROM turns),
-            recent AS (SELECT * FROM win ORDER BY ts DESC LIMIT {int(limit)}),
+            recent AS ({pick}),
             acts AS (
                 SELECT r.event_id, count(*) AS tools,
                        count(*) FILTER (WHERE a.tool_name = 'Bash')     AS bash,
@@ -2221,12 +2281,153 @@ def prompt_turns(con, limit=PROMPT_TURN_LIMIT, session_id=None,
             LEFT JOIN tok  t ON t.event_id = r.event_id
             LEFT JOIN sessions s ON s.session_id = r.session_id
             ORDER BY r.ts DESC""",
-        params,
+        [*params, *PROMPT_CLEAN_PARAMS, TURN_NOISE_PATTERN, *pick_params],
     ).fetchall()
-    keys = ["session_id", "ts", "next_ts", "event_id", "preview", "full_len",
-            "tools", "bash", "agents", "subcalls", "output_tokens",
-            "subagent_output_tokens", "requests", "last_ts", "project", "cwd"]
-    return [dict(zip(keys, row)) for row in rows]
+    return [dict(zip(_TURN_ROW_KEYS, row)) for row in rows]
+
+
+def _raw_turn_filter(session_id=None, since=None):
+    """`(where, params)` bounding the RAW user turns a turn query may look at.
+
+    One definition for every caller that has to agree about that set: the list's
+    scan (`prompt_turns`), the single-turn lookup (`find_turn`) and the CLI's
+    count of how many turns a scan could still reach (`_raw_turn_count`). A
+    second copy of these three predicates would make "how many are there" and
+    "which ones were scanned" drift apart silently.
+
+    The bounds go INSIDE the scan rather than after it, so `session_id=` sees
+    that session's newest `raw_scan` turns rather than whatever survives a global
+    cut, and `since` costs only turns older than itself (see `prompt_turns`).
+    """
+    where = ["type = 'user'", "agent_id IS NULL", "ts IS NOT NULL"]
+    params = []
+    if session_id:
+        where.append("session_id = ?")
+        params.append(session_id)
+    if since:
+        where.append("ts >= try_cast(? AS TIMESTAMPTZ)")
+        params.append(since)
+    return where, params
+
+
+def prompt_turns(con, limit=PROMPT_TURN_LIMIT, session_id=None,
+                 raw_scan=PROMPT_TURN_RAW_SCAN, since=None):
+    """One row per user prompt, newest-first, with what happened in its window.
+
+    Only main-thread turns become rows: a subagent's own turns are its task
+    prompt, which belongs under its parent's turn rather than next to it. A
+    mid-turn user message (Claude Code delivers one as a new `user` event while
+    the turn is still running) starts a NEW group - the correct reading of
+    "grouped by prompt" rather than pretending turns are atomic.
+
+    Harness-generated turns (`TURN_NOISE_PATTERN`, the SQL twin of
+    `TURN_NOISE_RE`) never become rows, and several kept turns sharing one
+    `(session_id, ts)` - an image plus its caption, a `<command-name>` block plus
+    a bare `/compact` - collapse to the longest cleaned text, because left alone
+    they would produce phantom zero-width windows.
+
+    Returns a list of dicts: `session_id, ts, next_ts, event_id, preview,
+    full_len, tools, bash, agents, subcalls, output_tokens,
+    subagent_output_tokens, requests, last_ts, project, cwd`. Timestamps come
+    back as strings (materializing a raw TIMESTAMPTZ needs the optional `pytz`);
+    `next_ts` is None for each session's newest turn and `last_ts` None for a
+    turn that emitted no API request. Every count coalesces to 0, never None.
+    Token numbers are the turn's generation cost by the same attribute-by-time
+    rule the `command_tokens` view documents, so a turn whose reply carried no
+    usage row honestly reports 0. `cwd` is the session's exact launch dir and
+    `project` the lossy dir-name decoding of it (see `_decode_project`), so a
+    caller showing a path prefers `cwd`. `cwd` is None in two cases: the
+    transcript has left the disk, or it is still there but carries no cwd in its
+    head (measured here: 10 of 127, all sub-300-byte stubs). Everything else
+    `backfill_session_cwd` fills on the next ingest. Read-only; never raises for a
+    caller that already guarded the connection.
+
+    `since` is a lower time bound applied INSIDE the raw scan (`ts >= since`), not
+    after it: filtering afterwards would cut the newest-`raw_scan` window down and
+    silently return fewer rows than `limit` asked for. Taking the window after the
+    bound keeps the suffix-closure argument intact - the next prompt of any kept
+    turn is newer than it, so it is fetched too - and the only turns it can cost
+    are ones older than the bound, which is what was asked. A value DuckDB cannot
+    read as a timestamp matches nothing (`try_cast` -> NULL), so a caller taking
+    one from a human should check it first (`cmd_prompts` does).
+    """
+    where, params = _raw_turn_filter(session_id, since)
+    return _turn_rows(con, where, params,
+                      f"SELECT * FROM win ORDER BY ts DESC LIMIT {int(limit)}",
+                      raw_scan=raw_scan)
+
+
+def find_turn(con, session_id=None, at=None, event_id=None):
+    """ONE turn, resolved by `event_id` or by `(session_id, at)`.
+
+    `event_id` is the id `prompt_turns` puts on the row, so the two compose: list
+    the turns, then open one by its id. An id that is not a main-thread user turn,
+    or one that LOST the same-timestamp collapse (longest cleaned text wins, ties
+    to the highest event_id, see `_turn_rows`), resolves to nothing - it is not a
+    turn this model has.
+
+    `at` resolves to the newest turn AT OR BEFORE it, the rule `cat --at` already
+    uses, so a time pointing into the middle of a turn finds that turn. Both
+    shapes of bound answer correctly, because the two are asking different
+    questions:
+
+    - a FULL-PRECISION bound (a row's own `ts`, which `prompts --json` prints and
+      `_turn_time` invites pasting back) compares exactly, `ts <= at`;
+    - a WHOLE-SECOND bound (the `HH:MM:SS` a rendered list shows) is widened to
+      that whole second, because `events.ts` keeps milliseconds: the turn printed
+      as `11:17:31` is really `11:17:31.112`, and an exact `<=` would answer that
+      printed string with the PREVIOUS turn.
+
+    Truncating the turn's ts for BOTH (what this did before) broke the first case:
+    a bound of `11:17:45.671` matched a turn at `11:17:45.777` and returned a
+    turn LATER than the one the bound was copied from - measured on a real store
+    at 8 of the newest 400 turns and 13 of the newest 200 in its longest session,
+    every one of them a `/compact` pair ~100ms apart, each handed the following
+    turn's window instead of its own.
+
+    What a whole-second bound cannot do is tell two turns INSIDE one second
+    apart: it lands on the newest of them, which is the row the list prints for
+    that second. `event_id` is how to name the other one.
+
+    `at` needs `session_id`, because turns from different sessions interleave and
+    "the turn at 10:30" is only a question about one session.
+
+    Returns a dict with the same keys as a `prompt_turns` row, or None. The scan
+    is NOT capped at `raw_scan`: it is scoped to one session, whose whole turn
+    history is a small fraction of the store-wide 5,433 that cap exists for, and
+    capping it would put an older turn out of reach. Read-only.
+    """
+    if event_id:
+        # The session first, so the scan below stays scoped to one session; an
+        # event that is not a main-thread user turn stops here.
+        row = con.execute(
+            "SELECT session_id FROM events "
+            "WHERE event_id = ? AND type = 'user' AND agent_id IS NULL",
+            [event_id],
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        session_id = row[0]
+        pick, pick_params = "SELECT * FROM win WHERE event_id = ?", [event_id]
+    elif session_id and at:
+        # Both rules in one predicate, decided by the BOUND rather than by the
+        # caller: the second disjunct is false whenever `at` carries a sub-second
+        # part, and when it does not it subsumes the first (date_trunc(ts) <= ts),
+        # so each shape of bound reduces to exactly one comparison. Binding the
+        # same string four times keeps the decision inside the SQL, where an
+        # unreadable `at` still degrades to "no rows" through `try_cast`.
+        pick = ("SELECT * FROM win "
+                "WHERE ts <= try_cast(? AS TIMESTAMPTZ) "
+                "   OR (date_trunc('second', ts) <= try_cast(? AS TIMESTAMPTZ) "
+                "       AND try_cast(? AS TIMESTAMPTZ) "
+                "           = date_trunc('second', try_cast(? AS TIMESTAMPTZ))) "
+                "ORDER BY ts DESC LIMIT 1")
+        pick_params = [at, at, at, at]
+    else:
+        return None
+    where, params = _raw_turn_filter(session_id)
+    rows = _turn_rows(con, where, params, pick, pick_params)
+    return rows[0] if rows else None
 
 
 def turn_actions(con, session_id, ts, next_ts=None, limit=TURN_ACTION_LIMIT):
@@ -2291,6 +2492,477 @@ def turn_prompt_text(con, event_id):
     if not row:
         return None
     return clean_prompt_text(row[0]) or None
+
+
+# --- Prompts CLI: the turn model without the TUI (Phase 6) ---------------------
+#
+# `claude-trail prompts` is the Prompts tab as plain text, over the same
+# read-only path as `search` / `tokens`. Two forms: the list, and one turn's tool
+# calls (`--at` + `--session`, or `--event-id`). Output is plain `print`, sized
+# from its own content and never from the terminal, so it reads the same in a
+# pipe as on a tty and `--json` is what a script should parse.
+
+PROMPT_CLI_LIMIT = 30             # list default, same order as `tokens`' 30
+PROMPT_CLI_SESSION_LEN = 8        # short session id, as `search`/`tokens` print it
+PROMPT_CLI_AGENT_ID_LEN = 4       # short agent id, the TUI's AGENT_ID_LABEL_LEN
+PROMPT_CLI_PROJECT_WIDTH = 20     # the Project cell, shortened like the TUI's
+PROMPT_CLI_PREVIEW_CHARS = 100    # the one-line Prompt cell; --json keeps all 400
+PROMPT_CLI_PROMPT_LINES = 10      # prompt lines quoted by the single-turn header
+
+_PROMPTS_USAGE = (
+    "usage: claude-trail prompts [--session S] [--limit N] [--since ISO] [--json]\n"
+    "       claude-trail prompts --at ISO --session S [--json]\n"
+    "       claude-trail prompts --event-id E [--json]")
+
+# flag -> option key. Every one of them takes a value; `--json` and `-h/--help`
+# are the only bare flags.
+_PROMPTS_VALUE_FLAGS = {"--session": "session", "--limit": "limit",
+                        "--since": "since", "--at": "at", "--event-id": "event_id"}
+
+_PROMPT_CLI_HEADERS = ("time", "sess", "project", "calls", "agents", "tokens",
+                       "prompt")
+
+
+def _parse_prompts_args(args):
+    """`prompts`' argv tail as an options dict, or `(None, message)`.
+
+    Hand-rolled like the rest of this file's CLI (there is no argparse anywhere
+    in it), but strict where the older parsers are permissive: an unknown flag is
+    an error instead of being ignored, because `--sesion 29dea45c` quietly listing
+    every session is worse than a usage line.
+    """
+    opts = {"help": False, "json": False, "session": None, "limit": None,
+            "since": None, "at": None, "event_id": None}
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-h", "--help"):
+            opts["help"] = True
+            return opts, None
+        if arg == "--json":
+            opts["json"] = True
+            i += 1
+            continue
+        key = _PROMPTS_VALUE_FLAGS.get(arg)
+        if key is None:
+            return None, f"unknown argument: {arg}"
+        if i + 1 >= len(args):
+            return None, f"{arg} needs a value"
+        opts[key] = args[i + 1]
+        i += 2
+    if opts["at"] and opts["event_id"]:
+        return None, "--at and --event-id both select one turn; pass just one"
+    if opts["event_id"] and opts["session"]:
+        # `find_turn` reads the session off the event, so accepting both would
+        # let `--session A --event-id <an id from B>` dump B's turn under A's
+        # name without a word.
+        return None, ("--event-id names its own session; drop --session "
+                      "(use --session with --at to select by time)")
+    if opts["at"] and not opts["session"]:
+        return None, "--at needs --session: turns from different sessions interleave"
+    # The list's bounds against the one-turn forms: the usage block already keeps
+    # them on separate lines, and silently dropping them would let a scripted
+    # caller believe `--since` narrowed a dump it cannot narrow.
+    if opts["at"] or opts["event_id"]:
+        given = [flag for flag, key in (("--since", "since"), ("--limit", "limit"))
+                 if opts[key] is not None]
+        if given:
+            return None, (f"{' and '.join(given)} bound the LIST; "
+                          "--at/--event-id already select one turn")
+    if opts["limit"] is None:
+        opts["limit"] = PROMPT_CLI_LIMIT
+        return opts, None
+    try:
+        opts["limit"] = max(1, int(opts["limit"]))
+    except ValueError:
+        return None, f"--limit wants a number, got {opts['limit']!r}"
+    return opts, None
+
+
+def _short_project_path(path):
+    """`short_path(path, PROMPT_CLI_PROJECT_WIDTH)`, from the TUI module.
+
+    The ONE helper this CLI still reads upwards, because its default width comes
+    from the `.env` column machinery that lives up there (`_env_int` /
+    `DIR_LABEL_WIDTH`) and moving the function down would drag that with it. The
+    width is passed explicitly, so nothing printed here depends on the user's
+    column settings; the other shared text helpers (`action_label`,
+    `short_tool_name`, `slash_label`) live in this module and the TUI imports
+    them.
+
+    Taken from `sys.modules` first: `claude_trail.py` run straight from a clone
+    IS `__main__`, and a plain `import claude_trail` would then execute that whole
+    module a second time just to reach one function.
+    """
+    for name in ("claude_trail", "__main__"):
+        mod = sys.modules.get(name)
+        if mod is not None and hasattr(mod, "short_path"):
+            return mod.short_path(path, PROMPT_CLI_PROJECT_WIDTH)
+    import claude_trail
+    return claude_trail.short_path(path, PROMPT_CLI_PROJECT_WIDTH)
+
+
+def _turn_time(ts, time_only=False):
+    """`YYYY-MM-DD HH:MM:SS` (or just `HH:MM:SS`) out of a `ts::VARCHAR`.
+
+    Sliced, not parsed: DuckDB already renders a TIMESTAMPTZ as
+    `2026-07-27 10:30:38+02` (sub-second when it has one), so the head is the text
+    to print - and `datetime.fromisoformat` would reject that 2-digit offset on
+    Python 3.10, the trap the plan records against the TUI's `format_time`.
+    Printing the whole date is what makes `--at` chainable: copy a list row's
+    time, paste it back.
+    """
+    text = (ts or "").strip()
+    return text[11:19] if time_only else text[:19]
+
+
+# Terminal control characters, stripped from every piece of STORED text this CLI
+# prints. A prompt is the likeliest place in the whole store to find pasted
+# terminal output, and a `\x1b[2J` or a `\x07` in one would be obeyed by the
+# terminal reading the list rather than shown in it (the TUI is safe here only
+# because Rich escapes for it). Tab becomes a space so a cell's printed width
+# stays its `len`, which is what `_print_columns` pads by; every other C0 control
+# and DEL is dropped. `--json` needs none of this: `json.dumps` escapes controls
+# to `\uXXXX`.
+_PLAIN_TEXT_MAP = {c: None for c in (*range(0x20), 0x7f)}
+_PLAIN_TEXT_MAP[0x09] = " "
+
+
+def _plain_text(line):
+    """One LINE of stored text with its control characters removed.
+
+    Per line, after the split: the map deletes `\\n` and `\\r` too, so running it
+    over a whole prompt would run its lines together.
+    """
+    return line.translate(_PLAIN_TEXT_MAP)
+
+
+def _turn_preview_line(turn):
+    """The turn's first non-blank line for the list's Prompt cell.
+
+    `slash_label` here and not in the query, for the same reason the TUI applies
+    it at render time: it collapses a whole `<command-name>` block to `/compact`,
+    right for a one-line cell and wrong for the full text. Capped at
+    PROMPT_CLI_PREVIEW_CHARS so twenty rows stay readable; `--json` carries the
+    query's full 400-char preview. The cut is marked with the `…` that
+    `short_path` puts in the Project cell of the same row, so one list row does
+    not spell "shortened" two ways.
+    """
+    label = slash_label(turn["preview"] or "")
+    lines = (_plain_text(ln).strip() for ln in label.splitlines())
+    line = next((ln for ln in lines if ln), "")
+    if not line:
+        return "(empty)"
+    if len(line) > PROMPT_CLI_PREVIEW_CHARS:
+        return line[:PROMPT_CLI_PREVIEW_CHARS - 1] + "…"
+    return line
+
+
+def _turn_list_cells(turn):
+    """One list row, in `_PROMPT_CLI_HEADERS` order.
+
+    Same numbers the Prompts tab shows: `calls` is the window-wide total with its
+    Bash share (a turn that ran nothing is a real turn and gets `-`, not a `0`
+    that reads as missing data), `agents` is blank when none ran, and `tokens` is
+    the window's output with the subagent part called out. Counts are printed
+    unabbreviated (the TUI's `24.2k` is a width compromise a CLI does not need)
+    and without thousands separators, so the column stays easy to cut and sort.
+    """
+    calls = "-"
+    if turn["tools"]:
+        calls = str(turn["tools"])
+        if turn["bash"]:
+            calls += f" ({turn['bash']} bash)"
+    tokens = str(turn["output_tokens"])
+    if turn["subagent_output_tokens"]:
+        tokens += f" (+{turn['subagent_output_tokens']} sub)"
+    return (
+        _turn_time(turn["ts"]),
+        (turn["session_id"] or "")[:PROMPT_CLI_SESSION_LEN],
+        # cwd is the session's exact launch dir, `project` the lossy dir-name
+        # decoding behind it; the TUI prefers the same way round.
+        _short_project_path(turn["cwd"] or turn["project"] or ""),
+        calls,
+        str(turn["agents"]) if turn["agents"] else "",
+        tokens,
+        _turn_preview_line(turn),
+    )
+
+
+def _print_columns(rows):
+    """Print `rows` (tuples of str) left-aligned, padding each column to the
+    widest cell in it.
+
+    Width comes from the CONTENT, never from the terminal: the same rows print
+    identically on a tty and through a pipe, and nothing is truncated to fit a
+    width the caller cannot see. The last column is therefore never padded.
+    """
+    if not rows:
+        return
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    for row in rows:
+        print("  ".join(cell.ljust(width)
+                        for cell, width in zip(row, widths)).rstrip())
+
+
+def _turn_work_text(turn):
+    """The Work line in plain text, wording copied from the TUI's turn page.
+
+    `tools` is INCLUSIVE of `subcalls`, so the main-thread count is a
+    SUBTRACTION; adding them would claim 105 calls for a turn that made 64. The
+    Bash count is window-wide (subagents included), so it stands on its own
+    rather than nested under the main-thread count.
+    """
+    if not turn["tools"]:
+        return "no tool calls"
+    text = f"{turn['tools']} tool call{'' if turn['tools'] == 1 else 's'}"
+    parts = []
+    if turn["subcalls"]:
+        main = max(0, turn["tools"] - turn["subcalls"])
+        agents = turn["agents"]
+        parts.append(f"{main} main, {turn['subcalls']} across "
+                     f"{agents} subagent{'' if agents == 1 else 's'}")
+    if turn["bash"]:
+        parts.append(f"{turn['bash']} bash")
+    return text + (": " + ", ".join(parts) if parts else "")
+
+
+def _turn_tokens_text(turn):
+    """The Tokens line: the window's generation cost and what it took.
+
+    `requests == 0` means no API request was attributed to the window, normally
+    because the ingest has not caught up with the turn yet - said in words rather
+    than printed as a bare `0 output`, which would read as a measurement.
+    """
+    if not turn["requests"]:
+        return "no requests attributed to this window yet (ingest lags the turn)"
+    parts = [f"{turn['output_tokens']} output"]
+    if turn["subagent_output_tokens"]:
+        parts.append(f"{turn['subagent_output_tokens']} by subagents")
+    parts.append(f"{turn['requests']} request"
+                 f"{'' if turn['requests'] == 1 else 's'}")
+    return ", ".join(parts)
+
+
+def _print_turn_prompt(turn):
+    """Quote the turn's prompt under the single-turn header.
+
+    The row's own preview, not `turn_prompt_text`: the preview is capped at 400
+    chars by the query while a real turn can run to 646,245, and a dump is not
+    the place to discover that. Both cuts (lines beyond
+    PROMPT_CLI_PROMPT_LINES, chars beyond the preview) are stated rather than
+    silent.
+    """
+    preview = turn["preview"] or ""
+    # `prompt_turns` drops a turn whose cleaned text is empty, so the placeholder
+    # is a guard, not a case: it keeps the label from standing over nothing.
+    lines = preview.splitlines() or ["(empty)"]
+    shown = [_plain_text(line) for line in lines[:PROMPT_CLI_PROMPT_LINES]]
+    for idx, line in enumerate(shown):
+        label = "prompt" if idx == 0 else ""
+        print(f"{label:<9} {line}".rstrip() if line else label)
+    notes = []
+    if len(lines) > len(shown):
+        notes.append(f"{len(lines) - len(shown)} more lines")
+    dropped = max(0, (turn["full_len"] or 0) - len(preview))
+    if dropped:
+        notes.append(f"{dropped} more chars")
+    if notes:
+        print(f"{'':<9} [+{', '.join(notes)}]")
+
+
+def _print_turn_detail(turn, actions):
+    """One turn's header plus its tool calls, oldest-first.
+
+    Oldest-first is the order the work happened in and the order `turn_actions`
+    returns, which is what makes the dump readable as a story. The Agent cell is
+    `main` or the subagent's short id (the TUI draws a tree gutter for the same
+    thing; a flat column greps better). A failed call is marked at the END of the
+    line, so the Detail column keeps its alignment and `grep '\\[error\\]'` finds
+    every one. A turn that ran nothing gets the sentence and no table: a header
+    over no rows reads as a truncated dump.
+    """
+    project = turn["cwd"] or turn["project"] or ""
+    sent = _turn_time(turn["ts"])
+    if turn["last_ts"]:
+        # The last request the store attributed to the window, not `next_ts`:
+        # next_ts is when the user next typed, so a turn answered in seconds and
+        # left on screen overnight would claim fourteen hours of work.
+        sent += f"   last request {_turn_time(turn['last_ts'])}"
+    head = [("session", f"{turn['session_id']}  {project}".rstrip()),
+            ("sent", sent),
+            ("work", _turn_work_text(turn)),
+            ("tokens", _turn_tokens_text(turn)),
+            ("event-id", turn["event_id"])]
+    for label, value in head:
+        print(f"{label:<9} {value}")
+    _print_turn_prompt(turn)
+    print()
+    if not actions:
+        print("(no tool calls in this turn)")
+        return
+    rows = [("time", "agent", "tool", "detail")]
+    for action in actions:
+        label = action_label(action["tool_name"], action["text"],
+                             action["tool_input"])
+        detail = " ".join(_plain_text(label).split())
+        if action["is_error"]:
+            detail = f"{detail or '-'}  [error]"
+        rows.append((
+            _turn_time(action["ts"], time_only=True),
+            # The same first-N slice the TUI's `short_agent_id` makes, taken here
+            # rather than out of the TUI: N is that module's own label constant,
+            # and one number is not worth an upward import.
+            (action["agent_id"] or "")[:PROMPT_CLI_AGENT_ID_LEN] or "main",
+            short_tool_name(action["tool_name"] or "?"),
+            detail or "-",
+        ))
+    _print_columns(rows)
+
+
+def _castable_ts(con, value):
+    """True when DuckDB reads `value` as a timestamp. Asked BEFORE the query so a
+    typo in `--since`/`--at` is a message rather than a silently empty result
+    (both bind through `try_cast`, which turns an unreadable value into NULL and
+    therefore into "no rows")."""
+    return bool(con.execute("SELECT try_cast(? AS TIMESTAMPTZ) IS NOT NULL",
+                            [value]).fetchone()[0])
+
+
+def _resolve_session_prefix(con, prefix):
+    """The full session id a `--session` prefix names, or `(None, message)`.
+
+    `search` and `tokens` match a session prefix with LIKE, and a user reading the
+    8-char `sess` column has only a prefix to give back. `prompt_turns` itself
+    takes an EXACT id (the TUI always holds one), so the prefix is resolved here
+    instead of loosening the query. An unknown prefix comes back unchanged and the
+    query returns nothing, which is the honest answer for a session the store
+    never saw.
+    """
+    ids = [row[0] for row in con.execute(
+        "SELECT session_id FROM sessions WHERE session_id LIKE ? ORDER BY session_id",
+        [prefix + "%"]).fetchall()]
+    if prefix in ids or not ids:
+        return prefix, None
+    if len(ids) > 1:
+        sample = ", ".join(i[:PROMPT_CLI_SESSION_LEN] for i in ids[:3])
+        return None, (f"--session {prefix} matches {len(ids)} sessions "
+                      f"({sample}, ...); use more characters")
+    return ids[0], None
+
+
+def _raw_turn_count(con, session_id=None, since=None):
+    """How many raw user turns a list scan could reach at most, under the same
+    bounds the scan itself applies (`_raw_turn_filter`). One cheap count, so
+    `_list_turns` knows when widening the scan has stopped buying anything."""
+    where, params = _raw_turn_filter(session_id, since)
+    return con.execute(
+        f"SELECT count(*) FROM events WHERE {' AND '.join(where)}",
+        params).fetchone()[0]
+
+
+def _list_turns(con, limit, session_id=None, since=None):
+    """`prompt_turns`, scanned until `limit` rows come back or the store runs out.
+
+    `raw_scan` bounds RAW user turns and the noise filter drops them AFTER the
+    scan, so no single guess at the scan size makes `--limit` mean what it says:
+    on the live store roughly half of the raw turns are harness noise, and a
+    fixed 2x scan for `--limit 500` came back with 466 rows. A scan cannot keep
+    more turns than it scanned, so the first pass starts at `limit` (never below
+    PROMPT_TURN_RAW_SCAN, whose cost is the measured one) and each further pass
+    doubles towards the raw count. The count is the stop condition: once the scan
+    covers every candidate turn, a short list is the honest answer rather than a
+    scan-size artifact.
+
+    Widening rather than scanning everything up front is the point: an uncapped
+    clean of a real store's 5,433 main-thread turns costs 1.96s against 74ms for
+    the newest 400, and almost every call is a small `--limit` that the first
+    pass already fills.
+    """
+    total = _raw_turn_count(con, session_id, since)
+    if not total:
+        return []
+    scan = min(total, max(PROMPT_TURN_RAW_SCAN, limit))
+    while True:
+        turns = prompt_turns(con, limit=limit, session_id=session_id,
+                             since=since, raw_scan=scan)
+        if len(turns) >= limit or scan >= total:
+            return turns
+        scan = min(total, scan * 2)
+
+
+def _run_prompts(con, opts):
+    """`cmd_prompts` with the store already open (so the open/close stays in one
+    place and every exit path closes it)."""
+    session_id = opts["session"]
+    if session_id:
+        session_id, err = _resolve_session_prefix(con, session_id)
+        if err:
+            print(err, file=sys.stderr)
+            return 2
+    for flag in ("since", "at"):
+        if opts[flag] and not _castable_ts(con, opts[flag]):
+            print(f"--{flag} wants a timestamp, got {opts[flag]!r}", file=sys.stderr)
+            return 2
+    if opts["at"] or opts["event_id"]:
+        turn = find_turn(con, session_id=session_id, at=opts["at"],
+                         event_id=opts["event_id"])
+        if turn is None:
+            if opts["event_id"]:
+                print(f"no turn with event-id {opts['event_id']}; "
+                      "`prompts --json` prints each turn's event_id",
+                      file=sys.stderr)
+            else:
+                print(f"no turn at or before {opts['at']} in session "
+                      f"{session_id[:PROMPT_CLI_SESSION_LEN]}", file=sys.stderr)
+            return 1
+        actions = turn_actions(con, turn["session_id"], turn["ts"], turn["next_ts"])
+        if opts["json"]:
+            # No `default=`: every value a turn row and `turn_actions` carry is
+            # already str/int/bool/None (both timestamps come back ::VARCHAR), so
+            # a fallback stringifier could only hide a query that started
+            # returning something else. The `--json` tests are what pin that.
+            print(json.dumps({**turn, "actions": actions}, indent=2))
+        else:
+            _print_turn_detail(turn, actions)
+        return 0
+    turns = _list_turns(con, opts["limit"], session_id, opts["since"])
+    if opts["json"]:
+        print(json.dumps(turns, indent=2))
+    else:
+        _print_columns([_PROMPT_CLI_HEADERS,
+                        *(_turn_list_cells(t) for t in turns)])
+    return 0
+
+
+def cmd_prompts(argv):
+    """`claude-trail prompts`: the Prompts tab's list, and one turn's tool calls.
+
+    The CLI twin of the TUI tab, over the same read-only store open, so the turn
+    model has coverage that does not depend on a terminal. Exit codes follow the
+    other read commands: 2 for an argument the parser refuses, 1 for a store that
+    is not there (or is held by an ingest, which `cli_main` catches), 0 otherwise
+    - including an empty list, which is an answer, not a failure.
+    """
+    opts, err = _parse_prompts_args(argv[1:])
+    if opts is None:
+        print(err, file=sys.stderr)
+        print(_PROMPTS_USAGE, file=sys.stderr)
+        return 2
+    if opts["help"]:
+        print(_PROMPTS_USAGE)
+        return 0
+    if not STORE_PATH.exists():
+        # Opening read-only would raise on a missing file (`cmd_stats` guards the
+        # same way); say where it would live and how to make one.
+        print(f"no audit store at {STORE_PATH} yet - run: claude-trail ingest",
+              file=sys.stderr)
+        return 1
+    con = connect(read_only=True)
+    try:
+        return _run_prompts(con, opts)
+    finally:
+        con.close()
 
 
 def session_token_totals(con, session_id):
@@ -2537,8 +3209,9 @@ def cmd_diff(argv):
 def cli_main(argv):
     cmd = argv[0]
     fn = {"ingest": cmd_ingest, "search": cmd_search, "stats": cmd_stats,
-          "tokens": cmd_tokens, "cat": cmd_cat, "diff": cmd_diff,
-          "reset-db": cmd_reset_db, "prune-raw": cmd_prune_raw}[cmd]
+          "tokens": cmd_tokens, "prompts": cmd_prompts, "cat": cmd_cat,
+          "diff": cmd_diff, "reset-db": cmd_reset_db,
+          "prune-raw": cmd_prune_raw}[cmd]
     try:
         return fn(argv)
     except Exception as e:

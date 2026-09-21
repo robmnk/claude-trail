@@ -1398,6 +1398,17 @@ def _build_turn_store(tmp_path, monkeypatch, sid="sess-turns-01",
         _tool_use_line("o-a1", sid2, "2026-06-30T03:00:01.000Z", "req-O1",
                        [{"type": "tool_use", "id": "toolu-o1", "name": "Bash",
                          "input": {"command": "echo other"}}], 5),
+        # Two tools with no `_COMMAND_FIELD` entry, so the store stores `text`
+        # NULL for both and a caller has to label them from `tool_input` at
+        # render time (`action_label`). The MCP one also has a 40-char routing
+        # prefix that only its last `__` segment survives (`_short_tool_name`).
+        _tool_use_line("o-a2", sid2, "2026-06-30T03:00:02.000Z", "req-O2",
+                       [{"type": "tool_use", "id": "toolu-o2", "name": "Agent",
+                         "input": {"description": "Review phase 6",
+                                   "subagent_type": "review-opus-xhigh"}},
+                        {"type": "tool_use", "id": "toolu-o3",
+                         "name": "mcp__plugin_linear_linear__authenticate",
+                         "input": {"reason": "no known label field"}}], 6),
     ], _TURN_CWD))
     con = store.connect()
     try:
@@ -1830,8 +1841,9 @@ def test_prompt_record_fields_match_the_query_keys(tmp_path, monkeypatch):
         # Checked here, before the lookups below: a renamed key would otherwise
         # raise a KeyError out of `rows[0]["ts"]` instead of showing the diff.
         assert set(rows[0]) == {f.name for f in fields(feed.PromptTurn)}
-        # sid2's only turn is the newest in the store and holds one call in its
-        # open-ended window, so the newest row alone answers for both key sets.
+        # sid2's only turn is the newest in the store and holds every one of its
+        # calls in an open-ended window, so the newest row answers for both key
+        # sets.
         acts = store.turn_actions(con, sid2, rows[0]["ts"], rows[0]["next_ts"])
     finally:
         con.close()
@@ -1989,6 +2001,501 @@ def test_prompt_for_command_skips_an_image_echo_sharing_the_timestamp(tmp_path, 
     finally:
         con.close()
     assert p["text"] == "look at this screenshot"
+
+
+# --- find_turn + the `prompts` CLI --------------------------------------------
+#
+# Over the same `_build_turn_store` fixture as the turn-model tests above, so the
+# windows the CLI prints are the ones already pinned there. Rendered timestamps
+# are local (`ts::VARCHAR`), so every assertion goes through a preview, an
+# event_id or a UTC `Z` argument rather than a printed clock time.
+
+
+def _prompts(*args):
+    """Run `prompts` through cli_main (the dispatch the TUI hands off to) and
+    return its exit code."""
+    return store.cli_main(["prompts", *args])
+
+
+def _prompt_cells(out):
+    """The Prompt cell of each list row: the last column, which is the only one
+    the printer leaves unpadded."""
+    return [ln.split("  ")[-1].strip() for ln in out.splitlines()[1:]]
+
+
+def _build_session_store(tmp_path, monkeypatch, sid, events):
+    """Ingest ONE synthetic transcript and return its session id.
+
+    `_build_turn_store`'s shape for the cases below that need timestamps or text
+    of their own (turns inside one second, a noise-heavy history, control
+    characters in a prompt) rather than the shared fixture's."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", events)
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+    finally:
+        con.close()   # release the write lock for the read-only reopen
+    return sid
+
+
+def _one_second_events(sid):
+    """Three turns, two of them 800ms apart INSIDE one second: the shape a
+    rendered `HH:MM:SS` cannot tell apart but a full-precision `ts` can."""
+    return [
+        _user_prompt("os-u1", sid, "before the pair", "2026-06-30T02:00:09.000Z"),
+        _user_prompt("os-u2", sid, "earlier of the pair", "2026-06-30T02:00:10.100Z"),
+        _user_prompt("os-u3", sid, "later of the pair", "2026-06-30T02:00:10.900Z"),
+    ]
+
+
+# The long turn's Prompt cell: its 400-char preview cut to fit the list's
+# one-line cap, with the cut marked by the same `…` `short_path` uses for the
+# Project cell of the same row.
+_LONG_TURN_CELL = ("long turn " + "x" * 500)[:store.PROMPT_CLI_PREVIEW_CHARS - 1] + "…"
+
+
+def test_find_turn_by_event_id_and_by_nearest_timestamp(tmp_path, monkeypatch):
+    """One turn, resolved either way: an event_id lands on exactly that turn, and
+    a timestamp lands on the newest turn AT OR BEFORE it (the `cat --at` rule, so
+    a whole-second time copied out of the list still resolves)."""
+    sid, _sid2 = _build_turn_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        listed = _turn(store.prompt_turns(con), "first ask")
+        by_id = store.find_turn(con, event_id=listed["event_id"])
+        # 2.5s into the first turn: no turn starts here, so it steps back to it
+        mid = store.find_turn(con, session_id=sid, at="2026-06-30T02:00:02.500Z")
+        # exactly on the next prompt: that turn, not the one before it
+        on_bound = store.find_turn(con, session_id=sid, at="2026-06-30T02:00:05.000Z")
+    finally:
+        con.close()
+    assert by_id == listed                      # same keys AND same aggregates
+    assert mid["preview"] == "first ask"
+    assert mid["next_ts"] == listed["next_ts"]  # the window, not just the prompt
+    assert on_bound["preview"] == "mid-turn nudge"
+
+
+def test_find_turn_at_matches_the_printed_second(tmp_path, monkeypatch):
+    """A rendered timestamp is whole seconds while `events.ts` keeps
+    milliseconds, so the `at` comparison truncates the turn's ts to the second.
+    Without that, the exact string the list printed for a turn resolves to the
+    PREVIOUS one, which is the one thing `--at` must never do."""
+    sid = "sess-find-subsecond"
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", [
+        _user_prompt("ss-u1", sid, "earlier ask", "2026-06-30T02:00:00.000Z"),
+        _user_prompt("ss-u2", sid, "later ask", "2026-06-30T02:00:10.112Z"),
+    ])
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+    finally:
+        con.close()
+    con = store.connect(read_only=True)
+    try:
+        printed = store.find_turn(con, session_id=sid, at="2026-06-30T02:00:10.000Z")
+        before = store.find_turn(con, session_id=sid, at="2026-06-30T02:00:09.000Z")
+    finally:
+        con.close()
+    assert printed["preview"] == "later ask"    # the second it is printed as
+    assert before["preview"] == "earlier ask"   # a whole second earlier: still before
+
+
+def test_find_turn_at_tells_two_turns_inside_one_second_apart(tmp_path, monkeypatch):
+    """Which rule applies is decided by the BOUND, not by the turn.
+
+    Two turns 800ms apart print the same `HH:MM:SS`, so that whole-second string
+    resolves to the NEWER of them - the row the list shows for that second -
+    while each turn's own full-precision `ts` (what `prompts --json` prints and
+    `_turn_time` invites pasting back) resolves to ITSELF. Truncating the turn's
+    ts against an untruncated bound made the earlier turn's own timestamp answer
+    with the LATER turn: measured at 9 of the newest 400 turns of a real store,
+    every one of them a `/compact` pair ~100ms apart, each handed the wrong
+    (open-ended) window."""
+    sid = "sess-one-second"
+    _build_session_store(tmp_path, monkeypatch, sid, _one_second_events(sid))
+    con = store.connect(read_only=True)
+    try:
+        rows = store.prompt_turns(con, session_id=sid)
+        earlier, later = _turn(rows, "earlier of"), _turn(rows, "later of")
+        printed = store._turn_time(earlier["ts"])
+        by_printed = store.find_turn(con, session_id=sid, at=printed)
+        by_earlier_ts = store.find_turn(con, session_id=sid, at=earlier["ts"])
+        by_later_ts = store.find_turn(con, session_id=sid, at=later["ts"])
+    finally:
+        con.close()
+    assert printed == store._turn_time(later["ts"])      # one printed second...
+    assert by_printed["event_id"] == later["event_id"]   # ...lands on the newer
+    assert by_earlier_ts["event_id"] == earlier["event_id"]
+    assert by_later_ts["event_id"] == later["event_id"]
+    # and the window that came with it is the earlier turn's ~800ms one, not the
+    # later turn's open-ended one
+    assert by_earlier_ts["next_ts"] == later["ts"]
+
+
+def test_find_turn_returns_none_for_what_is_not_a_turn(tmp_path, monkeypatch):
+    """An unknown id, a subagent's own turn, a tool_use row, a time before the
+    session's first prompt, and an `at` with no session all resolve to nothing."""
+    sid, _sid2 = _build_turn_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        assert store.find_turn(con, event_id="no-such-event") is None
+        assert store.find_turn(con, event_id="t-s-u1") is None      # subagent turn
+        assert store.find_turn(con, event_id="toolu-t1") is None    # a tool call
+        assert store.find_turn(con, session_id=sid,
+                               at="2020-01-01T00:00:00.000Z") is None
+        assert store.find_turn(con, at="2026-06-30T02:00:02.500Z") is None
+        assert store.find_turn(con, session_id=sid) is None
+    finally:
+        con.close()
+
+
+def test_find_turn_ignores_an_event_id_that_lost_the_collapse(tmp_path, monkeypatch):
+    """Turns sharing one (session_id, ts) collapse to the longest text, so only
+    the WINNING event_id is a turn of this model; the other one is not a row the
+    list could ever have shown."""
+    sid = "sess-find-samets"
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    ts = "2026-06-30T02:00:00.000Z"
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", [
+        _user_prompt("f-short", sid, "/compact", ts),
+        _user_prompt("f-long", sid, "<command-name>/compact</command-name>", ts),
+    ])
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+    finally:
+        con.close()
+    con = store.connect(read_only=True)
+    try:
+        winner = store.find_turn(con, event_id="f-long")
+        loser = store.find_turn(con, event_id="f-short")
+    finally:
+        con.close()
+    assert winner["preview"] == "<command-name>/compact</command-name>"
+    assert loser is None
+
+
+def test_prompt_turns_since_keeps_the_bound_inclusive(tmp_path, monkeypatch):
+    """`since` is a lower bound on the turn's own timestamp: a turn exactly on it
+    is in, the one just before it is out."""
+    _build_turn_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        at_bound = store.prompt_turns(con, since="2026-06-30T02:00:05.000Z")
+        just_after = store.prompt_turns(con, since="2026-06-30T02:00:05.001Z")
+        unreadable = store.prompt_turns(con, since="not-a-timestamp")
+    finally:
+        con.close()
+    assert [r["preview"][:14] for r in at_bound] == [
+        "other session ", "long turn xxxx", "third ask", "mid-turn nudge"]
+    assert "mid-turn nudge" not in [r["preview"] for r in just_after]
+    # try_cast turns a value DuckDB cannot read into NULL, so it matches nothing;
+    # cmd_prompts checks the string before it gets here.
+    assert unreadable == []
+
+
+def test_prompt_turns_since_fills_the_limit_from_the_bounded_set(tmp_path, monkeypatch):
+    """The bound goes INSIDE the query, so `limit` is filled out of the turns that
+    survive it. Filtering the list afterwards in Python would spend the limit on
+    turns older than the bound and hand back fewer rows than were asked for."""
+    _build_turn_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        rows = store.prompt_turns(con, limit=2, since="2026-06-30T02:00:05.000Z")
+    finally:
+        con.close()
+    assert len(rows) == 2
+    assert [r["preview"][:14] for r in rows] == ["other session ", "long turn xxxx"]
+
+
+def test_cmd_prompts_lists_turns_newest_first(tmp_path, monkeypatch, capsys):
+    """The list is one line per turn under a header, newest first, carrying the
+    Prompts tab's numbers: calls with their Bash share, the subagent count, the
+    window's output tokens with the subagent part, and the prompt's first line."""
+    _build_turn_store(tmp_path, monkeypatch)
+    assert _prompts() == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].split() == ["time", "sess", "project", "calls", "agents",
+                                "tokens", "prompt"]
+    assert _prompt_cells("\n".join(lines)) == [
+        "other session ask", _LONG_TURN_CELL, "third ask",
+        "mid-turn nudge", "first ask"]
+    first = next(ln for ln in lines if ln.endswith("first ask"))
+    assert "3 (1 bash)" in first          # window total, INCLUDING the subagent's
+    assert "37 (+7 sub)" in first         # output tokens, subagent share called out
+    assert "sess-tur" in first            # the short session id
+    assert "fake-proj" in first           # the session's exact cwd, not `/fake/proj`
+    third = next(ln for ln in lines if ln.endswith("third ask"))
+    assert " - " in third                 # a zero-call turn reads `-`, not `0`
+
+
+def test_cmd_prompts_session_and_limit_scope_the_list(tmp_path, monkeypatch, capsys):
+    """`--session` scopes to one session (by prefix, like `search`/`tokens`) and
+    `--limit` caps the rows."""
+    _sid, _sid2 = _build_turn_store(tmp_path, monkeypatch)
+    assert _prompts("--session", "sess-turns-02") == 0
+    assert _prompt_cells(capsys.readouterr().out) == ["other session ask"]
+    assert _prompts("--session", "sess-turns-01", "--limit", "2") == 0
+    assert _prompt_cells(capsys.readouterr().out) == [_LONG_TURN_CELL, "third ask"]
+    # an unknown session is an empty list, not an error: the header still prints
+    assert _prompts("--session", "sess-nope") == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "time  sess  project  calls  agents  tokens  prompt"]
+
+
+def test_cmd_prompts_ambiguous_session_prefix_is_refused(tmp_path, monkeypatch, capsys):
+    """Both fixture sessions start `sess-turns-0`, and silently picking one would
+    misreport whose turns these are."""
+    _build_turn_store(tmp_path, monkeypatch)
+    assert _prompts("--session", "sess-turns-0") == 2
+    err = capsys.readouterr().err
+    assert "matches 2 sessions" in err
+
+
+def test_cmd_prompts_since_excludes_turns_before_the_bound(tmp_path, monkeypatch, capsys):
+    """`--since` drops the turns older than the bound and keeps the one on it."""
+    _build_turn_store(tmp_path, monkeypatch)
+    assert _prompts("--session", "sess-turns-01",
+                    "--since", "2026-06-30T02:00:05.000Z") == 0
+    kept = _prompt_cells(capsys.readouterr().out)
+    assert kept[-1] == "mid-turn nudge"      # exactly on the bound: in
+    assert "first ask" not in kept           # five seconds before it: out
+
+
+def test_cmd_prompts_at_takes_back_both_times_the_list_printed(tmp_path, monkeypatch, capsys):
+    """The chain `_turn_time` advertises, end to end: copy a time out of the
+    list, paste it into `--at`. The text list prints ONE whole second for two
+    turns 800ms apart and that string opens the newer of them; `--json` prints
+    each turn's full-precision `ts` and that one opens the turn it came from."""
+    sid = "sess-one-second"
+    _build_session_store(tmp_path, monkeypatch, sid, _one_second_events(sid))
+    assert _prompts("--session", sid, "--json") == 0
+    rows = json.loads(capsys.readouterr().out)
+    earlier, later = _turn(rows, "earlier of"), _turn(rows, "later of")
+    assert _prompts("--session", sid) == 0
+    printed = [ln.split("  ")[0] for ln in capsys.readouterr().out.splitlines()[1:]]
+    assert printed[0] == printed[1]          # both turns, one printed second
+    for at, expected in ((printed[0], later["event_id"]),
+                         (earlier["ts"], earlier["event_id"]),
+                         (later["ts"], later["event_id"])):
+        assert _prompts("--session", sid, "--at", at) == 0, at
+        assert f"event-id  {expected}" in capsys.readouterr().out, at
+
+
+def test_cmd_prompts_limit_is_filled_past_the_dropped_noise_turns(tmp_path, monkeypatch,
+                                                                  capsys):
+    """`--limit N` means N rows, not "whatever N raw turns survive".
+
+    The scan bounds RAW user turns and the noise filter drops them AFTER it, so
+    on a history that is 3/4 harness noise a single pass comes back short (on the
+    live store, a fixed 2x scan for `--limit 500` returned 466). The scan widens
+    until the limit is filled, and stops once it covers every turn there is."""
+    sid = "sess-noisy-scan"
+    events = []
+    for i in range(16):
+        real = i % 4 == 3
+        events.append(_user_prompt(
+            f"ns-u{i}", sid,
+            f"real ask {i}" if real else f"<task-notification>agent {i}</task-notification>",
+            f"2026-06-30T02:{i:02d}:00.000Z"))
+    _build_session_store(tmp_path, monkeypatch, sid, events)
+    # The floor is the TUI's measured 400, which would swallow this whole fixture
+    # in one pass; shrink it so the widening is what fills the limit.
+    monkeypatch.setattr(store, "PROMPT_TURN_RAW_SCAN", 4)
+    assert _prompts("--session", sid, "--limit", "4") == 0
+    assert _prompt_cells(capsys.readouterr().out) == [
+        "real ask 15", "real ask 11", "real ask 7", "real ask 3"]
+    # more than the store holds: what exists, and no endless widening
+    assert _prompts("--session", sid, "--limit", "50") == 0
+    assert len(_prompt_cells(capsys.readouterr().out)) == 4
+
+
+def test_cmd_prompts_strips_terminal_control_characters(tmp_path, monkeypatch, capsys):
+    """Prompt text is the likeliest place in this store to find PASTED TERMINAL
+    OUTPUT, and this printer writes to a real terminal: an ANSI escape or a BEL
+    in a prompt (or in a command it ran) must print as text rather than be obeyed
+    by the terminal reading it. `--json` keeps them, escaped as `\\uXXXX`."""
+    sid = "sess-control-chars"
+    _build_session_store(tmp_path, monkeypatch, sid, [
+        _user_prompt("cc-u1", sid, "\x1b[31mRED\x1b[0m and a \x07bell\nsecond line",
+                     "2026-06-30T02:00:00.000Z"),
+        _tool_use_line("cc-a1", sid, "2026-06-30T02:00:01.000Z", "req-C1",
+                       [{"type": "tool_use", "id": "toolu-c1", "name": "Bash",
+                         "input": {"command": "echo \x1b[2Jclear"}}], 5),
+    ])
+    assert _prompts("--session", sid) == 0
+    listed = capsys.readouterr().out
+    assert _prompt_cells(listed) == ["[31mRED[0m and a bell"]
+    assert _prompts("--session", sid, "--at", "2026-06-30T02:00:02.000Z") == 0
+    dumped = capsys.readouterr().out
+    assert "prompt    [31mRED[0m and a bell" in dumped
+    assert dumped.rstrip().endswith("echo [2Jclear")
+    for out in (listed, dumped):
+        assert "\x1b" not in out and "\x07" not in out
+    assert _prompts("--session", sid, "--json") == 0
+    assert "\\u001b" in capsys.readouterr().out
+
+
+def test_cmd_prompts_json_round_trips(tmp_path, monkeypatch, capsys):
+    """`--json` is the scriptable form: a JSON array of the query's own dicts,
+    with the full 400-char preview the text list shortens."""
+    _build_turn_store(tmp_path, monkeypatch)
+    assert _prompts("--json", "--limit", "2") == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert [r["preview"][:14] for r in rows] == ["other session ", "long turn xxxx"]
+    assert set(rows[0]) == set(store._TURN_ROW_KEYS)
+    assert len(_turn(rows, "long turn")["preview"]) == store.PROMPT_PREVIEW_CHARS
+
+
+def test_cmd_prompts_at_dumps_one_turns_tool_calls(tmp_path, monkeypatch, capsys):
+    """`--at` + `--session` resolves one turn and prints its calls oldest-first:
+    the main thread's, then the subagent's under its short id."""
+    _build_turn_store(tmp_path, monkeypatch)
+    assert _prompts("--session", "sess-turns-01",
+                    "--at", "2026-06-30T02:00:02.500Z") == 0
+    out = capsys.readouterr().out
+    head, table = out.split("\n\n", 1)
+    assert "session   sess-turns-01  /home/u/Projects/fake-proj" in head
+    # tools is INCLUSIVE of subcalls, so the main-thread count is a subtraction
+    assert "work      3 tool calls: 1 main, 2 across 1 subagent, 1 bash" in head
+    assert "tokens    37 output, 7 by subagents, 2 requests" in head
+    assert "prompt    first ask" in head
+    rows = [ln.split() for ln in table.splitlines() if ln]
+    assert rows[0] == ["time", "agent", "tool", "detail"]
+    assert [(r[1], r[2]) for r in rows[1:]] == [
+        ("main", "Bash"), ("ag1", "Read"), ("ag1", "Grep")]
+    assert table.rstrip().endswith("def build_")
+
+
+def test_cmd_prompts_event_id_labels_calls_the_store_left_blank(tmp_path, monkeypatch, capsys):
+    """`--event-id` takes the id the list's `--json` prints, and the Agent/MCP
+    calls it dumps have no stored `text`: their label comes from `tool_input`, and
+    an MCP tool keeps only its own name."""
+    _build_turn_store(tmp_path, monkeypatch)
+    assert _prompts("--json", "--session", "sess-turns-02") == 0
+    event_id = json.loads(capsys.readouterr().out)[0]["event_id"]
+    assert _prompts("--event-id", event_id) == 0
+    out = capsys.readouterr().out
+    assert f"event-id  {event_id}" in out
+    assert "work      3 tool calls: 1 bash" in out
+    rows = [ln.split(None, 3) for ln in out.split("\n\n", 1)[1].splitlines() if ln]
+    assert [(r[2], r[3]) for r in rows[1:]] == [
+        ("Bash", "echo other"),
+        ("Agent", "Review phase 6"),          # from tool_input.description
+        ("authenticate", "-")]                # mcp__plugin_linear_linear__ dropped
+
+
+def test_cmd_prompts_marks_a_failed_call(tmp_path, monkeypatch, capsys):
+    """A call whose tool_result came back `is_error` is marked at the END of its
+    line, so the Detail column keeps its alignment and the marker greps."""
+    _build_turn_store(tmp_path, monkeypatch)
+    assert _prompts("--session", "sess-turns-01",
+                    "--at", "2026-06-30T02:00:05.000Z") == 0
+    out = capsys.readouterr().out
+    assert "prompt    mid-turn nudge" in out
+    assert out.rstrip().endswith("echo two  [error]")
+
+
+def test_cmd_prompts_json_single_turn_carries_its_actions(tmp_path, monkeypatch, capsys):
+    """The single-turn `--json` is the turn's own dict plus its `actions` list."""
+    _build_turn_store(tmp_path, monkeypatch)
+    assert _prompts("--json", "--session", "sess-turns-01",
+                    "--at", "2026-06-30T02:00:02.500Z") == 0
+    turn = json.loads(capsys.readouterr().out)
+    assert set(turn) == set(store._TURN_ROW_KEYS) | {"actions"}
+    assert turn["preview"] == "first ask"
+    assert [(a["tool_name"], a["agent_id"]) for a in turn["actions"]] == [
+        ("Bash", None), ("Read", "ag1"), ("Grep", "ag1")]
+
+
+def test_cmd_prompts_zero_call_turn_says_so(tmp_path, monkeypatch, capsys):
+    """A turn that ran nothing is real (a question, a slash command, a resumed
+    session), so the dump says that rather than printing an empty table."""
+    _build_turn_store(tmp_path, monkeypatch)
+    assert _prompts("--session", "sess-turns-01",
+                    "--at", "2026-06-30T02:00:10.000Z") == 0
+    out = capsys.readouterr().out
+    assert "work      no tool calls" in out
+    assert "tokens    no requests attributed to this window yet" in out
+    assert out.rstrip().endswith("(no tool calls in this turn)")
+    # and no column header standing over the nothing it would describe
+    assert "detail" not in out
+
+
+def test_cmd_prompts_unresolvable_turn_exits_1(tmp_path, monkeypatch, capsys):
+    """A turn that is not there is exit 1 with one line, not an empty dump."""
+    _build_turn_store(tmp_path, monkeypatch)
+    assert _prompts("--session", "sess-turns-01",
+                    "--at", "2020-01-01T00:00:00.000Z") == 1
+    assert "no turn at or before" in capsys.readouterr().err
+    assert _prompts("--event-id", "no-such-event") == 1
+    assert "no turn with event-id" in capsys.readouterr().err
+
+
+def test_cmd_prompts_missing_store_exits_1(tmp_path, monkeypatch, capsys):
+    """Opening a store that is not there read-only would raise, so say where it
+    would live and how to make one (`cmd_stats` guards the same way)."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "nope.duckdb")
+    assert _prompts() == 1
+    assert "no audit store at" in capsys.readouterr().err
+
+
+def test_cmd_prompts_refuses_bad_arguments(tmp_path, monkeypatch, capsys):
+    """Every argument error is exit 2 with a reason plus the usage line - and an
+    unknown flag is an error, not something to ignore: `--sesion X` listing every
+    session would look like a working command."""
+    _build_turn_store(tmp_path, monkeypatch)
+    for args, reason in [
+        (("--sesion", "x"), "unknown argument: --sesion"),
+        (("--session",), "--session needs a value"),
+        (("--limit", "many"), "--limit wants a number"),
+        (("--at", "2026-06-30T02:00:00.000Z"), "--at needs --session"),
+        (("--at", "x", "--event-id", "y"), "both select one turn"),
+        (("--session", "sess-turns-01", "--at", "nope"), "--at wants a timestamp"),
+        (("--since", "nope"), "--since wants a timestamp"),
+        # an event_id carries its own session, so honouring --session too would
+        # mean dumping one session's turn under another's name
+        (("--session", "sess-turns-01", "--event-id", "t-u1"),
+         "--event-id names its own session"),
+        # the list's bounds against the one-turn forms: dropped silently before
+        (("--event-id", "t-u1", "--since", "2026-06-30T02:00:00.000Z"),
+         "--since bound the LIST"),
+        (("--session", "sess-turns-01", "--at", "2026-06-30T02:00:00.000Z",
+          "--limit", "5"), "--limit bound the LIST"),
+    ]:
+        assert _prompts(*args) == 2, args
+        assert reason in capsys.readouterr().err, args
+
+
+def test_cmd_prompts_help_prints_usage(tmp_path, monkeypatch, capsys):
+    """`--help` is the usage line on stdout and exit 0, not an error."""
+    _build_turn_store(tmp_path, monkeypatch)
+    assert _prompts("--help") == 0
+    assert capsys.readouterr().out.startswith("usage: claude-trail prompts")
+
+
+def test_cli_main_dispatches_prompts(monkeypatch, capsys):
+    """`prompts` is wired into cli_main's table, and a busy store on that path
+    degrades to the same one-line message the other read commands give."""
+    seen = []
+    monkeypatch.setitem(store.cli_main.__globals__, "cmd_prompts",
+                        lambda argv: seen.append(argv) or 0)
+    assert store.cli_main(["prompts", "--limit", "5"]) == 0
+    assert seen == [["prompts", "--limit", "5"]]
+
+    def busy(argv):
+        raise Exception('IO Error: Could not set lock on file "x": Conflicting lock')
+    monkeypatch.setitem(store.cli_main.__globals__, "cmd_prompts", busy)
+    assert store.cli_main(["prompts"]) == 1
+    assert "store busy" in capsys.readouterr().err
 
 
 def test_session_token_totals(tmp_path, monkeypatch):
