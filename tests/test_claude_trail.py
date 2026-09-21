@@ -149,12 +149,17 @@ class TestNormalizeCmd:
 
 
 class TestParseTs:
-    """`parse_ts` widens an hours-only UTC offset before parsing.
+    """`parse_ts` pads the fraction and widens an hours-only UTC offset first.
 
-    DuckDB renders a TIMESTAMPTZ as `2026-07-29 19:18:37.084-03`, so that is the
-    shape every store timestamp reaches the TUI in, and `fromisoformat` rejects
-    it before Python 3.11 - below the package's declared floor, where every Time
-    cell read `??:??:??` and the turn page's duration chip disappeared.
+    DuckDB renders a TIMESTAMPTZ as `2026-07-29 19:18:37.084-03` and trims the
+    fraction's trailing zeros, so store timestamps arrive with an hours-only
+    offset and with anything from 0 to 6 fraction digits. `fromisoformat`
+    rejects the short offset before Python 3.11, and rejects any fraction that
+    is not exactly 3 or 6 digits - both below the package's declared floor,
+    where every Time cell read `??:??:??` and the turn page's duration chip
+    disappeared. Measured on a copy of the real store: of 172,454 `events` rows
+    90% carry 3 digits, 9% carry 2, 1% carry 1 and 151 carry none, and
+    `file_history` snapshots add 4-, 5- and 6-digit ones.
     """
 
     def test_hours_only_offset_keeps_the_instant(self):
@@ -166,6 +171,42 @@ class TestParseTs:
         from datetime import datetime as _dt, timedelta as _td, timezone as _tz
         assert feed.parse_ts("2026-07-27 10:30:38+02") == _dt(
             2026, 7, 27, 10, 30, 38, tzinfo=_tz(_td(hours=2)))
+
+    def test_two_digit_fraction_with_offset(self):
+        # DuckDB trimmed a trailing zero off `.080`: 80 milliseconds, not 8.
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        assert feed.parse_ts("2026-07-29 19:18:37.08-03") == _dt(
+            2026, 7, 29, 19, 18, 37, 80000, tzinfo=_tz(_td(hours=-3)))
+
+    def test_one_digit_fraction_with_offset(self):
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        assert feed.parse_ts("2026-07-29 19:18:37.5-03") == _dt(
+            2026, 7, 29, 19, 18, 37, 500000, tzinfo=_tz(_td(hours=-3)))
+
+    def test_two_digit_fraction_without_offset(self):
+        from datetime import datetime as _dt
+        assert feed.parse_ts("2026-07-29 19:18:37.08") == _dt(
+            2026, 7, 29, 19, 18, 37, 80000)
+
+    def test_one_digit_fraction_without_offset(self):
+        from datetime import datetime as _dt
+        assert feed.parse_ts("2026-07-29 19:18:37.5") == _dt(
+            2026, 7, 29, 19, 18, 37, 500000)
+
+    def test_five_digit_fraction_with_full_offset(self):
+        # The padding runs before the offset is widened, so it has to end the
+        # fraction at a `+HH:MM` offset too, not only at an hours-only one.
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        assert feed.parse_ts("2026-07-29 19:18:37.01234+02:00") == _dt(
+            2026, 7, 29, 19, 18, 37, 12340, tzinfo=_tz(_td(hours=2)))
+
+    def test_over_long_fraction_is_truncated_not_rejected(self):
+        # DuckDB stores microseconds and never emits more, but a nanosecond
+        # string would raise on every Python version; truncating keeps the
+        # instant to the precision `datetime` can hold.
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        assert feed.parse_ts("2026-07-29 19:18:37.084123456-03") == _dt(
+            2026, 7, 29, 19, 18, 37, 84123, tzinfo=_tz(_td(hours=-3)))
 
     def test_full_offset_is_left_alone(self):
         from datetime import datetime as _dt, timedelta as _td, timezone as _tz
@@ -192,11 +233,21 @@ class TestParseTs:
 
 
 class TestEnvExampleDocumentsEveryKey:
-    """`.env.example` is where a user learns these keys exist, so every key the
-    module resolves through `_env_int` must appear in it with the code's own
-    default. A width added to COLUMNS / PROMPT_COLUMNS and never written down is
-    undiscoverable, and a default changed in only one of the two files is worse
-    than either value alone."""
+    """`.env.example` is where a user learns these keys exist, so the file and
+    the `_env_int` call sites must name the same keys with the same defaults.
+    A width added to COLUMNS / PROMPT_COLUMNS and never written down is
+    undiscoverable, a default changed in only one of the two files is worse than
+    either value alone, and a key left in the file after the code stopped
+    reading it is a documented setting that does nothing.
+
+    Both assertions are whole-line (`^KEY=N$`): a substring match let a code
+    default of `8` pass against a file value of `80`. The set comparison also
+    catches the one shape `_pairs` cannot scrape, a non-literal default
+    (`_env_int("X", DEFAULT)`), which would otherwise be skipped in silence."""
+
+    def _example(self):
+        return (Path(feed.__file__).resolve().parent / ".env.example").read_text(
+            encoding="utf-8")
 
     def _pairs(self):
         source = Path(feed.__file__).resolve().read_text(encoding="utf-8")
@@ -205,11 +256,15 @@ class TestEnvExampleDocumentsEveryKey:
         return pairs
 
     def test_every_env_int_key_is_in_the_example(self):
-        example = (Path(feed.__file__).resolve().parent / ".env.example").read_text(
-            encoding="utf-8")
+        example = self._example()
         for key, default in self._pairs():
-            assert f"{key}={default}" in example, (
+            assert re.search(rf"^{re.escape(key)}={default}$", example, re.M), (
                 f"{key}={default} is missing from .env.example")
+
+    def test_every_example_key_is_read_by_the_code(self):
+        documented = set(re.findall(r"^(CLAUDE_TRAIL_\w+)=", self._example(), re.M))
+        assert documented == {key for key, _ in self._pairs()}, (
+            "the .env.example keys and the _env_int call sites have drifted apart")
 
 
 class TestFormatTime:

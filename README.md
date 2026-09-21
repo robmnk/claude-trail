@@ -11,13 +11,16 @@ Observability tool for Claude Code: a real-time TUI dashboard that shows every B
 - **Prompt behind each command** - the detail view shows the turn that led to the command (the user's ask for a main-agent row, the subagent's own task prompt for an agent row); `Enter` opens it in full
 - **Subagent attribution** - tags each command with the subagent that ran it and draws a tree gutter attributing rows to subagent runs; `s` opens a per-session modal listing every subagent with live status
 - **Active session indicator** - shows how many sessions have been active in the last 5 minutes
-- **Minimal footprint** - single Python file, one dependency (`rich`)
+- **Minimal footprint** - two Python files, two dependencies (`rich`, `duckdb`)
 - **Cross-platform** - works on Linux and macOS (uses `xdg-open` or `open` automatically)
 
 ## How It Works
 
+There are two data paths, and they are independent:
+
 1. A Claude Code `PostToolUse` hook (`claude-trail hook`) captures every Bash command and appends it as JSON to `~/.claude/command-log.jsonl`
 2. `claude-trail` tails the log file and renders a live-updating table using [Rich](https://github.com/Textualize/rich)
+3. Separately, `claude-trail ingest` reads Claude Code's own transcripts (`~/.claude/projects/**/*.jsonl`) into a local DuckDB store at `~/.claude/trail.duckdb` (`$CLAUDE_TRAIL_DB` moves it). That store covers every tool, not just Bash, and is what the Prompts tab, the token numbers and the `search` / `tokens` / `cat` / `diff` / `prompts` subcommands read. It is as fresh as the last ingest, so a `Stop` hook or a timer keeps it current (see [Audit store](#audit-store))
 
 ## Setup
 
@@ -191,28 +194,37 @@ claude-trail prune-raw [-y] [--no-compact]        # drop the verbatim raw_events
 
 Run `ingest` from cron or leave one `--watch` process polling; it is idempotent (byte-offset tailing), and `--compact` reclaims free blocks with a full rewrite. The lowest-friction option is a Claude Code `Stop` hook that backgrounds a singleton ingest after every turn, keeping the store fresh with no daemon or cron: `claude-trail ingest --detach` (built-in: its own `fork`/`flock`), or a small `setsid`/`flock`/`timeout` wrapper that adds a hang timeout and folds in periodic `--compact` (see the Hook Setup section in `CLAUDE.md`); either way the detached run appends its output to `<store>.ingest.log`, so a failing ingest stays diagnosable. Each `CHECKPOINT` re-expands the file to ~2x its packed size, so the store steady-states around 2x; periodic `--compact` packs it back (bounded, not unbounded). On a terminal `ingest` shows a live Rich progress bar for the transcript and file-history phases; off a tty (cron/pipe) it prints timestamped progress instead (start, per-phase timing, stored-row deltas, final store size), and `-v` adds one line per changed transcript. `reset-db` deletes the store file (and its WAL) after a confirmation prompt (`-y` skips it); the store is a derived cache, so the next `ingest` rebuilds it. `tokens` reports exact per-session and per-command spend; `cat` / `diff` reconstruct edited files from content-addressed blobs plus `structuredPatch` diffs. `prune-raw` is a one-shot cleanup that drops the verbatim transcript payload (typically ~2/3 of the store) without breaking any command, since the transcripts on disk stay the source of truth.
 
-**`prompts` is the Prompts tab without a terminal.** It lists the same turns as plain columns, then dumps one of them. List first, then copy a row's time back to open it:
+**`prompts` is the Prompts tab without a terminal.** It lists the same turns as plain columns, then dumps one of them. List first, then copy a row's time back to open it. Both blocks below are real output: the list is scoped to one session (`--limit` defaults to 30 without it), and the dump is piped through `head` because that turn made 43 calls and the dump prints every one of them.
 
 ```
-$ claude-trail prompts --limit 20
-time                 sess      project         calls         agents  tokens  prompt
-2026-07-27 10:30:38  29dea45c  …/claude-trail  73 (31 bash)  3       52198   lets plan a new feature. claude-trail will have two main views …
-2026-07-27 09:12:04  29dea45c  …/claude-trail  4 (2 bash)            1204    /compact
+$ claude-trail prompts --session 478629d3 --limit 5
+time                 sess      project         calls         agents  tokens              prompt
+2026-07-06 19:56:06  478629d3  …/claude/trail  1 (1 bash)            1275                save this plan
+2026-07-05 04:21:15  478629d3  …/claude/trail  43 (21 bash)  2       44549 (+32216 sub)  first review the plan. than lets finish the specs
+2026-07-05 04:20:43  478629d3  …/claude/trail  -                     0                   /effort high
+2026-07-05 04:20:38  478629d3  …/claude/trail  -                     0                   /model
+2026-07-05 04:17:17  478629d3  …/claude/trail  1                     5664                do the plans/2026-06-30-audit-trail-store.md file contains all the specs for the feature?
 
-$ claude-trail prompts --session 29dea45c --at "2026-07-27 10:30:38"
-session   29dea45c-0896-4149-905d-90518b2d06ae  /home/naka/Projects/personal/claude-trail
-sent      2026-07-27 10:30:38   last request 2026-07-27 10:40:47
-work      73 tool calls: 32 main, 41 across 3 subagents, 31 bash
-tokens    52198 output, 16591 by subagents, 49 requests
-event-id  e8c35b07-2b1f-4eb8-8946-662d6c4cf292
-prompt    lets plan a new feature. claude-trail will have two main views …
+$ claude-trail prompts --session 478629d3 --at "2026-07-05 04:21:15" | head -14
+session   478629d3-fde1-49a9-a42b-325f7c4240e4  /home/naka/Projects/personal/claude/trail
+sent      2026-07-05 04:21:15   last request 2026-07-05 04:31:31
+work      43 tool calls: 6 main, 37 across 2 subagents, 21 bash
+tokens    44549 output, 32216 by subagents, 43 requests
+event-id  d2f94df9-1212-4231-95f6-e7622667f501
+prompt    first review the plan. than lets finish the specs
 
-time      agent  tool  detail
-10:30:54  main   Bash  wc -l claude_trail.py
-10:31:02  3f2a   Read  claude_trail.py
+time      agent  tool             detail
+04:21:56  main   Agent            Explore worktree current state
+04:22:00  a02a   Bash             find /home/naka/Projects/personal/claude-trail-audit-store -type f -name "*.py" | head -20
+04:22:08  a02a   Bash             ls -la /home/naka/Projects/personal/claude-trail-audit-store/
+04:22:12  a02a   Bash             cd /home/naka/Projects/personal/claude-trail-audit-store && git status && echo "---" && git branch -vv
+04:22:15  a02a   Bash             find /home/naka/Projects/personal/claude-trail-audit-store/plans -type f 2>/dev/null
+04:22:19  a02a   Read             /home/naka/Projects/personal/claude-trail-audit-store/claude_trail.py
 ```
 
-The dump prints the turn's header (session, work, tokens, event id), the prompt, and every tool call oldest-first as `time agent tool detail`, with `main` or the subagent's short id in the agent column and a trailing `[error]` on a failed call. `--session` takes an id prefix, `--at` finds the newest turn at or before the time you give it (and needs `--session`, since sessions interleave), `--event-id` opens a turn by the id `--json` prints, and `--json` gives a script the raw query rows. Exit codes: 2 for a bad argument, 1 for a missing store or a turn that did not resolve, 0 otherwise.
+The list's `tokens` cell breaks out what the subagents generated (`44549 (+32216 sub)`), which is the same split the dump's `tokens` line prints, and its `calls` cell is a plain `-` for a turn that ran no tool at all, rather than a `0` that reads as missing data. The `project` cell reads `…/claude/trail` here, not `…/claude-trail`, because this old session's transcript is gone, so the store has no launch directory for it and falls back to decoding the transcript's directory name, which cannot tell a separator `-` from one inside a name (see Upgrading below).
+
+The dump prints the turn's header (session, work, tokens, event id), the prompt, and every tool call oldest-first as `time agent tool detail`, with `main` or the subagent's short id in the agent column and a trailing `[error]` on a failed call. The `work` line subtracts: 43 calls is 6 on the main thread plus 37 across the 2 subagents, and the 21 Bash calls are counted over the whole turn, subagents included. A prompt too long to quote is cut to its first 10 lines and the cut is stated rather than silent, as `[+N more lines, M more chars]` (each half only when that cut happened). `--session` takes an id prefix, `--at` finds the newest turn at or before the time you give it (and needs `--session`, since sessions interleave), `--event-id` opens a turn by the id `--json` prints, and `--json` gives a script the raw query rows. Exit codes: 2 for a bad argument, 1 for a missing store or a turn that did not resolve, 0 otherwise.
 
 **Upgrading?** Nothing to run. The Prompts tab's Project column prefers each session's exact launch directory (`sessions.cwd`), which older stores did not record; the next ordinary `claude-trail ingest` fills it in place for every session whose transcript is still on disk, and logs `sessions: N cwd backfilled` once. Sessions whose transcript is gone keep the old, approximate project name. Do **not** run `reset-db` for this: on a store older than its transcripts that deletes history it cannot rebuild.
 
