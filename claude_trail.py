@@ -1279,9 +1279,45 @@ def parse_line(line: str) -> LogEntry | None:
         return None
 
 
+# A UTC offset written with HOURS ONLY (`...37.084-03`), which is how DuckDB
+# renders a TIMESTAMPTZ and therefore how every store timestamp reaches this
+# module. `datetime.fromisoformat` only learned to read that shape in 3.11, and
+# this package's floor is 3.10, where it raises instead: every Time cell (feed,
+# prompts list, turn page) would read `??:??:??` and the turn page's duration
+# chip would vanish. The `HH:MM` in front of the offset is required by the
+# pattern so a bare date (`2026-07-29`) is never mistaken for one.
+_SHORT_TZ_OFFSET_RE = re.compile(r"(\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?)([+-]\d{2})$")
+
+# The SECOND half of the same 3.10 gap. DuckDB trims trailing zeros off the
+# fraction, so one store timestamp in ten arrives with 1 or 2 digits there
+# (`...37.08-03`, `...37.5-03`), and 3.10's `fromisoformat` accepts a fraction
+# of exactly 3 or 6 digits and rejects every other length. Padding to 6 keeps
+# the instant (`.08` is 80 ms, `.5` is 500 ms) and is what 3.11+ does anyway.
+# The lookahead ends the fraction at the offset, the `Z`, or the end of the
+# string, so nothing else in the timestamp is touched; a fraction longer than 6
+# digits (which DuckDB does not emit) is truncated rather than left to raise.
+_FRACTION_RE = re.compile(r"\.(\d+)(?=[-+Zz]|$)")
+
+
+def parse_ts(ts: str) -> datetime:
+    """`datetime.fromisoformat(ts)` with the two 3.10-only shapes normalized first.
+
+    The ONE place this module parses a timestamp, so the 3.10 gaps above are
+    closed once for the feed's own `+HH:MM` hook lines and for the store's
+    `ts::VARCHAR` strings alike: the fraction is padded to 6 digits, then an
+    hours-only UTC offset is widened to `+HH:MM`. A date-only or naive string
+    has neither and passes through untouched, as does a full `+HH:MM` offset (a
+    trailing `Z` still raises on 3.10, which reads no `Z` at all; no store or
+    hook path feeds one here). Raises whatever `fromisoformat` raises - every
+    caller already treats an unparseable timestamp as "no time".
+    """
+    ts = _FRACTION_RE.sub(lambda m: "." + m.group(1)[:6].ljust(6, "0"), ts)
+    return datetime.fromisoformat(_SHORT_TZ_OFFSET_RE.sub(r"\1\2:00", ts))
+
+
 def format_time(ts: str) -> str:
     try:
-        dt = datetime.fromisoformat(ts)
+        dt = parse_ts(ts)
         if dt.tzinfo is not None:
             dt = dt.astimezone()  # render in the user's local timezone
         return dt.strftime("%H:%M:%S")
@@ -2108,13 +2144,13 @@ def count_active_sessions(
 
     `now` should be timezone-aware. Entries whose timestamp fails to parse, or
     whose naive/aware-ness makes the subtraction invalid, are ignored (the
-    `datetime.fromisoformat` parse and the elapsed-time check share one
-    try/except, matching the original inline logic exactly).
+    `parse_ts` parse and the elapsed-time check share one try/except, matching
+    the original inline logic exactly).
     """
     active = set()
     for entry in entries:
         try:
-            ts = datetime.fromisoformat(entry.get("timestamp", ""))
+            ts = parse_ts(entry.get("timestamp", ""))
             if (now - ts).total_seconds() < window:
                 active.add(entry.get("session_id", ""))
         except (ValueError, TypeError):
@@ -2486,12 +2522,15 @@ def _turn_duration(start: str, end: str | None) -> str | None:
 
     `last_ts` and not `next_ts`: `next_ts` is when the user next typed, so a turn
     answered in seconds and left on screen overnight would report 14 hours.
+
+    Both ends are store strings, so both carry the hours-only UTC offset
+    `parse_ts` widens; parsing them directly is what made this chip vanish on
+    Python 3.10.
     """
     if not start or not end:
         return None
     try:
-        elapsed = (datetime.fromisoformat(end)
-                   - datetime.fromisoformat(start)).total_seconds()
+        elapsed = (parse_ts(end) - parse_ts(start)).total_seconds()
     except (ValueError, TypeError):
         return None
     return _format_duration(elapsed) if elapsed >= 0 else None

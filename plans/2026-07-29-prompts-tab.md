@@ -179,8 +179,8 @@ TABS = ("commands", "prompts")   # ordered; AppState.tab holds one
 - A tab strip renders as the first line of the panel body, above the table:
   `  Commands   Prompts ` with the active tab `bold reverse` and the other `dim`. Panel
   title stays `claude-trail vX.Y.Z`.
-- The status bar's key hints become per-tab. Prompts tab:
-  `j/k:nav  ↵:view  r:refresh  x:hide empty  s:session  o:log  t:transcript  d:db  tab:commands  q:quit`.
+- The status bar's key hints become per-tab. Prompts tab, as shipped (`_TAB_HINTS`):
+  `j/k:nav  ↵:view  r:refresh  x:hide empty  S:session only  s:session  o:log  t:transcript  d:db  tab:commands  q:quit`.
 - `AppState.tab` starts at `"commands"`; the feed stays the default view.
 
 ### State
@@ -269,24 +269,35 @@ one global dict.
 
 ### Detail page
 
+As shipped (rendered from `build_turn_panel`, so this block is the wording to
+copy, not a sketch):
+
 ```
-╭─ claude-trail v0.7.0 - prompt ─────────────────────────────────────────╮
-│ Session   4be5769  claude-trail   Sent  18:58:55   Turn  6m 12s        │
-│ Work      64 tool calls: 23 main (14 Bash), 41 across 2 subagents      │
-│ Tokens    24.2k output (3.1k subagent) - 15 requests                   │
-│                                                                        │
-│ ╭─ prompt ───────────────────────────────────────────────── +14 lines ╮│
-│ │ lets plan a new feature. claude-trail will have two mains views ...  ││
-│ ╰─────────────────────────────────────────────────────────────────────╯│
-│  Time      Agent           Tool    Detail                              │
-│  18:58:57                  Bash    wc -l claude_trail.py               │
-│  18:59:02  ┌ 3f2a explore  Read    claude_trail.py                     │
-│  18:59:04  │ 3f2a          Grep    def build_                          │
-│  18:59:09  └ 3f2a          Read    claude_trail_store.py               │
-│  18:59:14                  Edit    plans/2026-07-29-prompts-tab.md     │
-│  esc:back  ↵:full prompt  j/k:scroll  b:bash only                      │
-╰────────────────────────────────────────────────────────────────────────╯
+╭──────────────────────  claude-trail vX.Y.Z · turn  ──────────────────────╮
+│                                                                          │
+│  Session  4be57694  …/claude-trail  ·  sent 18:58:55  ·  ran 6m 12s      │
+│     Work  64 tool calls: 23 main, 41 across 2 subagents  ·  14 Bash      │
+│   Tokens  24,200 output  ·  3,100 by subagents  ·  15 requests           │
+│                                                                          │
+│  ╭─ prompt ───────────────────────────────────────────────────────────╮  │
+│  │  lets plan a new feature. claude-trail will have two main views …  │  │
+│  ╰────────────────────────────────────────────────────────────────────╯  │
+│  Actions (64)  1-5 of 64                                                 │
+│  Time       Agent                  Tool               Detail             │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  │
+│  18:58:57                          Bash               wc -l claude_tra…  │
+│  18:59:02   ┌ 3f2a explore         Read               claude_trail.py    │
+│  18:59:04   │                      Grep               def build_         │
+│  18:59:09   └                      Read               claude_trail_sto…  │
+│  18:59:14                          Edit               plans/2026-07-29…  │
+│  esc / q : back    ↵ : full prompt    j/k g/G : scroll    b : bash only  │
+╰──────────────────────────────────────────────────────────────────────────╯
 ```
+
+The Work row SUBTRACTS (`tools` already includes `subcalls`) and the Bash count
+stands on its own, because the query counts Bash across the whole window,
+subagents included: `23 main (14 Bash)` would be arithmetically impossible on a
+turn whose subagents ran most of the Bash.
 
 - `prompt_turns.tools` is INCLUSIVE of `subcalls` (phase 1 review, measured on a fixture: 1
   main-thread Bash plus 2 subagent calls gives `tools=3, subcalls=2`). The header must subtract
@@ -397,8 +408,10 @@ depend on the TUI.
       transcript left the disk before the backfill ran, or it is present with no `cwd` in its
       first `SESSION_CWD_SCAN_LINES` (50) lines (10 of 127 on this machine).
     - Upgrade path: nothing to run. The next ordinary `claude-trail ingest` (Stop hook or the 30s
-      timer) backfills `sessions.cwd` in place, before the transcript sweep, and logs
-      `sessions: N cwd backfilled` once; `--file-history-only` skips it. Do NOT tell users to
+      timer) backfills `sessions.cwd` in place (after the transcript sweep and before the
+      file-history pass; the sweep itself only writes a cwd on a full read from byte 0, so the
+      order cannot freeze a post-`cd` value) and logs `sessions: N cwd backfilled` once;
+      `--file-history-only` skips it. Do NOT tell users to
       `reset-db`: on a store older than its transcripts that deletes sessions it cannot rebuild
       (1,703 sessions vs 127 transcripts on disk here).
     - Honest expectation, measured on a copy of the live store: 117 of 1,703 rows fill on the
