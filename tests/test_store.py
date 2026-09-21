@@ -790,6 +790,11 @@ def test_cmd_ingest_backfills_session_cwd_and_reports_it(tmp_path, monkeypatch, 
     out = capsys.readouterr().out
     assert "transcripts: 0/1 changed" in out          # nothing re-parsed, just the fill
     assert "sessions: 1 cwd backfilled" in out
+    # A backfilled cwd is an UPDATE, so no table count moves and the run looks
+    # empty to `_checkpoint_due`. It must still flush, or the fill sits in the
+    # WAL behind a "stored nothing" skip.
+    assert "checkpoint: flushing WAL to disk" in out
+    assert "checkpoint: skipped" not in out
     con = store.connect(read_only=True)
     try:
         assert _cwd_of(con, sid) == cwd
@@ -797,6 +802,107 @@ def test_cmd_ingest_backfills_session_cwd_and_reports_it(tmp_path, monkeypatch, 
         con.close()
     assert store.cmd_ingest(["ingest"]) == 0          # silent once nothing is NULL
     assert "cwd backfilled" not in capsys.readouterr().out
+
+
+def _post_cd_upgrade_store(tmp_path, monkeypatch, sid, launched):
+    """A store in the exact shape the upgrade run meets it in: the transcript's
+    launch-dir head is ALREADY ingested (the offset is past it), the session row
+    predates the column so its cwd is NULL, and one post-`cd` line is waiting to
+    be swept. Returns the transcript path."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    path = projects / "-home-u-Projects-personal-claude-trail" / f"{sid}.jsonl"
+    _write_jsonl(path, _cwd_transcript(sid, launched))
+    con = store.connect()
+    try:
+        store.ingest_all(con)                          # head ingested, offset advanced
+        con.execute("UPDATE sessions SET cwd=NULL")    # the pre-change store shape
+    finally:
+        con.close()
+    with open(path, "a", encoding="utf-8") as fh:      # the tail, written after a `cd`
+        fh.write(json.dumps(
+            {**_user_prompt("cd-tail", sid, "after cd", "2026-06-30T04:00:05.000Z"),
+             "cwd": "/tmp/scratchpad"}) + "\n")
+    return path
+
+
+def test_ingest_all_keeps_the_launch_dir_when_the_sweep_lands_a_post_cd_tail(
+        tmp_path, monkeypatch):
+    """The two writers of this column have to agree, and nothing between them
+    says so. An incremental sweep parses a chunk that starts MID-FILE, so the
+    first cwd it sees is wherever the run had `cd`-ed to; writing that is
+    permanent (`coalesce` never replaces a value and the backfill skips a row
+    that is no longer NULL), which would label the session with a scratchpad
+    forever. Pins the outcome, not the mechanism: whoever ends up writing the
+    row, it must be the launch dir."""
+    sid, launched = "sess-cwd-0008", "/home/u/Projects/personal/claude-trail"
+    _post_cd_upgrade_store(tmp_path, monkeypatch, sid, launched)
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        assert _cwd_of(con, sid) == launched      # not "/tmp/scratchpad"
+    finally:
+        con.close()
+
+
+def test_cmd_ingest_keeps_the_launch_dir_when_the_sweep_lands_a_post_cd_tail(
+        tmp_path, monkeypatch, capsys):
+    """The same ordering guarantee on the path the user actually runs (the Stop
+    hook and the 30s timer both land here), where the sweep really does ingest a
+    new tail chunk rather than finding nothing to do."""
+    sid, launched = "sess-cwd-0009", "/home/u/Projects/personal/claude-trail"
+    _post_cd_upgrade_store(tmp_path, monkeypatch, sid, launched)
+    capsys.readouterr()                                # drop the setup's output
+    assert store.cmd_ingest(["ingest"]) == 0
+    out = capsys.readouterr().out
+    assert "transcripts: 1/1 changed, +1 lines" in out  # the tail WAS swept
+    assert "sessions: 1 cwd backfilled" in out
+    con = store.connect(read_only=True)
+    try:
+        assert _cwd_of(con, sid) == launched
+    finally:
+        con.close()
+
+
+def test_backfill_session_cwd_rereads_only_transcripts_whose_row_is_still_null(
+        tmp_path, monkeypatch):
+    """The name pre-filter is what keeps the steady state cheap. Rows that can
+    never be filled (transcript gone) keep `pending` non-empty forever on a real
+    store, so without the filter every sweep would re-read the head of every
+    transcript on disk instead of only the ones whose own row is still NULL."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    done, todo = "sess-cwd-0010", "sess-cwd-0011"
+    _write_jsonl(projects / "-fake-proj" / f"{done}.jsonl",
+                 _cwd_transcript(done, "/home/u/done", uuid="pf-u1"))
+    _write_jsonl(projects / "-fake-proj" / f"{todo}.jsonl",
+                 _cwd_transcript(todo, "/home/u/todo", uuid="pf-u2"))
+    reads = []
+    real_head_cwd = store._head_cwd
+
+    def counting_head_cwd(path):
+        reads.append(path.stem)
+        return real_head_cwd(path)
+
+    monkeypatch.setattr(store, "_head_cwd", counting_head_cwd)
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        con.execute("UPDATE sessions SET cwd=NULL WHERE session_id=?", [todo])
+        # a session whose transcript is long gone: NULL forever, and the reason
+        # the cheap early return never fires on a real store
+        con.execute("INSERT INTO sessions(session_id, project) VALUES (?,?)",
+                    ["sess-cwd-gone", "/fake/proj"])
+        reads.clear()
+        assert store.backfill_session_cwd(con) == 1
+        assert reads == [todo]                       # not the already-filled one
+        assert _cwd_of(con, todo) == "/home/u/todo"
+        assert _cwd_of(con, done) == "/home/u/done"
+        assert _cwd_of(con, "sess-cwd-gone") is None
+    finally:
+        con.close()
 
 
 def test_compact_db_reclaims_free_blocks_and_preserves_rows(tmp_path, monkeypatch):
@@ -891,6 +997,31 @@ def test_cmd_search_tool_filter_excludes_non_matching_tool(tmp_path, monkeypatch
     assert "please continue" in capsys.readouterr().out
     assert store.cmd_search(["search", "please continue", "--tool", "Bash"]) == 0
     assert "please continue" not in capsys.readouterr().out
+
+
+def test_cmd_search_project_filter_matches_either_path_column(tmp_path, monkeypatch, capsys):
+    """`--project` has to accept the name the user can see. The Prompts tab shows
+    `sessions.cwd`, so `--project claude-trail` must hit it; the lossy
+    `sessions.project` (`claude/trail`, all dashes turned into slashes) still
+    matches too, since that is all a row with no cwd has."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    sid = "sess-proj-0001"
+    _write_jsonl(projects / "-home-u-Projects-personal-claude-trail" / f"{sid}.jsonl",
+                 [{**e, "cwd": "/home/u/Projects/personal/claude-trail"}
+                  for e in _main_transcript_events(sid)])
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+    finally:
+        con.close()                 # release the write lock for the read-only reopen
+    assert store.cmd_search(["search", "echo hi", "--project", "claude-trail"]) == 0
+    assert "echo hi" in capsys.readouterr().out          # the real dir name
+    assert store.cmd_search(["search", "echo hi", "--project", "claude/trail"]) == 0
+    assert "echo hi" in capsys.readouterr().out          # the decoded one
+    assert store.cmd_search(["search", "echo hi", "--project", "keypad-macros"]) == 0
+    assert "echo hi" not in capsys.readouterr().out      # and it still filters
 
 
 def test_cmd_tokens_default_per_session(tmp_path, monkeypatch, capsys):

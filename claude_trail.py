@@ -481,9 +481,11 @@ def _turn_project_path(turn: "PromptTurn") -> str:
     name, so it renders `claude-trail` as `…/claude/trail`, `personal-fin` as
     `…/personal/fin` - paths that do not exist. The lossy half cannot be
     recovered (nothing says which dashes were separators), so `cwd` wins and
-    `project` stays the fallback for the sessions that have no cwd: ones ingested
-    before the store wrote the column whose transcript has since left the disk
-    (`claude_trail_store.backfill_session_cwd` fills the rest on the next ingest).
+    `project` stays the fallback for the sessions that have no cwd. Two kinds of
+    session have none: one whose transcript has left the disk, and one whose
+    transcript is still there but carries no cwd in its head (10 of the 127 here,
+    all sub-300-byte stubs). `claude_trail_store.backfill_session_cwd` fills every
+    other pre-column row on the next ingest.
     """
     return turn.cwd or turn.project or ""
 
@@ -3044,8 +3046,8 @@ class PromptTurn:
       (subtract, never add).
     - `cwd` is the session's exact launch dir and outranks `project`, which is
       the lossy decoding of the transcript dir name (`claude-trail` comes back as
-      `claude/trail`). `cwd` is None only for a session ingested before the store
-      wrote the column whose transcript has since left the disk; everything that
+      `claude/trail`). `cwd` is None for a session whose transcript has left the
+      disk, and for one whose transcript carries no cwd at all; everything that
       shows a path goes through `_turn_project_path`.
     """
 
