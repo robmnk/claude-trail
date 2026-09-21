@@ -376,6 +376,19 @@ depend on the TUI.
       `.env.example` widths (including the six `CLAUDE_TRAIL_PROMPT_COL_*` keys), the `S` key,
       version bump. The plan, CLAUDE.md's Controls table and the README all currently disagree
       with the code on the prompts-tab key set; this phase reconciles all three.
+  - Carried from the phase 4 review: `requires-python = ">=3.10"` is a false floor. The store's
+    timestamps carry a 2-digit UTC offset (`...084-03`), which `datetime.fromisoformat` only
+    accepts on 3.11+, so on the declared minimum `format_time` returns `??:??:??` for EVERY Time
+    cell (feed, prompts list and action table alike) and the turn page's duration chip silently
+    vanishes. Verified on a real 3.10 interpreter. Pre-existing, not introduced by this feature.
+    Either bump the floor to `>=3.11` or normalize `-03` to `-03:00` before parsing; do not ship
+    the release claiming 3.10 support without one of them.
+  - Also from the phase 4 review: the plan's own detail-page mock is arithmetically impossible on
+    the example it cites (73 calls / 31 Bash is 3 main + 28 subagent, so `32 main (31 Bash)`
+    cannot happen). `prompt_turns.bash` counts Bash across the whole window, subagents included.
+    Fix the mock to match the shipped wording, not the other way round.
+  - `_short_tool_name` collapses three distinct MCP `authenticate` tools into one label (7 of
+    31,279 calls). Accepted deliberately; the docstring records the limit.
 
 ## Conventions for this run
 
@@ -385,9 +398,14 @@ reused (phase 1's reviewer overwrote `REVIEW-phase-1.md`; it was restored from `
 
 ## Verify
 
+Run the suite with the PROJECT VENV, not the system interpreter: `duckdb` is installed only in
+`.venv`, so `python3 -m pytest` (a pyenv shim onto system 3.14) fails 85 store tests with
+`ModuleNotFoundError: No module named 'duckdb'` while still reporting the other 643 as passed.
+That reads as a real regression and is not one. Caught during phase 4.
+
 ```bash
 cd /home/naka/Projects/personal/claude-trail
-python3 -m pytest tests/ -q
+.venv/bin/python -m pytest tests/ -q
 python3 claude_trail.py prompts --limit 20
 python3 claude_trail.py prompts --session <sid> --limit 5
 python3 claude_trail.py                     # Tab into Prompts, Enter a turn with subagents

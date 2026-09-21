@@ -1500,6 +1500,45 @@ def test_prompt_record_fields_match_the_query_keys(tmp_path, monkeypatch):
     assert set(acts[0]) == {f.name for f in fields(feed.TurnAction)}
 
 
+def test_turn_page_renders_what_the_real_queries_return(tmp_path, monkeypatch):
+    """The TUI's turn page against REAL query output, not hand-built records.
+
+    Everything else about that page is tested without duckdb, which cannot catch
+    the two things only the store can say: that `tools` counts the subagent's
+    calls (so the Work row has to subtract) and that a subagent's calls come back
+    interleaved in the parent turn's window under its own `agent_id` (so the
+    gutter has runs to bracket). This fixture is the phase-1 measurement itself -
+    one main-thread Bash plus a subagent's two parallel calls.
+    """
+    sid, _sid2 = _build_turn_store(tmp_path, monkeypatch)
+    con = store.connect(read_only=True)
+    try:
+        rows = store.prompt_turns(con)
+        first = _turn(rows, "first ask")
+        acts = store.turn_actions(con, first["session_id"], first["ts"],
+                                  first["next_ts"])
+        text = store.turn_prompt_text(con, first["event_id"])
+    finally:
+        con.close()
+
+    turn = feed.PromptTurn.from_row(first)
+    actions = [feed.TurnAction.from_row(a) for a in acts]
+    assert (turn.tools, turn.subcalls, turn.agents) == (3, 2, 1)
+    assert feed._turn_work_line(turn).plain.startswith(
+        "3 tool calls: 1 main, 2 across 1 subagent")
+
+    table = feed.build_action_table(
+        actions, {"ag1": {"description": "explore", "type": "Explore"}})
+    # The main-thread call renders no gutter; the subagent's two are bracketed
+    # as one run, labelled once.
+    assert [c.plain for c in table.columns[1].cells] == ["", "┌ ag1 explore", "└ "]
+    # Every call is labelled, including the two whose `text` the store derived
+    # from a non-command field (a file_path and a pattern).
+    assert sorted(c.plain for c in table.columns[3].cells) == [
+        "/tmp/read-me.py", "def build_", "echo one"]
+    assert text == "first ask"
+
+
 def test_sql_clean_pipeline_agrees_with_the_python_one(tmp_path, monkeypatch):
     """`prompt_turns` cleans and classifies a turn in SQL; every other consumer
     (turn_prompt_text, prompt_for_command) does it in Python. The two must agree on
