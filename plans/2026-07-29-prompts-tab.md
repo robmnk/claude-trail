@@ -244,7 +244,7 @@ A second data-driven list, same `Column` record, whose `render` callables take a
 |---|------|---------|
 | 1 | Time | `HH:MM:SS` of the prompt |
 | 2 | Session | `session_label` + `/color` tint (reuses `_render_session`'s logic on a sid) |
-| 3 | Project | `short_path` of `sessions.project`. NOT `cwd`: `_upsert_session` never writes that column, so `sessions.cwd` is always NULL (phase 1 review, pinned by a test). `prompt_turns` still returns the key, which documents the gap |
+| 3 | Project | `short_path` of `sessions.cwd`, the session's exact launch dir, written at ingest since phase 5 (first `cwd` on the main transcript, never follows a `cd`, never rewritten; subagent transcripts never contribute). Falls back to the lossy `_decode_project` of `sessions.project` when `cwd` is NULL: the transcript left the disk before the backfill ran, or it carries no `cwd` in its first `SESSION_CWD_SCAN_LINES` lines (10 of 127 on-disk transcripts, measured in the phase 5 review). Before phase 5 the column was `project` only, because `_upsert_session` never wrote `cwd` |
 | 4 | Calls | `23` total, dim `(14 bash)` |
 | 5 | Agents | subagent count, blank when 0 |
 | 6 | Tokens | `24.2k` output, dim `+3.1k sub` when a subagent ran |
@@ -389,6 +389,26 @@ depend on the TUI.
     Fix the mock to match the shipped wording, not the other way round.
   - `_short_tool_name` collapses three distinct MCP `authenticate` tools into one label (7 of
     31,279 calls). Accepted deliberately; the docstring records the limit.
+  - Carried from the phase 5 review, the `sessions.cwd` docs debt (CLAUDE.md Audit store / Data
+    model, Columns table, README):
+    - `sessions.cwd` is the session's LAUNCH dir: the first top-level `cwd` on the main
+      transcript, never rewritten, so it does not follow a `cd` (12 of the newest 40 transcripts
+      carry several); subagent transcripts never contribute. NULL is two cases, not one: the
+      transcript left the disk before the backfill ran, or it is present with no `cwd` in its
+      first `SESSION_CWD_SCAN_LINES` (50) lines (10 of 127 on this machine).
+    - Upgrade path: nothing to run. The next ordinary `claude-trail ingest` (Stop hook or the 30s
+      timer) backfills `sessions.cwd` in place, before the transcript sweep, and logs
+      `sessions: N cwd backfilled` once; `--file-history-only` skips it. Do NOT tell users to
+      `reset-db`: on a store older than its transcripts that deletes sessions it cannot rebuild
+      (1,703 sessions vs 127 transcripts on disk here).
+    - Honest expectation, measured on a copy of the live store: 117 of 1,703 rows fill on the
+      first ingest and no rendered project changes today, because the hyphenated-project
+      transcripts this plan cites (`claude-trail`, `personal-fin`, `keypad-macros`) have left the
+      disk and stay on the `project` fallback. The win is forward-looking; the "3 of the 6
+      projects" measurement above no longer reproduces.
+    - `search --project P` matched only the lossy `sessions.project`, so the name the column now
+      shows found nothing. Document whichever way the phase 5 fix resolved it (widened to match
+      `cwd` too, or recorded as a limit).
 
 ## Conventions for this run
 
