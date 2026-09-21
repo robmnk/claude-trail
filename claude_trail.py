@@ -39,7 +39,7 @@ from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timedelta
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 from pathlib import Path
-from typing import Callable, TypedDict
+from typing import Callable, NamedTuple, TypedDict
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -331,12 +331,20 @@ class Column:
 # TestConsoleMarkupIsNeverParsed pins this per column and per panel.
 
 
-def _danger_prefixed(cmd: str, body: str) -> Text:
-    """A `Text` of `body`, prefixed with a bold-red `* ` when `cmd` is dangerous."""
+def _danger_prefixed(cmd: str, body: str | Text) -> Text:
+    """A `Text` of `body`, prefixed with a bold-red `* ` when `cmd` is dangerous.
+
+    `body` is a plain string for the one-line cells and an already-styled `Text`
+    for the colored command view (`highlight_command`); either way the result is
+    a fresh `Text`, so the caller's own object is never mutated by the prefix.
+    """
     text = Text()
     if is_dangerous(cmd):
         text.append("* ", style="bold red")
-    text.append(body)
+    if isinstance(body, Text):
+        text.append_text(body)
+    else:
+        text.append(body)
     return text
 
 
@@ -1325,6 +1333,741 @@ def format_time(ts: str) -> str:
         return "??:??:??"
 
 
+# --- Command tokenizer and highlighter ---
+#
+# `tokenize_command` splits a Bash command into display spans and
+# `highlight_command` paints them with `CMD_STYLES`, the one palette every view
+# shares. This is a DISPLAY HEURISTIC, not a shell parser: it understands enough
+# shell to tell a command name from a flag, a path, a string, a variable, an
+# operator, a redirect and a heredoc, and it guesses on the rest. Two guarantees
+# hold whatever the input, and the tests pin both:
+#
+# LOSSLESS - `"".join(t.text for t in tokenize_command(cmd)) == cmd`, character
+# for character, and the tokens tile the string end to end
+# (`cmd[t.start:t.end] == t.text`, each token starting where the previous one
+# ended), so a colored command can never differ from the command that ran.
+# `tokenize_command` checks this before returning and falls back to a single
+# `word` token covering everything if it ever fails.
+#
+# NEVER RAISES - an unterminated quote or heredoc, an unbalanced `$(`, a lone
+# trailing `\`, a control character, an empty string and a 52 KB one-liner all
+# come back as tokens. Anything the scanner cannot make sense of degrades to
+# `word` (or `string`), never to an exception out of a live render.
+
+
+class Token(NamedTuple):
+    """One span of a command: what it is, its verbatim text, and where it sits.
+
+    `start`/`end` are half-open offsets into the command the token came from, so
+    `cmd[tok.start:tok.end] == tok.text` for every token.
+    """
+
+    kind: str
+    text: str
+    start: int
+    end: int
+
+
+_SHELL_KEYWORDS = frozenset({
+    "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done",
+    "case", "esac", "in", "function", "select",
+})
+
+# Keywords that open a body, so the next word starts a new simple command.
+_BODY_KEYWORDS = frozenset({"if", "then", "else", "elif", "while", "until", "do"})
+
+# Keywords whose word list is introduced by `in` (`for f in *.py`). That is the
+# only place `in` is a keyword; anywhere else it is an ordinary argument.
+_IN_KEYWORDS = frozenset({"for", "select", "case"})
+
+# Commands that run another command, so the word after them names a command too.
+_COMMAND_WRAPPERS = frozenset({"sudo", "nohup", "time", "exec", "env", "xargs"})
+
+# Control operators, longest first so `&&` never reads as two `&`.
+_OPERATORS = ("&&", "||", "|&", ";;", "|", ";", "&")
+
+# `<<` / `<<-` open a heredoc; `<<<` is a here-string and belongs with the
+# redirects below, which is what the negative lookahead keeps out.
+_HEREDOC_OP_RE = re.compile(r"\d*<<-?(?!<)")
+
+# Every redirect shape. `&>>`/`&>` come first so `&>` is not read as `&` plus
+# `>`, then the optionally fd-numbered ones (`2>&1`, `<&3`, `>|`, `<>`, `<<<`).
+_REDIRECT_RE = re.compile(r"&>>|&>|\d*(?:<<<|>>|>\||>&-|>&\d*|<&-|<&\d*|<>|>|<)")
+
+# `NAME=`, `NAME+=` or `NAME[key]=` starting a word in command position.
+_ASSIGN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]*\])?\+?=")
+
+_VAR_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+# `$?`, `$@`, `$#`, `$$`, `$!`, `$-`, `$1`: one character is the whole variable.
+_SPECIAL_VAR_CHARS = "@*#?$!-0123456789"
+
+# A run of ordinary word characters: everything that does not start a quote, an
+# expansion, an operator, a redirect or an escape.
+_PLAIN_RUN_RE = re.compile(r"[^\s'\"$`|&;()<>\\]+")
+
+# Whitespace other than a newline. Newlines are taken one at a time because a
+# newline ends a line and may open a heredoc body.
+_BLANK_RUN_RE = re.compile(r"[^\S\n]+")
+
+# Characters that end a word outside quotes (whitespace ends one as well).
+_WORD_BREAK_CHARS = "|&;()<>"
+
+# How deep `$( )` and backtick nesting is followed before the rest is left as a
+# plain word. Bounded so a pathological input cannot exhaust the stack.
+_MAX_SUBST_DEPTH = 8
+
+
+def _classify_word(text: str) -> str:
+    """Kind of a word that is NOT in command position: flag, path or word.
+
+    A URL keeps its slashes but is a `word`, not a `path`, so `https://x/y` is
+    not painted like a file (the `://` test is what tells them apart).
+    """
+    if text.startswith("-"):
+        return "flag"
+    if "://" in text:
+        return "word"
+    if text.startswith(("/", "~", "./", "../")) or "/" in text:
+        return "path"
+    return "word"
+
+
+def _skip_quoted_span(src: str, pos: int, limit: int, escapes: bool = False) -> int:
+    """Index just past the string that opens at `pos` (a `'` or a `"`).
+
+    `escapes` honours `\\"` inside a double-quoted string (and every escape
+    inside `$'...'`); single quotes have no escapes at all. An unterminated
+    string ends at `limit`, which is how the scanner degrades instead of raising.
+    """
+    quote = src[pos]
+    i = pos + 1
+    while i < limit:
+        c = src[i]
+        if escapes and c == "\\":
+            i = min(i + 2, limit)
+            continue
+        if c == quote:
+            return i + 1
+        i += 1
+    return limit
+
+
+def _find_close_paren(src: str, pos: int, limit: int) -> tuple[int, bool]:
+    """Scan from `pos` for the `)` closing an already-open `(`.
+
+    Returns `(index, True)` at the closing paren, or `(limit, False)` when the
+    command ends first (an unbalanced `$(`, left as an open span). Nested parens
+    are counted and quoted spans skipped, so a `)` inside `"..."` closes nothing.
+    """
+    depth = 1
+    i = pos
+    while i < limit:
+        c = src[i]
+        if c == "\\":
+            i = min(i + 2, limit)
+            continue
+        if c in "'\"":
+            i = _skip_quoted_span(src, i, limit, escapes=c == '"')
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i, True
+        i += 1
+    return limit, False
+
+
+def _heredoc_delim_end(src: str, pos: int, limit: int) -> int:
+    """End of a heredoc delimiter word starting at `pos` (`EOF`, `'EOF'`, `\\EOF`)."""
+    i = pos
+    while i < limit:
+        c = src[i]
+        if c == "\\":
+            if i + 1 < limit and src[i + 1] == "\n":
+                break
+            i = min(i + 2, limit)
+            continue
+        if c in "'\"":
+            i = _skip_quoted_span(src, i, limit, escapes=c == '"')
+            continue
+        if c.isspace() or c in _WORD_BREAK_CHARS:
+            break
+        i += 1
+    return i
+
+
+def _heredoc_delim_value(raw: str) -> str:
+    """The terminator line a delimiter word asks for: quotes and escapes removed.
+
+    `<<'EOF'`, `<<"EOF"`, `<<\\EOF` and `<<EOF` all end at a line reading `EOF`.
+    (The quoting also decides whether the body expands variables, which does not
+    matter here: the body is displayed verbatim either way.)
+    """
+    out = []
+    i = 0
+    while i < len(raw):
+        c = raw[i]
+        if c == "\\" and i + 1 < len(raw):
+            out.append(raw[i + 1])
+            i += 2
+            continue
+        if c in "'\"":
+            close = raw.find(c, i + 1)
+            if close == -1:
+                out.append(raw[i + 1:])
+                break
+            out.append(raw[i + 1:close])
+            i = close + 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+class _CommandScanner:
+    """The one-pass scanner behind `tokenize_command`.
+
+    It walks the command with an explicit position and a little state: whether
+    the next word sits in command position, whether an `in` keyword is expected
+    (`for f in ...`), whether the previous token was a redirect (so its target is
+    not mistaken for a command name), and the heredocs whose bodies start after
+    the next newline.
+
+    `pos`/`limit` bound the region being scanned WITHIN the full command, so a
+    `$( )` body is tokenized in place by a nested scanner and every offset stays
+    absolute. `depth` is that nesting, capped by `_MAX_SUBST_DEPTH`.
+    """
+
+    def __init__(self, src: str, pos: int, limit: int, depth: int = 0):
+        self.src = src
+        self.pos = pos
+        self.limit = limit
+        self.depth = depth
+        self.out: list[Token] = []
+        self.expect_command = True
+        self.expect_in = False
+        self.after_redirect = False
+        self.pending_heredocs: list[tuple[str, bool]] = []
+        self._word_first = True
+        self._keep_command = False
+
+    # ---- driver ----
+
+    def run(self) -> None:
+        while self.pos < self.limit:
+            before = self.pos
+            self._step()
+            if self.pos <= before:
+                # Nothing consumed (a character no branch claims): take it as a
+                # plain word rather than spin forever.
+                self._push_span("word", before, before + 1)
+                self.pos = before + 1
+
+    def _step(self) -> None:
+        src, pos, limit = self.src, self.pos, self.limit
+        c = src[pos]
+        if c.isspace() or (c == "\\" and pos + 1 < limit and src[pos + 1] == "\n"):
+            self._scan_space()
+            return
+        if c == "#":
+            # A `#` reaches this point only at a word boundary, which is exactly
+            # where the shell starts a comment; inside a word or a string it is
+            # consumed as ordinary text by the word scanner.
+            end = src.find("\n", pos, limit)
+            end = limit if end == -1 else end
+            self._push_span("comment", pos, end)
+            self.pos = end
+            return
+        m = _HEREDOC_OP_RE.match(src, pos, limit)
+        if m:
+            self._scan_heredoc_op(m.end())
+            return
+        m = _REDIRECT_RE.match(src, pos, limit)
+        if m:
+            self._push_span("redirect", pos, m.end())
+            self.pos = m.end()
+            self.after_redirect = True
+            return
+        for op in _OPERATORS:
+            if pos + len(op) <= limit and src.startswith(op, pos):
+                self._push_operator(pos, pos + len(op))
+                return
+        if c in "()" or (c in "{}" and self._is_brace_operator(pos)):
+            self._push_operator(pos, pos + 1)
+            return
+        self._scan_word()
+
+    def _push_operator(self, start: int, end: int) -> None:
+        self._push_span("operator", start, end)
+        self.pos = end
+        self.expect_command = True
+        self.expect_in = False
+        self.after_redirect = False
+
+    def _is_brace_operator(self, pos: int) -> bool:
+        """True for a `{`/`}` that groups commands, false for one inside a word.
+
+        `{ echo hi; }` brackets a group; `ls x{a,b}` is a brace expansion and
+        stays part of its word.
+        """
+        nxt = self.src[pos + 1] if pos + 1 < self.limit else ""
+        if self.src[pos] == "{":
+            return nxt == "" or nxt.isspace()
+        return nxt == "" or nxt.isspace() or nxt in ";|&)"
+
+    # ---- whitespace, comments, heredocs ----
+
+    def _scan_space(self) -> None:
+        r"""A run of spaces, tabs and newlines, line continuations included.
+
+        A `\` before a newline is whitespace (the shell joins the lines), so it
+        lands in this token rather than in the word beside it. A real newline
+        opens a new command position, and when a heredoc is pending the run stops
+        right after it so the body can be taken verbatim.
+        """
+        src, limit = self.src, self.limit
+        start = self.pos
+        saw_newline = False
+        while self.pos < limit:
+            c = src[self.pos]
+            if c == "\\":
+                if self.pos + 1 < limit and src[self.pos + 1] == "\n":
+                    self.pos += 2
+                    continue
+                break
+            if c == "\n":
+                self.pos += 1
+                saw_newline = True
+                if self.pending_heredocs:
+                    break
+                continue
+            if not c.isspace():
+                break
+            m = _BLANK_RUN_RE.match(src, self.pos, limit)
+            self.pos = m.end() if m else self.pos + 1
+        self._push_span("space", start, self.pos)
+        if saw_newline:
+            self.expect_command = True
+            self.expect_in = False
+            self.after_redirect = False
+            if self.pending_heredocs:
+                self._scan_heredocs()
+
+    def _scan_heredoc_op(self, op_end: int) -> None:
+        """`<<`, `<<-` plus the delimiter word, as one token, and queue the body.
+
+        The delimiter rides along (`<<'EOF'`, `<< EOF`) because it is the label
+        of the block, not an argument of the command. The rest of the opening
+        line keeps tokenizing as a command; only the newline starts the body.
+        """
+        start = self.pos
+        strip_tabs = self.src.endswith("-", start, op_end)
+        blank = _BLANK_RUN_RE.match(self.src, op_end, self.limit)
+        delim_start = blank.end() if blank else op_end
+        delim_end = _heredoc_delim_end(self.src, delim_start, self.limit)
+        if delim_end > delim_start:
+            raw = self.src[delim_start:delim_end]
+            self.pending_heredocs.append((_heredoc_delim_value(raw), strip_tabs))
+            end = delim_end
+        else:
+            end = op_end  # `<<` with nothing after it: no body to look for
+        self._push_span("heredoc_op", start, end)
+        self.pos = end
+        self.after_redirect = False
+
+    def _scan_heredocs(self) -> None:
+        """Take each queued heredoc body verbatim, through its terminator line.
+
+        Several heredocs opened on one line are taken in the order they were
+        opened. `<<-` allows leading tabs before the terminator. A heredoc whose
+        terminator never arrives swallows the rest of the command as body, which
+        is what the shell would have waited for.
+        """
+        src, limit = self.src, self.limit
+        while self.pending_heredocs:
+            delim, strip_tabs = self.pending_heredocs.pop(0)
+            body_start = self.pos
+            line_start = self.pos
+            term = None
+            while line_start < limit:
+                nl = src.find("\n", line_start, limit)
+                line_end = limit if nl == -1 else nl
+                line = src[line_start:line_end]
+                if (line.lstrip("\t") if strip_tabs else line).rstrip("\r") == delim:
+                    term = (line_start, line_end)
+                    break
+                if nl == -1:
+                    break
+                line_start = nl + 1
+            if term is None:
+                self._push_span("heredoc_body", body_start, limit)
+                self.pos = limit
+                self.pending_heredocs.clear()
+                return
+            self._push_span("heredoc_body", body_start, term[0])
+            self._push_span("heredoc_end", term[0], term[1])
+            self.pos = term[1]
+            if self.pending_heredocs and self.pos < limit and src[self.pos] == "\n":
+                # The newline between two terminators belongs to neither body.
+                self._push_span("space", self.pos, self.pos + 1)
+                self.pos += 1
+
+    # ---- words ----
+
+    def _scan_word(self) -> None:
+        """One shell word, from a word boundary up to the next one.
+
+        A word is a run of plain characters with quoted, `$var` and `$( )` parts
+        spliced in, so `--out="$HOME/x"` is a flag, a string, a var and a string.
+        Only the first plain part can name a command, open a compound or be an
+        assignment; the rest are arguments.
+        """
+        src, limit = self.src, self.limit
+        self._word_first = True
+        # A redirect target never takes the command slot: in `> /tmp/out ls` it
+        # is still `ls` that runs.
+        self._keep_command = self.expect_command and self.after_redirect
+        while self.pos < limit:
+            c = src[self.pos]
+            if c.isspace() or c in _WORD_BREAK_CHARS:
+                break
+            if c == "\\" and self.pos + 1 < limit and src[self.pos + 1] == "\n":
+                break  # a line continuation is whitespace, not part of the word
+            if c == "'":
+                self._scan_single_quoted()
+            elif c == '"':
+                self._scan_double_quoted(self.pos, self.pos + 1)
+            elif c == "`":
+                self._scan_backticks()
+            elif c == "$" and self._scan_dollar():
+                pass
+            else:
+                start, end = self._plain_run()
+                if end == start:
+                    break  # nothing consumable here; `run` advances by one
+                self._emit_plain(start, end)
+            self._word_first = False
+        self.expect_command = self._keep_command
+        self.after_redirect = False
+
+    def _emit_plain(self, start: int, end: int) -> None:
+        """Classify one plain part of a word and push it.
+
+        In command position the first part can be a keyword, an assignment or the
+        command name; `sudo`, `env` and the other wrappers (and an assignment
+        prefix) leave the command slot open for the word after them. Everywhere
+        else it is a flag, a path or a plain word.
+        """
+        text = self.src[start:end]
+        if self._word_first and self.expect_in and text == "in":
+            self._push_span("keyword", start, end)
+            self.expect_in = False
+            return
+        if not (self._word_first and self.expect_command and not self.after_redirect):
+            self._push_span(_classify_word(text), start, end)
+            return
+        if text != "in" and text in _SHELL_KEYWORDS:
+            self._push_span("keyword", start, end)
+            self._keep_command = text in _BODY_KEYWORDS
+            self.expect_in = text in _IN_KEYWORDS
+            return
+        assign = None if text.startswith("-") else _ASSIGN_RE.match(text)
+        if assign:
+            # `NAME=` is the token; the value is classified as usual and the
+            # command slot stays open, because `FOO=bar cmd` still runs `cmd`.
+            value_start = start + assign.end()
+            self._push_span("assign", start, value_start)
+            if value_start < end:
+                value = self.src[value_start:end]
+                self._push_span(_classify_word(value), value_start, end)
+            self._keep_command = True
+            return
+        if text.startswith("-"):
+            self._push_span("flag", start, end)
+            return
+        self._push_span("command", start, end)
+        self._keep_command = text in _COMMAND_WRAPPERS
+
+    def _plain_run(self) -> tuple[int, int]:
+        r"""Consume a run of ordinary word characters, escapes included.
+
+        Stops at whitespace, at an operator or redirect character, at a quote, at
+        a `$` that starts an expansion and at a line continuation. A lone `$` and
+        a trailing `\` are ordinary text, which is how a malformed command still
+        tokenizes.
+        """
+        src, limit = self.src, self.limit
+        start = self.pos
+        while self.pos < limit:
+            c = src[self.pos]
+            if c == "\\":
+                if self.pos + 1 < limit and src[self.pos + 1] == "\n":
+                    break
+                self.pos = min(self.pos + 2, limit)
+                continue
+            if c == "$":
+                if self._dollar_kind(self.pos) is not None:
+                    break
+                self.pos += 1
+                continue
+            if c in "'\"`" or c.isspace() or c in _WORD_BREAK_CHARS:
+                break
+            m = _PLAIN_RUN_RE.match(src, self.pos, limit)
+            self.pos = m.end() if m else self.pos + 1
+        return start, self.pos
+
+    # ---- quotes, expansions, substitutions ----
+
+    def _scan_single_quoted(self) -> None:
+        """`'...'`: nothing is special inside, so a `"` in there is plain text."""
+        end = _skip_quoted_span(self.src, self.pos, self.limit)
+        self._push_span("string", self.pos, end)
+        self.pos = end
+
+    def _scan_double_quoted(self, token_start: int, body_start: int) -> None:
+        r"""`"..."`, split around the expansions inside it.
+
+        The literal runs are `string` tokens and `$VAR` / `${...}` / `$( )` /
+        backticks between them keep their own kinds, so a variable stays visible
+        inside a quoted argument. `\"` does not close the string and a `'` inside
+        is plain text. `token_start` is where the token begins (the `$` for a
+        `$"..."` string), `body_start` the first character after the quote.
+        """
+        src, limit = self.src, self.limit
+        seg_start = token_start
+        i = body_start
+        while i < limit:
+            c = src[i]
+            if c == "\\":
+                i = min(i + 2, limit)
+                continue
+            if c == '"':
+                i += 1
+                break
+            if (c == "$" and self._dollar_kind(i) is not None) or c == "`":
+                self._push_span("string", seg_start, i)
+                self.pos = i
+                if c == "`":
+                    self._scan_backticks()
+                else:
+                    self._scan_dollar()
+                i = seg_start = self.pos
+                continue
+            i += 1
+        i = min(i, limit)
+        self._push_span("string", seg_start, i)
+        self.pos = i
+
+    def _dollar_kind(self, pos: int) -> str | None:
+        """What the `$` at `pos` opens: `subst`, `var`, `string`, or None for a
+        dollar sign that is just text."""
+        nxt = self.src[pos + 1] if pos + 1 < self.limit else ""
+        if not nxt:
+            return None
+        if nxt == "(":
+            return "subst"
+        if nxt in "'\"":
+            return "string"
+        if nxt in "{_" or nxt.isalpha() or nxt in _SPECIAL_VAR_CHARS:
+            return "var"
+        return None
+
+    def _scan_dollar(self) -> bool:
+        """Scan the `$`-expansion at `self.pos`. False, nothing consumed, for a
+        plain `$`."""
+        kind = self._dollar_kind(self.pos)
+        if kind is None:
+            return False
+        if kind == "subst":
+            self._scan_command_subst()
+        elif kind == "string":
+            self._scan_dollar_quoted()
+        elif self.src[self.pos + 1] == "{":
+            self._scan_braced_var()
+        else:
+            self._scan_simple_var()
+        return True
+
+    def _scan_simple_var(self) -> None:
+        """`$NAME`, or a one-character special like `$1`, `$?`, `$@`, `$$`."""
+        start = self.pos
+        m = _VAR_NAME_RE.match(self.src, start + 1, self.limit)
+        end = m.end() if m else min(start + 2, self.limit)
+        self._push_span("var", start, end)
+        self.pos = end
+
+    def _scan_braced_var(self) -> None:
+        """`${...}`, counting nested braces. Unterminated runs to the end."""
+        src, limit = self.src, self.limit
+        start = self.pos
+        i = start + 2
+        depth = 1
+        while i < limit:
+            c = src[i]
+            if c == "\\":
+                i = min(i + 2, limit)
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    i += 1
+                    break
+            i += 1
+        i = min(i, limit)
+        self._push_span("var", start, i)
+        self.pos = i
+
+    def _scan_dollar_quoted(self) -> None:
+        """`$'...'` (escapes honoured) and `$"..."` (a translated string)."""
+        start = self.pos
+        if self.src[start + 1] == '"':
+            self._scan_double_quoted(start, start + 2)
+            return
+        end = _skip_quoted_span(self.src, start + 1, self.limit, escapes=True)
+        self._push_span("string", start, end)
+        self.pos = end
+
+    def _scan_command_subst(self) -> None:
+        """`$( ... )`: the delimiters are `subst`, the inside is a command.
+
+        Nested parens are balanced, so `$(echo $(date) (x))` closes where the
+        shell closes it, and the body is tokenized recursively down to
+        `_MAX_SUBST_DEPTH`; deeper than that the whole span is left a plain word.
+        """
+        start = self.pos
+        body = start + 2
+        close, closed = _find_close_paren(self.src, body, self.limit)
+        end = close + 1 if closed else close
+        if self.depth >= _MAX_SUBST_DEPTH:
+            self._push_span("word", start, end)
+            self.pos = end
+            return
+        self._push_span("subst", start, body)
+        self._scan_nested(body, close)
+        if closed:
+            self._push_span("subst", close, close + 1)
+        self.pos = end
+
+    def _scan_backticks(self) -> None:
+        r"""A backtick span: the same shape as `$( )`, with `\`` the one escape."""
+        src, limit = self.src, self.limit
+        start = self.pos
+        i = start + 1
+        while i < limit:
+            c = src[i]
+            if c == "\\":
+                i = min(i + 2, limit)
+                continue
+            if c == "`":
+                break
+            i += 1
+        closed = i < limit
+        end = i + 1 if closed else limit
+        if self.depth >= _MAX_SUBST_DEPTH:
+            self._push_span("word", start, end)
+            self.pos = end
+            return
+        self._push_span("subst", start, start + 1)
+        self._scan_nested(start + 1, min(i, limit))
+        if closed:
+            self._push_span("subst", i, i + 1)
+        self.pos = end
+
+    def _scan_nested(self, start: int, end: int) -> None:
+        """Tokenize `src[start:end]` as a command in its own right."""
+        inner = _CommandScanner(self.src, start, end, self.depth + 1)
+        inner.run()
+        self.out.extend(inner.out)
+
+    # ---- output ----
+
+    def _push_span(self, kind: str, start: int, end: int) -> None:
+        if end > start:
+            self.out.append(Token(kind, self.src[start:end], start, end))
+
+
+def _tokens_cover(tokens: list[Token], cmd: str) -> bool:
+    """True when `tokens` tile `cmd` end to end with no gap and no overlap."""
+    pos = 0
+    for tok in tokens:
+        if tok.start != pos or tok.end != pos + len(tok.text):
+            return False
+        pos = tok.end
+    return pos == len(cmd) and "".join(t.text for t in tokens) == cmd
+
+
+def tokenize_command(cmd: str) -> list[Token]:
+    """Split a Bash command into display tokens (see the block comment above).
+
+    Kinds: `command`, `keyword`, `assign`, `flag`, `path`, `string`, `var`,
+    `subst`, `heredoc_op`, `heredoc_body`, `heredoc_end`, `operator`, `redirect`,
+    `comment`, `space`, `word`.
+
+    Lossless and never raising, by construction and then by check: a scan that
+    does not tile the input exactly is thrown away for one `word` token covering
+    the whole command, so the worst case is an uncolored command, never a wrong
+    one and never a traceback. The scan is single-pass and linear in the length
+    of the command.
+    """
+    if not cmd:
+        return []
+    try:
+        scanner = _CommandScanner(cmd, 0, len(cmd), 0)
+        scanner.run()
+        if _tokens_cover(scanner.out, cmd):
+            return scanner.out
+    except Exception:
+        # A heuristic that colors a command may never be the reason a render
+        # dies; an uncolored command is a fine answer.
+        pass
+    return [Token("word", cmd, 0, len(cmd))]
+
+
+# The one palette. Every view that colors a command reads it from here, so the
+# command view, the feed column and the turn page cannot drift apart. A kind
+# missing from the table (or mapped to "") renders unstyled.
+CMD_STYLES = {
+    "command": "bold",
+    "keyword": "bold blue",
+    "assign": "yellow",
+    "flag": "cyan",
+    "path": "blue",
+    "string": "green",
+    "var": "yellow",
+    "subst": "yellow",
+    "heredoc_op": "magenta",
+    "heredoc_end": "magenta",
+    "heredoc_body": "dim",
+    "operator": "bold magenta",
+    "redirect": "magenta",
+    "comment": "dim italic",
+    "space": "",
+    "word": "",
+}
+
+
+def highlight_command(cmd: str, reflow: bool = False) -> Text:
+    """`cmd` as a colored `Text`, built from its tokens and `CMD_STYLES`.
+
+    `Text.append` only, never `Text.from_markup`: a command holding `[bold]` or
+    `[/tmp/x]` renders literally instead of losing the span or raising a
+    MarkupError out of the live update (the rule under `Column`).
+
+    `reflow` is accepted now and does nothing yet; it is where the formatter
+    (which breaks a long one-liner at its top-level operators) plugs in, so the
+    call sites do not change when it lands.
+    """
+    text = Text()
+    for tok in tokenize_command(cmd):
+        text.append(tok.text, style=CMD_STYLES.get(tok.kind, ""))
+    return text
+
+
 # ==== Rendering: table ====
 
 
@@ -1657,8 +2400,10 @@ def build_detail_panel(
         meta.add_row("Tokens", _format_command_tokens(tokens))
 
     # Reuse the Command column's danger marker, but keep the raw (un-normalized)
-    # command so newlines are preserved in this full-screen view.
-    cmd_text = _danger_prefixed(cmd, cmd or "(empty)")
+    # command so newlines are preserved in this full-screen view. The body is
+    # tokenized and colored (`highlight_command`, `Text.append` only), so a `[`
+    # in the command is still literal text.
+    cmd_text = _danger_prefixed(cmd, highlight_command(cmd) if cmd else Text("(empty)"))
 
     cmd_panel = Panel(
         cmd_text,
