@@ -123,7 +123,7 @@ Where it renders:
 
 ## Phases
 
-- [ ] 1. Tokenizer + highlighter, applied in the command view (no reflow yet)
+- [x] 1. Tokenizer + highlighter, applied in the command view (no reflow yet)
   - `Token`, `tokenize_command`, `CMD_STYLES`, `highlight_command(cmd)`, a `Text`-taking
     danger prefix, `build_detail_panel` uses it.
   - Tests: one case per token kind; the measured shapes (pipes, `;`, `&&`/`||`, quoted /
