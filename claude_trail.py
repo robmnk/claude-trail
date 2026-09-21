@@ -2414,78 +2414,32 @@ def build_prompts_panel(
 
 # ---- Prompts tab: one turn's detail page (`↵`) ----
 
-# Fields a tool call's `tool_input` may carry that say what the call did, in the
-# order the turn page prefers them. Measured on a real store: `events.text` is
-# NULL for every tool the store has no `_COMMAND_FIELD` entry for (Agent - 644
-# rows - plus ToolSearch, WebFetch, WebSearch, Skill, AskUserQuestion and the MCP
-# tools), while `tool_input` is populated for every single `tool_use` row (0
-# NULLs). This list labels 1,935 of those 2,818 text-less calls, so 97% of all
-# calls end up with a label; the rest are MCP tools with keys of their own
-# (`page_id`, `channel_id`, `taskId`) and render a dim `-`.
-_ACTION_FIELDS = ("description", "file_path", "path", "pattern", "query", "url",
-                  "skill", "notebook_path", "command")
-
-
+# The two label helpers below are the store's, kept reachable under their old
+# names here because this is where the turn page reads them. Both are pure text
+# over a stored row and are shared verbatim with `claude-trail prompts`, so the
+# store owns them and the TUI imports them (the direction CLAUDE.md states) -
+# never the other way round.
 def action_label(tool_name: str, text: str | None, tool_input: str | None) -> str:
-    """What one tool call did, in a line: the store's `text` when it has one,
-    else the first `_ACTION_FIELDS` entry of the raw `tool_input` JSON.
+    """`claude_trail_store.action_label(...)`: what one tool call did, in a line.
 
-    Resolved at RENDER time rather than at ingest on purpose: extending the
-    store's `_COMMAND_FIELD` would only label newly ingested rows, and `events`
-    can no longer be re-derived from `raw_events` (the raw payload is pruned for
-    non-snapshot lines), so every already-stored row would stay blank until a
-    full re-ingest.
-
-    `tool_name` selects nothing today - the field order above is tool-agnostic
-    and already puts `description` (the Agent tool's only useful field) first -
-    but it is what a per-tool rule would key off, and it keeps the call site
-    reading as "label this row".
-
-    Returns "" when neither source says anything: a `tool_input` that is absent,
-    is not JSON, is not an object, or carries none of the known fields. The
-    caller renders that as a dim placeholder rather than an empty cell.
+    The wording is shared with `claude-trail prompts`, so it lives in the store
+    next to the turn model both readers query (with `_ACTION_FIELDS`, the field
+    list it reads off `tool_input`). Imported lazily for the reason `_slash_label`
+    gives: the feed and the hook must not pay for that module, and by the time a
+    turn action exists the prompts loader has already imported it.
     """
-    if text:
-        return text
-    try:
-        data = json.loads(tool_input) if tool_input else None
-    except (TypeError, ValueError):
-        return ""
-    if not isinstance(data, dict):
-        return ""
-    for key in _ACTION_FIELDS:
-        value = data.get(key)
-        # Strings only: every field above is a path, a pattern or prose. A dict
-        # or a list under one of those names means a tool this list does not
-        # know, and dumping its JSON into the cell would be noise, not a label.
-        if isinstance(value, str) and value.strip():
-            return value
-    return ""
+    from claude_trail_store import action_label as _action_label
+    return _action_label(tool_name, text, tool_input)
 
 
 def _short_tool_name(tool_name: str) -> str:
-    """An MCP tool's own name, without its server prefix.
+    """`claude_trail_store.short_tool_name(...)`: an MCP tool's own name, without
+    its server prefix (the Tool column is too narrow to spend on routing).
 
-    Real tool names run to 63 characters
-    (`mcp__plugin_chrome-devtools-mcp_chrome-devtools__evaluate_script`), all of
-    which is server routing until the last `__`. The Tool column is narrow, so
-    keeping the prefix would ellipsize every MCP row to the same `mcp__plugin…`:
-    18 of the 77 distinct tool names in a real store are MCP ones, and they would
-    all read alike. A plain tool name has no `__` and is returned unchanged.
-
-    Known limit, deliberately not fixed: dropping the server can COLLIDE two
-    tools whose own names match. In a real store that is
-    `mcp__plugin_linear_linear__authenticate`,
-    `mcp__plugin_Notion_notion__authenticate` and
-    `mcp__plugin_slack_slack__authenticate`, which all render `authenticate` -
-    7 rows out of 31,279 tool calls (0.02%). (Two further collisions,
-    `notion-fetch` and `notion-update-page`, are one tool reached under two
-    server aliases, so they are not really collisions at all.) Disambiguating
-    would mean keeping part of the prefix on those rows, which trades a legible
-    column for every MCP call against 0.02% of them; the turn's full detail is
-    one row over in the Detail cell.
-    """
-    return tool_name.rsplit("__", 1)[-1] if "__" in tool_name else tool_name
+    Lives in the store with `action_label` for the same reason, and is imported
+    the same lazy way."""
+    from claude_trail_store import short_tool_name
+    return short_tool_name(tool_name)
 
 
 def _action_tool_cell(action: "TurnAction") -> Text:

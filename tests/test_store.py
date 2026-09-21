@@ -2023,9 +2023,38 @@ def _prompt_cells(out):
     return [ln.split("  ")[-1].strip() for ln in out.splitlines()[1:]]
 
 
+def _build_session_store(tmp_path, monkeypatch, sid, events):
+    """Ingest ONE synthetic transcript and return its session id.
+
+    `_build_turn_store`'s shape for the cases below that need timestamps or text
+    of their own (turns inside one second, a noise-heavy history, control
+    characters in a prompt) rather than the shared fixture's."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", events)
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+    finally:
+        con.close()   # release the write lock for the read-only reopen
+    return sid
+
+
+def _one_second_events(sid):
+    """Three turns, two of them 800ms apart INSIDE one second: the shape a
+    rendered `HH:MM:SS` cannot tell apart but a full-precision `ts` can."""
+    return [
+        _user_prompt("os-u1", sid, "before the pair", "2026-06-30T02:00:09.000Z"),
+        _user_prompt("os-u2", sid, "earlier of the pair", "2026-06-30T02:00:10.100Z"),
+        _user_prompt("os-u3", sid, "later of the pair", "2026-06-30T02:00:10.900Z"),
+    ]
+
+
 # The long turn's Prompt cell: its 400-char preview cut to fit the list's
-# one-line cap, with the cut stated.
-_LONG_TURN_CELL = ("long turn " + "x" * 500)[:store.PROMPT_CLI_PREVIEW_CHARS - 3] + "..."
+# one-line cap, with the cut marked by the same `…` `short_path` uses for the
+# Project cell of the same row.
+_LONG_TURN_CELL = ("long turn " + "x" * 500)[:store.PROMPT_CLI_PREVIEW_CHARS - 1] + "…"
 
 
 def test_find_turn_by_event_id_and_by_nearest_timestamp(tmp_path, monkeypatch):
@@ -2075,6 +2104,38 @@ def test_find_turn_at_matches_the_printed_second(tmp_path, monkeypatch):
         con.close()
     assert printed["preview"] == "later ask"    # the second it is printed as
     assert before["preview"] == "earlier ask"   # a whole second earlier: still before
+
+
+def test_find_turn_at_tells_two_turns_inside_one_second_apart(tmp_path, monkeypatch):
+    """Which rule applies is decided by the BOUND, not by the turn.
+
+    Two turns 800ms apart print the same `HH:MM:SS`, so that whole-second string
+    resolves to the NEWER of them - the row the list shows for that second -
+    while each turn's own full-precision `ts` (what `prompts --json` prints and
+    `_turn_time` invites pasting back) resolves to ITSELF. Truncating the turn's
+    ts against an untruncated bound made the earlier turn's own timestamp answer
+    with the LATER turn: measured at 9 of the newest 400 turns of a real store,
+    every one of them a `/compact` pair ~100ms apart, each handed the wrong
+    (open-ended) window."""
+    sid = "sess-one-second"
+    _build_session_store(tmp_path, monkeypatch, sid, _one_second_events(sid))
+    con = store.connect(read_only=True)
+    try:
+        rows = store.prompt_turns(con, session_id=sid)
+        earlier, later = _turn(rows, "earlier of"), _turn(rows, "later of")
+        printed = store._turn_time(earlier["ts"])
+        by_printed = store.find_turn(con, session_id=sid, at=printed)
+        by_earlier_ts = store.find_turn(con, session_id=sid, at=earlier["ts"])
+        by_later_ts = store.find_turn(con, session_id=sid, at=later["ts"])
+    finally:
+        con.close()
+    assert printed == store._turn_time(later["ts"])      # one printed second...
+    assert by_printed["event_id"] == later["event_id"]   # ...lands on the newer
+    assert by_earlier_ts["event_id"] == earlier["event_id"]
+    assert by_later_ts["event_id"] == later["event_id"]
+    # and the window that came with it is the earlier turn's ~800ms one, not the
+    # later turn's open-ended one
+    assert by_earlier_ts["next_ts"] == later["ts"]
 
 
 def test_find_turn_returns_none_for_what_is_not_a_turn(tmp_path, monkeypatch):
@@ -2209,6 +2270,80 @@ def test_cmd_prompts_since_excludes_turns_before_the_bound(tmp_path, monkeypatch
     assert "first ask" not in kept           # five seconds before it: out
 
 
+def test_cmd_prompts_at_takes_back_both_times_the_list_printed(tmp_path, monkeypatch, capsys):
+    """The chain `_turn_time` advertises, end to end: copy a time out of the
+    list, paste it into `--at`. The text list prints ONE whole second for two
+    turns 800ms apart and that string opens the newer of them; `--json` prints
+    each turn's full-precision `ts` and that one opens the turn it came from."""
+    sid = "sess-one-second"
+    _build_session_store(tmp_path, monkeypatch, sid, _one_second_events(sid))
+    assert _prompts("--session", sid, "--json") == 0
+    rows = json.loads(capsys.readouterr().out)
+    earlier, later = _turn(rows, "earlier of"), _turn(rows, "later of")
+    assert _prompts("--session", sid) == 0
+    printed = [ln.split("  ")[0] for ln in capsys.readouterr().out.splitlines()[1:]]
+    assert printed[0] == printed[1]          # both turns, one printed second
+    for at, expected in ((printed[0], later["event_id"]),
+                         (earlier["ts"], earlier["event_id"]),
+                         (later["ts"], later["event_id"])):
+        assert _prompts("--session", sid, "--at", at) == 0, at
+        assert f"event-id  {expected}" in capsys.readouterr().out, at
+
+
+def test_cmd_prompts_limit_is_filled_past_the_dropped_noise_turns(tmp_path, monkeypatch,
+                                                                  capsys):
+    """`--limit N` means N rows, not "whatever N raw turns survive".
+
+    The scan bounds RAW user turns and the noise filter drops them AFTER it, so
+    on a history that is 3/4 harness noise a single pass comes back short (on the
+    live store, a fixed 2x scan for `--limit 500` returned 466). The scan widens
+    until the limit is filled, and stops once it covers every turn there is."""
+    sid = "sess-noisy-scan"
+    events = []
+    for i in range(16):
+        real = i % 4 == 3
+        events.append(_user_prompt(
+            f"ns-u{i}", sid,
+            f"real ask {i}" if real else f"<task-notification>agent {i}</task-notification>",
+            f"2026-06-30T02:{i:02d}:00.000Z"))
+    _build_session_store(tmp_path, monkeypatch, sid, events)
+    # The floor is the TUI's measured 400, which would swallow this whole fixture
+    # in one pass; shrink it so the widening is what fills the limit.
+    monkeypatch.setattr(store, "PROMPT_TURN_RAW_SCAN", 4)
+    assert _prompts("--session", sid, "--limit", "4") == 0
+    assert _prompt_cells(capsys.readouterr().out) == [
+        "real ask 15", "real ask 11", "real ask 7", "real ask 3"]
+    # more than the store holds: what exists, and no endless widening
+    assert _prompts("--session", sid, "--limit", "50") == 0
+    assert len(_prompt_cells(capsys.readouterr().out)) == 4
+
+
+def test_cmd_prompts_strips_terminal_control_characters(tmp_path, monkeypatch, capsys):
+    """Prompt text is the likeliest place in this store to find PASTED TERMINAL
+    OUTPUT, and this printer writes to a real terminal: an ANSI escape or a BEL
+    in a prompt (or in a command it ran) must print as text rather than be obeyed
+    by the terminal reading it. `--json` keeps them, escaped as `\\uXXXX`."""
+    sid = "sess-control-chars"
+    _build_session_store(tmp_path, monkeypatch, sid, [
+        _user_prompt("cc-u1", sid, "\x1b[31mRED\x1b[0m and a \x07bell\nsecond line",
+                     "2026-06-30T02:00:00.000Z"),
+        _tool_use_line("cc-a1", sid, "2026-06-30T02:00:01.000Z", "req-C1",
+                       [{"type": "tool_use", "id": "toolu-c1", "name": "Bash",
+                         "input": {"command": "echo \x1b[2Jclear"}}], 5),
+    ])
+    assert _prompts("--session", sid) == 0
+    listed = capsys.readouterr().out
+    assert _prompt_cells(listed) == ["[31mRED[0m and a bell"]
+    assert _prompts("--session", sid, "--at", "2026-06-30T02:00:02.000Z") == 0
+    dumped = capsys.readouterr().out
+    assert "prompt    [31mRED[0m and a bell" in dumped
+    assert dumped.rstrip().endswith("echo [2Jclear")
+    for out in (listed, dumped):
+        assert "\x1b" not in out and "\x07" not in out
+    assert _prompts("--session", sid, "--json") == 0
+    assert "\\u001b" in capsys.readouterr().out
+
+
 def test_cmd_prompts_json_round_trips(tmp_path, monkeypatch, capsys):
     """`--json` is the scriptable form: a JSON array of the query's own dicts,
     with the full 400-char preview the text list shortens."""
@@ -2291,6 +2426,8 @@ def test_cmd_prompts_zero_call_turn_says_so(tmp_path, monkeypatch, capsys):
     assert "work      no tool calls" in out
     assert "tokens    no requests attributed to this window yet" in out
     assert out.rstrip().endswith("(no tool calls in this turn)")
+    # and no column header standing over the nothing it would describe
+    assert "detail" not in out
 
 
 def test_cmd_prompts_unresolvable_turn_exits_1(tmp_path, monkeypatch, capsys):
@@ -2324,6 +2461,15 @@ def test_cmd_prompts_refuses_bad_arguments(tmp_path, monkeypatch, capsys):
         (("--at", "x", "--event-id", "y"), "both select one turn"),
         (("--session", "sess-turns-01", "--at", "nope"), "--at wants a timestamp"),
         (("--since", "nope"), "--since wants a timestamp"),
+        # an event_id carries its own session, so honouring --session too would
+        # mean dumping one session's turn under another's name
+        (("--session", "sess-turns-01", "--event-id", "t-u1"),
+         "--event-id names its own session"),
+        # the list's bounds against the one-turn forms: dropped silently before
+        (("--event-id", "t-u1", "--since", "2026-06-30T02:00:00.000Z"),
+         "--since bound the LIST"),
+        (("--session", "sess-turns-01", "--at", "2026-06-30T02:00:00.000Z",
+          "--limit", "5"), "--limit bound the LIST"),
     ]:
         assert _prompts(*args) == 2, args
         assert reason in capsys.readouterr().err, args
