@@ -345,6 +345,12 @@ def _decode_project(transcript_path):
     # dir names encode cwd: "-home-naka-Projects-personal" -> project label.
     # Use the first component under PROJECTS_DIR: subagent transcripts live two
     # levels deeper (<project>/<sid>/subagents/*.jsonl), so parent.name is wrong there.
+    # LOSSY, and unfixably so: the encoding spends `-` on both the separator and
+    # any `-` in a directory's own name, so `claude-trail` comes back as
+    # `claude/trail` - a path that does not exist. `sessions.cwd` (written from the
+    # transcript's own `cwd`, see `_first_event_cwd`) is the exact answer; this
+    # stays the fallback for rows that have no cwd rather than trying to guess
+    # which dashes were separators.
     try:
         name = transcript_path.relative_to(PROJECTS_DIR).parts[0]
     except ValueError:
@@ -393,6 +399,7 @@ def ingest_transcript(con, path):
     # subagent transcripts: <project>/<sid>/subagents/agent-<id>.jsonl
     agent_id = path.stem.removeprefix("agent-") if path.parent.name == "subagents" else None
     raw_rows, rows, ureqs, fvs = [], [], [], []
+    cwd = None   # the session's launch dir, from the first main-thread line carrying one
     for line in complete.decode("utf-8", errors="replace").splitlines():
         if not line.strip():
             continue
@@ -413,6 +420,11 @@ def ingest_transcript(con, path):
         raw_val = line if typ == "file-history-snapshot" else None
         raw_rows.append((uid, ev.get("sessionId", ""), ev.get("timestamp"),
                          typ, str(path), raw_val))
+        # Main transcripts only: a subagent runs under the PARENT session id but
+        # in its own cwd (measured: a scratchpad under /tmp for 2 of 5 sampled
+        # subagent transcripts), so taking its cwd would mislabel the parent.
+        if cwd is None and agent_id is None:
+            cwd = _first_event_cwd(ev)
         rows.extend(parse_event(ev, agent_id))  # derived events; may be empty for a line
         u = parse_usage(ev, agent_id)           # one api_requests row per assistant line
         if u:
@@ -422,8 +434,8 @@ def ingest_transcript(con, path):
             if fv:
                 fvs.append(fv)
     if raw_rows:
-        _insert_raw(con, raw_rows)            # index rows always; payload only for snapshots/malformed
-        _upsert_session(con, path, raw_rows)  # sees every line (event_count stays exact)
+        _insert_raw(con, raw_rows)                 # index rows always; payload only for snapshots/malformed
+        _upsert_session(con, path, raw_rows, cwd)  # sees every line (event_count stays exact)
     if rows:
         _insert_events(con, rows)
     if ureqs:
@@ -471,18 +483,34 @@ def _insert_requests(con, rows):
     con.execute("DELETE FROM _req_stage")
 
 
-def _upsert_session(con, path, raw_rows):
+def _first_event_cwd(ev):
+    """The top-level `cwd` of one transcript line, or None when it carries none."""
+    cwd = ev.get("cwd") if isinstance(ev, dict) else None
+    return cwd if isinstance(cwd, str) and cwd else None
+
+
+def _upsert_session(con, path, raw_rows, cwd=None):
     # raw_rows are tuples: (uuid, session_id, ts, type, transcript_path, raw)
+    #
+    # `cwd` is the FIRST cwd seen on a main transcript (the launch dir), and it is
+    # written once: `coalesce(sessions.cwd, excluded.cwd)` never replaces a value
+    # already there. Latest-wins would be wrong AND unstable - Claude Code rewrites
+    # the top-level cwd after a `cd`, and 12 of the newest 40 transcripts on this
+    # machine carry more than one (up to 27 distinct values, including
+    # `/tmp/.../scratchpad`), so the Project column would drift away from the
+    # project mid-session and flip on every incremental sweep. First-wins also
+    # makes the sweep idempotent: re-ingesting the same session cannot change it.
     sid = next((r[1] for r in raw_rows if r[1]), None)
     if not sid:
         return
     ts_vals = [r[2] for r in raw_rows if r[2]]
     con.execute(
-        "INSERT INTO sessions(session_id, project, first_ts, last_ts, event_count) "
-        "VALUES (?,?,?,?,?) ON CONFLICT (session_id) DO UPDATE SET "
+        "INSERT INTO sessions(session_id, project, cwd, first_ts, last_ts, event_count) "
+        "VALUES (?,?,?,?,?,?) ON CONFLICT (session_id) DO UPDATE SET "
+        "cwd=coalesce(sessions.cwd, excluded.cwd), "
         "last_ts=greatest(sessions.last_ts, excluded.last_ts), "
         "event_count=sessions.event_count + excluded.event_count",
-        [sid, _decode_project(path), min(ts_vals, default=None),
+        [sid, _decode_project(path), cwd, min(ts_vals, default=None),
          max(ts_vals, default=None), len(raw_rows)])  # event_count = transcript lines
 
 
@@ -561,10 +589,92 @@ def _store_size():
     return total
 
 
+def _main_transcript_paths():
+    """Main session transcripts only: `<project>/<sid>.jsonl`, no subagents."""
+    return sorted(PROJECTS_DIR.glob("*/*.jsonl"))
+
+
 def _transcript_paths():
     """All transcript files: main `<sid>.jsonl` plus subagent `subagents/*.jsonl`."""
-    return (sorted(PROJECTS_DIR.glob("*/*.jsonl"))
+    return (_main_transcript_paths()
             + sorted(PROJECTS_DIR.glob("*/*/subagents/*.jsonl")))
+
+
+# How far into a transcript the backfill looks for the session's launch cwd.
+# Measured over the 127 transcripts on this machine: the first cwd-bearing line
+# is line 2..21 (the header block), and the 10 files with no cwd at all are
+# sub-300-byte stubs. 50 covers that with room to spare while bounding the read
+# of a transcript that can be hundreds of MB to its head.
+SESSION_CWD_SCAN_LINES = 50
+
+
+def _head_cwd(path):
+    """`(session_id, cwd)` from the first head line of `path` that carries a cwd.
+
+    `(None, None)` when the head has none (a stub transcript, an unreadable file).
+    The session id comes from the SAME line as the cwd, so the row that gets
+    filled is identified by the data rather than by the file name.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= SESSION_CWD_SCAN_LINES:
+                    break
+                if '"cwd"' not in line:   # cheap reject before parsing a big line
+                    continue
+                try:
+                    ev = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                cwd = _first_event_cwd(ev)
+                if cwd:
+                    return ev.get("sessionId"), cwd
+    except OSError:
+        pass
+    return None, None
+
+
+def backfill_session_cwd(con, paths=None):
+    """Fill `sessions.cwd` for rows ingested before the ingester wrote it.
+
+    IN-PLACE, not a `reset-db` + full re-ingest. The cwd is a few lines into each
+    transcript, so filling it costs one bounded head read per stale session:
+    measured on the real 1.5 GB store, 117 rows filled inside a 0.9s ingest run.
+    A reset would also be LOSSY, not merely slow - the store keeps 1,703 sessions
+    while only 127 main transcripts are still on disk, so rebuilding from scratch
+    would throw away the other ~1,580 sessions' history to fill a column it could
+    not fill for them either. `raw_events` cannot answer it (the verbatim payload
+    is kept only for file-history-snapshot lines, see `ingest_transcript` /
+    `prune_raw_events`), so the transcripts on disk are the only source either way.
+
+    Self-limiting and idempotent: once no row has a NULL cwd it does one scan of
+    the small `sessions` table and returns, reading no files; a value already
+    there is never overwritten. Sessions whose transcript is gone from disk stay
+    NULL and keep rendering from `project`. The candidate filter is the file name
+    (a main transcript is named `<session-id>.jsonl`, true for all 117 resolvable
+    transcripts here), which is what keeps a sweep that still has NULL rows from
+    re-reading every transcript head; a name that disagrees with its own
+    `sessionId` just leaves that row NULL. Returns the number of rows filled.
+    """
+    pending = {r[0] for r in con.execute(
+        "SELECT session_id FROM sessions WHERE cwd IS NULL").fetchall()}
+    if not pending:
+        return 0
+    filled = 0
+    for path in (_main_transcript_paths() if paths is None else paths):
+        # `paths` may be the full sweep list; a subagent's cwd is its own, and its
+        # `agent-<id>` stem is never a session id, so both filters drop it.
+        if path.parent.name == "subagents" or path.stem not in pending:
+            continue
+        sid, cwd = _head_cwd(path)
+        sid = sid or path.stem
+        if not cwd or sid not in pending:
+            continue
+        con.execute("UPDATE sessions SET cwd=? WHERE session_id=? AND cwd IS NULL",
+                    [cwd, sid])
+        pending.discard(sid)
+        filled += 1
+    return filled
 
 
 def _sweep_transcripts(con, paths=None, verbose=False, tick=None):
@@ -594,6 +704,8 @@ def ingest_all(con, verbose=False):
     before emitting rows). Returns the transcript-line count (the historical
     contract); per-file lines are logged when `verbose`."""
     _files, _changed, lines = _sweep_transcripts(con, verbose=verbose)
+    # Rows ingested before the ingester wrote `cwd`; a no-op once none are NULL.
+    backfill_session_cwd(con)
     ingest_file_history(con, verbose=verbose)
     return lines
 
@@ -1466,7 +1578,7 @@ def cmd_ingest(argv):
             sweep += 1
             t0 = time.monotonic()
             before = _table_counts(con)
-            files = changed = lines = 0
+            files = changed = lines = cwd_filled = 0
             t_tx = 0.0
             with _IngestProgress(bar_enabled) as prog:
                 if not fh_only:
@@ -1475,6 +1587,11 @@ def cmd_ingest(argv):
                     s = time.monotonic()
                     files, changed, lines = _sweep_transcripts(
                         con, paths=paths, verbose=file_verbose, tick=prog.tick_transcript)
+                    # One-time in-place backfill of sessions.cwd for rows ingested
+                    # before it was written; reuses the swept path list and costs a
+                    # single `sessions` scan once nothing is NULL. Skipped under
+                    # --file-history-only, which touches no transcript at all.
+                    cwd_filled = backfill_session_cwd(con, paths=paths)
                     t_tx = time.monotonic() - s
                 s = time.monotonic()
                 fh_new, fh_resolved = ingest_file_history(
@@ -1483,13 +1600,17 @@ def cmd_ingest(argv):
                 t_fh = time.monotonic() - s
             after = _table_counts(con)
             delta = {k: after.get(k, 0) - before.get(k, 0) for k in after}
-            stored_anything = stored_anything or any(delta.values())
+            # A backfilled cwd is an UPDATE, so it moves no row count: name it
+            # explicitly or the flush would be skipped as "stored nothing".
+            stored_anything = stored_anything or any(delta.values()) or bool(cwd_filled)
             elapsed = time.monotonic() - t0
             # Under --watch, stay quiet on an idle sweep (nothing new) so the poll
             # loop does not spam; always report a changed sweep and any one-shot run.
-            if not watch or changed or fh_new or fh_resolved or any(delta.values()):
+            if not watch or changed or fh_new or fh_resolved or cwd_filled or any(delta.values()):
                 if not fh_only:
                     _log(f"transcripts: {changed}/{files} changed, +{lines} lines")
+                if cwd_filled:   # silent on every later run: nothing is NULL any more
+                    _log(f"sessions: {cwd_filled} cwd backfilled")
                 _log(f"file-history: {fh_new} new snapshots, {fh_resolved} resolved")
                 _log("stored: " + ", ".join(
                     f"+{delta.get(k, 0)} {k}" for k in _INGEST_COUNT_TABLES if k in after))
@@ -1998,8 +2119,12 @@ def prompt_turns(con, limit=PROMPT_TURN_LIMIT, session_id=None,
     turn that emitted no API request. Every count coalesces to 0, never None.
     Token numbers are the turn's generation cost by the same attribute-by-time
     rule the `command_tokens` view documents, so a turn whose reply carried no
-    usage row honestly reports 0. Read-only; never raises for a caller that
-    already guarded the connection.
+    usage row honestly reports 0. `cwd` is the session's exact launch dir and
+    `project` the lossy dir-name decoding of it (see `_decode_project`), so a
+    caller showing a path prefers `cwd`; `cwd` is None only for a session that was
+    ingested before the column was written AND whose transcript has since left the
+    disk (`backfill_session_cwd` fills the rest). Read-only; never raises for a
+    caller that already guarded the connection.
     """
     where = ["type = 'user'", "agent_id IS NULL", "ts IS NOT NULL"]
     params = []

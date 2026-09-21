@@ -608,6 +608,197 @@ def test_decode_project_maps_encoded_dir_name(tmp_path, monkeypatch):
     assert store._decode_project(path) == "/home/naka/Projects/personal"
 
 
+# --- sessions.cwd: the exact launch dir, and the backfill for old rows ---------
+
+
+def _cwd_of(con, sid):
+    return con.execute("SELECT cwd FROM sessions WHERE session_id=?", [sid]).fetchone()[0]
+
+
+def _cwd_transcript(sid, cwd, uuid="c-u1", ts="2026-06-30T04:00:00.000Z"):
+    """One main-transcript user line carrying a top-level cwd."""
+    return [{**_user_prompt(uuid, sid, "hello", ts), "cwd": cwd}]
+
+
+def test_ingest_writes_the_true_cwd_for_a_hyphenated_project_dir(tmp_path, monkeypatch):
+    """The whole point of the column: a project dir whose name contains a `-`
+    decodes to a path that does not exist, while the transcript's own cwd is
+    exact. Both are stored; only one is right."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    sid, cwd = "sess-cwd-0001", "/home/u/Projects/personal/claude-trail"
+    _write_jsonl(projects / "-home-u-Projects-personal-claude-trail" / f"{sid}.jsonl",
+                 _cwd_transcript(sid, cwd))
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        project, stored = con.execute(
+            "SELECT project, cwd FROM sessions WHERE session_id=?", [sid]).fetchone()
+    finally:
+        con.close()
+    assert stored == cwd                                   # exact, dashes intact
+    assert project == "/home/u/Projects/personal/claude/trail"  # lossy, not a real path
+    assert project != stored
+
+
+def test_ingest_keeps_the_first_cwd_when_the_session_cds(tmp_path, monkeypatch):
+    """A session's cwd is its LAUNCH dir: Claude Code rewrites the top-level cwd
+    after a `cd`, so later lines (and later incremental sweeps) must not move the
+    column to whatever scratchpad the run wandered into."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    sid, launched = "sess-cwd-0002", "/home/u/Projects/personal"
+    path = projects / "-home-u-Projects-personal" / f"{sid}.jsonl"
+    _write_jsonl(path, [
+        {**_user_prompt("cd-u1", sid, "first", "2026-06-30T04:00:00.000Z"),
+         "cwd": launched},
+        {**_user_prompt("cd-u2", sid, "second", "2026-06-30T04:00:01.000Z"),
+         "cwd": "/tmp/scratch"},
+    ])
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        assert _cwd_of(con, sid) == launched
+        # a later sweep of appended lines, all of them post-`cd`, changes nothing
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(
+                {**_user_prompt("cd-u3", sid, "third", "2026-06-30T04:00:02.000Z"),
+                 "cwd": "/tmp/scratch"}) + "\n")
+        store.ingest_all(con)
+        assert _cwd_of(con, sid) == launched
+    finally:
+        con.close()
+
+
+def test_subagent_cwd_never_overwrites_the_parent_session(tmp_path, monkeypatch):
+    """A subagent transcript is ingested under the PARENT session id but often
+    runs somewhere else (a /tmp scratchpad), so its cwd is ignored outright:
+    it neither replaces the parent's nor fills in for a missing one."""
+    sid = _build_turn_store(tmp_path, monkeypatch)[0]
+    con = store.connect(read_only=True)
+    try:
+        assert _cwd_of(con, sid) == _TURN_CWD          # not the subagent's scratchpad
+    finally:
+        con.close()
+
+    # And with ONLY the subagent transcript on disk, the session row it creates
+    # keeps a NULL cwd rather than claiming the scratchpad as the project.
+    projects = tmp_path / "projects2"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail2.duckdb")
+    sid2 = "sess-cwd-0003"
+    _write_jsonl(projects / "-fake-proj" / sid2 / "subagents" / "agent-ag9.jsonl",
+                 _cwd_transcript(sid2, _TURN_SUB_CWD, uuid="s-only-1"))
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        assert _cwd_of(con, sid2) is None
+    finally:
+        con.close()
+
+
+def test_backfill_session_cwd_fills_null_rows_in_place(tmp_path, monkeypatch):
+    """The upgrade path for rows ingested before the column was written: no
+    reset-db, just a bounded head read per stale session. Idempotent - a second
+    run has nothing to do."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    sid, cwd = "sess-cwd-0004", "/home/u/Projects/personal/keypad-macros"
+    _write_jsonl(projects / "-home-u-Projects-personal-keypad-macros" / f"{sid}.jsonl",
+                 _cwd_transcript(sid, cwd))
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        con.execute("UPDATE sessions SET cwd=NULL")      # the pre-change store
+        assert store.backfill_session_cwd(con) == 1
+        assert _cwd_of(con, sid) == cwd
+        assert store.backfill_session_cwd(con) == 0      # nothing NULL left
+        assert _cwd_of(con, sid) == cwd
+    finally:
+        con.close()
+
+
+def test_backfill_session_cwd_skips_a_session_whose_transcript_is_gone(tmp_path, monkeypatch):
+    """Most rows of an old store outlive their transcripts. Those stay NULL (the
+    Project column falls back to `project`) instead of raising or guessing."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    sid = "sess-cwd-0005"
+    path = projects / "-fake-proj" / f"{sid}.jsonl"
+    _write_jsonl(path, _cwd_transcript(sid, "/home/u/gone"))
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        con.execute("UPDATE sessions SET cwd=NULL")
+        path.unlink()
+        assert store.backfill_session_cwd(con) == 0
+        assert _cwd_of(con, sid) is None
+    finally:
+        con.close()
+
+
+def test_backfill_session_cwd_reads_only_the_head_of_a_transcript(tmp_path, monkeypatch):
+    """The backfill's read is BOUNDED, unlike the ingest sweep (which is parsing
+    every line anyway): a cwd that first appears past SESSION_CWD_SCAN_LINES is
+    not worth re-reading a multi-hundred-MB transcript for, and finding none in
+    the head leaves the row NULL rather than raising."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    sid = "sess-cwd-0006"
+    deep = [_user_prompt(f"d-u{i}", sid, f"ask {i}",
+                         f"2026-06-30T04:{i:02d}:00.000Z")
+            for i in range(store.SESSION_CWD_SCAN_LINES + 2)]
+    deep[-1] = {**deep[-1], "cwd": "/home/u/too-deep"}
+    _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", deep)
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        # The sweep reads the whole file, so it does find the late cwd ...
+        assert _cwd_of(con, sid) == "/home/u/too-deep"
+        con.execute("UPDATE sessions SET cwd=NULL")
+        # ... while the backfill stops at the head and leaves the row alone.
+        assert store.backfill_session_cwd(con) == 0
+        assert _cwd_of(con, sid) is None
+    finally:
+        con.close()
+
+
+def test_cmd_ingest_backfills_session_cwd_and_reports_it(tmp_path, monkeypatch, capsys):
+    """The backfill rides the normal `ingest` sweep, so the user upgrades by
+    doing nothing. Modeled on the real upgrade: a store that already ingested
+    everything (so the sweep finds no new line) and whose cwd column is empty.
+    It logs only when it actually filled rows."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    sid, cwd = "sess-cwd-0007", "/home/u/Projects/personal/personal-fin"
+    _write_jsonl(projects / "-home-u-Projects-personal-personal-fin" / f"{sid}.jsonl",
+                 _cwd_transcript(sid, cwd))
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        con.execute("UPDATE sessions SET cwd=NULL")   # the pre-change store shape
+    finally:
+        con.close()
+    capsys.readouterr()                               # drop the setup's output
+    assert store.cmd_ingest(["ingest"]) == 0
+    out = capsys.readouterr().out
+    assert "transcripts: 0/1 changed" in out          # nothing re-parsed, just the fill
+    assert "sessions: 1 cwd backfilled" in out
+    con = store.connect(read_only=True)
+    try:
+        assert _cwd_of(con, sid) == cwd
+    finally:
+        con.close()
+    assert store.cmd_ingest(["ingest"]) == 0          # silent once nothing is NULL
+    assert "cwd backfilled" not in capsys.readouterr().out
+
+
 def test_compact_db_reclaims_free_blocks_and_preserves_rows(tmp_path, monkeypatch):
     """compact_db rewrites the store into a fresh file: every row survives, the
     file is no larger, PRAGMA reports zero free blocks, and the temp is cleaned
@@ -985,8 +1176,16 @@ def test_clean_prompt_text_strips_reminders_but_keeps_commands():
 #
 # plus a second session with one turn, so session filtering has something to
 # exclude.
+#
+# Both transcripts carry a top-level `cwd` like the real ones do, and the fixture
+# picks a LAST COMPONENT WITH A DASH (`fake-proj`): the dir-name decoding behind
+# `sessions.project` turns that into `/fake/proj`, so the two columns differ and
+# a test can tell which one a caller used.
 
 _LONG_TURN_TEXT = "long turn " + "x" * 500          # 510 chars: preview truncates
+
+_TURN_CWD = "/home/u/Projects/fake-proj"            # the exact launch dir
+_TURN_SUB_CWD = "/tmp/claude/fake-proj/scratchpad"  # where the subagent ran instead
 
 
 def _tool_use_line(uuid, sid, ts, request_id, blocks, out_tokens):
@@ -1010,6 +1209,11 @@ def _tool_result_line(uuid, sid, ts, tool_use_id, is_error=False):
                                      "tool_use_id": tool_use_id,
                                      "content": "out", "is_error": is_error}]},
             "toolUseResult": {"stdout": "out", "stderr": "", "interrupted": False}}
+
+
+def _with_cwd(events, cwd):
+    """Stamp a top-level `cwd` on every line, the way a real transcript carries it."""
+    return [{**e, "cwd": cwd} for e in events]
 
 
 def _turn_transcript_events(sid):
@@ -1041,26 +1245,29 @@ def _build_turn_store(tmp_path, monkeypatch, sid="sess-turns-01",
     monkeypatch.setattr(store, "PROJECTS_DIR", projects)
     monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
     _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl",
-                 _turn_transcript_events(sid))
+                 _with_cwd(_turn_transcript_events(sid), _TURN_CWD))
     _write_jsonl(
         projects / "-fake-proj" / sid / "subagents" / "agent-ag1.jsonl",
         # The subagent's own user turn is its task prompt: it must NOT become a
         # row of its own (only main-thread turns do), and its tool calls carry the
-        # PARENT session_id, so they fall inside the parent turn's window.
-        [_user_prompt("t-s-u1", sid, "task prompt for ag1",
-                      "2026-06-30T02:00:02.500Z"),
-         _tool_use_line("t-s-a1", sid, "2026-06-30T02:00:03.000Z", "req-S1",
-                        [{"type": "tool_use", "id": "toolu-sub-a", "name": "Read",
-                          "input": {"file_path": "/tmp/read-me.py"}},
-                         {"type": "tool_use", "id": "toolu-sub-b", "name": "Grep",
-                          "input": {"pattern": "def build_"}}], 7)],
+        # PARENT session_id, so they fall inside the parent turn's window. Its cwd
+        # is its own (a scratchpad) and must not reach the parent's session row.
+        _with_cwd(
+            [_user_prompt("t-s-u1", sid, "task prompt for ag1",
+                          "2026-06-30T02:00:02.500Z"),
+             _tool_use_line("t-s-a1", sid, "2026-06-30T02:00:03.000Z", "req-S1",
+                            [{"type": "tool_use", "id": "toolu-sub-a", "name": "Read",
+                              "input": {"file_path": "/tmp/read-me.py"}},
+                             {"type": "tool_use", "id": "toolu-sub-b", "name": "Grep",
+                              "input": {"pattern": "def build_"}}], 7)],
+            _TURN_SUB_CWD),
     )
-    _write_jsonl(projects / "-fake-proj" / f"{sid2}.jsonl", [
+    _write_jsonl(projects / "-fake-proj" / f"{sid2}.jsonl", _with_cwd([
         _user_prompt("o-u1", sid2, "other session ask", "2026-06-30T03:00:00.000Z"),
         _tool_use_line("o-a1", sid2, "2026-06-30T03:00:01.000Z", "req-O1",
                        [{"type": "tool_use", "id": "toolu-o1", "name": "Bash",
                          "input": {"command": "echo other"}}], 5),
-    ])
+    ], _TURN_CWD))
     con = store.connect()
     try:
         store.ingest_all(con)
@@ -1091,10 +1298,11 @@ def test_prompt_turns_one_row_per_main_thread_prompt_newest_first(tmp_path, monk
     assert [r["ts"] for r in rows] == sorted((r["ts"] for r in rows), reverse=True)
     assert not any("task prompt for ag1" in r["preview"] for r in rows)
     assert {r["session_id"] for r in rows} == {sid, sid2}
-    # sessions.project is decoded from the transcript dir; cwd is not populated by
-    # the ingester today, so the key is present and None (the TUI falls back).
+    # Both path keys come back, and they DISAGREE: `project` is decoded from the
+    # transcript dir name (every `-` becomes `/`, so `fake-proj` splits), `cwd` is
+    # the exact launch dir the transcript recorded. The TUI shows `cwd`.
     assert _turn(rows, "first ask")["project"] == "/fake/proj"
-    assert _turn(rows, "first ask")["cwd"] is None
+    assert _turn(rows, "first ask")["cwd"] == _TURN_CWD
 
 
 def test_prompt_turns_window_ends_at_the_next_prompt(tmp_path, monkeypatch):

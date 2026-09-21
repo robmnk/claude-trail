@@ -472,16 +472,29 @@ def _render_turn_session(turn: "PromptTurn", ctx: RenderCtx):
     return _session_cell(turn.session_id, ctx)
 
 
-def _render_turn_project(turn: "PromptTurn", ctx: RenderCtx):
-    """The session's project dir, left-truncated like the feed's Directory cell.
+def _turn_project_path(turn: "PromptTurn") -> str:
+    """The path to show for a turn's session: its exact cwd, else the decoded one.
 
-    `sessions.project` ALONE: `PromptTurn.cwd` is always None (`_upsert_session`
-    never writes that column), so a fallback to it would be dead code.
+    `sessions.cwd` is the session's launch dir, copied verbatim from the
+    transcript. `sessions.project` is decoded from the transcript DIR NAME, whose
+    encoding spends `-` on both the separator and any `-` in a directory's own
+    name, so it renders `claude-trail` as `…/claude/trail`, `personal-fin` as
+    `…/personal/fin` - paths that do not exist. The lossy half cannot be
+    recovered (nothing says which dashes were separators), so `cwd` wins and
+    `project` stays the fallback for the sessions that have no cwd: ones ingested
+    before the store wrote the column whose transcript has since left the disk
+    (`claude_trail_store.backfill_session_cwd` fills the rest on the next ingest).
+    """
+    return turn.cwd or turn.project or ""
+
+
+def _render_turn_project(turn: "PromptTurn", ctx: RenderCtx):
+    """The session's directory, left-truncated like the feed's Directory cell.
 
     A `Text`, because a project path is outside text (see the note under
     `Column`): a directory named `[wip]` would otherwise be deleted from the cell.
     """
-    return Text(short_path(turn.project or "", PROJECT_LABEL_WIDTH))
+    return Text(short_path(_turn_project_path(turn), PROJECT_LABEL_WIDTH))
 
 
 def _render_turn_calls(turn: "PromptTurn", ctx: RenderCtx):
@@ -2729,10 +2742,11 @@ def build_turn_panel(
     meta.add_column(ratio=1)
     ident = Text()
     ident.append_text(_session_cell(turn.session_id, ctx))
-    if turn.project:
+    project = _turn_project_path(turn)   # the exact cwd, else the decoded dir name
+    if project:
         # append (not from_markup) does not parse markup, so a project dir named
         # `[wip]` survives (see the note under `Column`).
-        ident.append(f"  {short_path(turn.project, PROJECT_LABEL_WIDTH)}", style="dim")
+        ident.append(f"  {short_path(project, PROJECT_LABEL_WIDTH)}", style="dim")
     ident.append(f"  ·  sent {format_time(turn.ts)}", style="dim")
     took = _turn_duration(turn.ts, turn.last_ts)
     if took:
@@ -3028,9 +3042,11 @@ class PromptTurn:
     - `tools` is INCLUSIVE of `subcalls`: one main-thread Bash plus two subagent
       calls is `tools=3, subcalls=2`, so a main-thread count is `tools - subcalls`
       (subtract, never add).
-    - `cwd` is always None. `_upsert_session` never writes that column, so
-      `sessions.cwd` is dead; `project` is the populated one. The field is kept
-      because it documents the gap, and nothing renders it.
+    - `cwd` is the session's exact launch dir and outranks `project`, which is
+      the lossy decoding of the transcript dir name (`claude-trail` comes back as
+      `claude/trail`). `cwd` is None only for a session ingested before the store
+      wrote the column whose transcript has since left the disk; everything that
+      shows a path goes through `_turn_project_path`.
     """
 
     session_id: str
