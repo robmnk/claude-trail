@@ -2312,13 +2312,21 @@ class TestPromptRecords:
         assert turn.tools == 3 and turn.subcalls == 2
         assert turn.tools - turn.subcalls == 1
 
-    def test_cwd_is_always_none_project_is_the_populated_one(self):
-        # `_upsert_session` never writes sessions.cwd; the field only documents
-        # the gap, so nothing may render it.
-        turn = feed.PromptTurn.from_row(self.TURN_ROW)
-        assert turn.cwd is None
+    def test_cwd_outranks_project_and_both_survive_the_mapping(self):
+        # Since phase 5 the ingester writes sessions.cwd (the session's exact
+        # launch dir), so BOTH path keys arrive and `cwd` is the one to show;
+        # `project` is the lossy dir-name decoding kept as the fallback.
+        turn = feed.PromptTurn.from_row(
+            {**self.TURN_ROW, "cwd": "/home/naka/Projects/personal/claude-trail"})
+        assert turn.cwd == "/home/naka/Projects/personal/claude-trail"
         assert turn.project == "/home/naka/x"
-        assert feed.PromptTurn(session_id="s", ts="t").cwd is None
+        assert feed._turn_project_path(turn) == turn.cwd
+        # A row from before the column was written (its transcript is gone, so
+        # the backfill cannot fill it) still resolves, via `project`.
+        old = feed.PromptTurn.from_row(self.TURN_ROW)
+        assert old.cwd is None
+        assert feed._turn_project_path(old) == "/home/naka/x"
+        assert feed._turn_project_path(feed.PromptTurn(session_id="s", ts="t")) == ""
 
     def test_defaults_let_a_test_build_a_row_without_a_db(self):
         turn = feed.PromptTurn(session_id="s1", ts="2026-07-29 10:00:00-03")
@@ -2356,16 +2364,32 @@ class TestPromptColumnRender:
         cell = self._col(2).render(_turn(sid="abcd1234-5678"), feed.RenderCtx())
         assert cell.plain == "abcd1234"
 
-    def test_project_column_renders_project_and_never_cwd(self):
-        turn = _turn(project="/home/naka/Projects/personal/claude-trail")
+    def test_project_column_prefers_the_exact_cwd(self):
+        # The dir-name decoding behind `project` spends `-` on the separator, so
+        # a `claude-trail` session reads `…/claude/trail` there. `cwd` is the
+        # path the session actually ran in and wins.
+        turn = _turn(project="/home/naka/Projects/personal/claude/trail",
+                     cwd="/home/naka/Projects/personal/claude-trail")
         cell = self._col(3).render(turn, feed.RenderCtx())
-        assert cell.plain == feed.short_path(turn.project, feed.PROJECT_LABEL_WIDTH)
+        assert cell.plain == feed.short_path(turn.cwd, feed.PROJECT_LABEL_WIDTH)
         assert "claude-trail" in cell.plain
-        # `sessions.cwd` is never written, so a row carrying one must not show it:
-        # the plan's old cwd fallback would have been dead code.
-        sneaky = feed.PromptTurn(session_id="s", ts="2026-07-29 10:00:00-03",
-                                 project=None, cwd="/should/not/render")
-        assert self._col(3).render(sneaky, feed.RenderCtx()).plain == ""
+        assert "claude/trail" not in cell.plain
+
+    def test_project_column_falls_back_when_the_row_has_no_cwd(self):
+        # Sessions ingested before the column was written whose transcript has
+        # since left the disk: `project` still names them.
+        turn = _turn(project="/home/naka/Projects/personal", cwd=None)
+        assert self._col(3).render(turn, feed.RenderCtx()).plain == \
+            feed.short_path(turn.project, feed.PROJECT_LABEL_WIDTH)
+        blank = feed.PromptTurn(session_id="s", ts="2026-07-29 10:00:00-03")
+        assert self._col(3).render(blank, feed.RenderCtx()).plain == ""
+
+    def test_project_column_is_text_not_markup(self):
+        from rich.text import Text
+        # A cwd is user-derived: a dir named `[wip]` must survive the cell.
+        cell = self._col(3).render(_turn(cwd="/home/naka/[wip]"), feed.RenderCtx())
+        assert isinstance(cell, Text)
+        assert "[wip]" in cell.plain
 
     def test_calls_column_shows_the_total_and_the_bash_share(self):
         from rich.text import Text
@@ -3667,6 +3691,16 @@ class TestTurnPanelHeader:
         assert "ran 6m 12s" in out
         assert "1 main, 2 across 1 subagent" in out
         assert "2,400 output" in out
+
+    def test_header_names_the_directory_from_the_cwd(self):
+        # Same rule as the list's Project column: the exact cwd, not the lossy
+        # dir-name decoding, so the two views never disagree about a project.
+        turn = _turn(sid="4be57694-c1f0", ts="2026-07-29 18:58:55-03", tools=1,
+                     project="/home/naka/Projects/personal/keypad/macros",
+                     cwd="/home/naka/Projects/personal/keypad-macros")
+        out = _panel_text(feed.build_turn_panel(_turn_state(turn), 40))
+        assert "keypad-macros" in out
+        assert "keypad/macros" not in out
 
     def test_header_drops_the_duration_when_the_turn_made_no_request(self):
         out = _panel_text(feed.build_turn_panel(_turn_state(_turn(tools=1)), 40))
