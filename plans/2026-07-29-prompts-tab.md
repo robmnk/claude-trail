@@ -371,7 +371,7 @@ depend on the TUI.
   - Tests: a transcript whose dir name contains a `-` gets the true path (not the `/`-substituted
     one), the Project column prefers `cwd`, the fallback still renders when `cwd` is NULL, and the
     phase 1 test that pins `cwd is None` is updated deliberately rather than deleted.
-- [ ] 6. CLI `prompts` subcommand + dispatch wiring, with tests.
+- [x] 6. CLI `prompts` subcommand + dispatch wiring, with tests.
 - [ ] 7. Docs + release: CLAUDE.md (Controls, Columns, Conventions, Audit store), README,
       `.env.example` widths (including the six `CLAUDE_TRAIL_PROMPT_COL_*` keys), the `S` key,
       version bump. The plan, CLAUDE.md's Controls table and the README all currently disagree
