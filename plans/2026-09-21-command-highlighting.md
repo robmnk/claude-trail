@@ -140,8 +140,11 @@ Where it renders:
 - [ ] 2. Formatter, and the command view reflows
   - `format_command`, `highlight_command(cmd, reflow=True)`, `build_detail_panel` passes
     `reflow=True`.
+  - Carried from the phase 1 review: process substitution `<(a | b)` and `>(a)` tokenizes as
+    a `redirect` followed by plain `operator` parens (168 real commands), so the formatter
+    must count those parens as depth and never split at the `|` inside them.
   - Tests: a split at each depth-0 operator; no split inside quotes, a heredoc body, `$( )`,
-    `( )`, `{ }`, backticks, and inside `for`/`while`/`if`/`case` compounds; an author's
+    `( )`, `{ }`, `<( )`, backticks, and inside `for`/`while`/`if`/`case` compounds; an author's
     newline survives; a trailing `;` is left alone; `&` never splits; idempotence;
     `normalize_cmd` equality and token-sequence equality over every phase 1 case; the
     heredoc body stays at column 0 under an indented continuation; the rendered panel shows

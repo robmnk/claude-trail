@@ -148,6 +148,630 @@ class TestNormalizeCmd:
         assert feed.normalize_cmd("   ls   ") == "ls"
 
 
+class TestTokenizeCommand:
+    """`tokenize_command`: enough shell to color a command, plus two guarantees.
+
+    LOSSLESS - the tokens concatenate back to the command and their offsets tile
+    it end to end, so what a view colors can never differ from what ran.
+    NEVER RAISES - an unterminated quote or heredoc, an unbalanced `$(`, a lone
+    trailing backslash, a control character, an empty string and a 52 KB one-liner
+    all come back as tokens. Both hold over `CASES` and over generated pairs of
+    them, not only over the hand-written assertions below.
+    """
+
+    # One entry per rule in the plan's token table, plus the shapes the plan
+    # measured in the real command log (pipe 57%, `;` 37%, `&&` 21%, `$(` or a
+    # backtick 10%, a heredoc 9%). The kind-coverage, losslessness, offset and
+    # never-raises sweeps all read this list, so a case added here is covered by
+    # every one of them without touching them.
+    CASES = (
+        "ls -la",
+        "git status --short | head -5",
+        "cd /home/naka && ls || echo no; date",
+        "sudo rm -rf /tmp/x",
+        "FOO=bar BAZ=1 python run.py",
+        'for f in *.py; do echo "$f"; done',
+        "if [ -f x ]; then echo y; fi",
+        "{ echo hi; } | ( cd /tmp && ls )",
+        "make &> log.txt",
+        "python x.py 1>/dev/null 2>&1",
+        "cat <<< 'here string'",
+        "grep --color=auto -n 'foo bar' bar.txt",
+        "curl https://example.com/api?x=1 -o /tmp/out",
+        "echo a#b  # a real comment",
+        'echo "path $HOME/x ${FOO:-y} $(date)"',
+        "echo $((1+2)) $((x > 1)) $(( (1+2) * 3 ))",
+        "xargs -n1 echo hi",
+        "echo `date` and $(echo $(date) (x))",
+        'echo "he said \\"hi\\" and it\'s fine"',
+        "echo 'a \" b'",
+        "printf $'a\\nb' $1 $? $@ $# $$",
+        "ls \\\n  -la",
+        "cat <<'EOF'\nbody $x\nEOF",
+        "cat <<-EOF\n\tbody\n\tEOF",
+        "cat <<A <<B\na\nA\nb\nB",
+        "tail -f /var/log/x | grep -v noise &",
+        "echo 'unterminated",
+        "cat <<EOF\nnever ends",
+        "echo $(unbalanced",
+        "echo trailing\\",
+        "",
+        "echo \x01\x02",
+    )
+
+    # The broken shapes the plan names, kept apart from CASES so the never-raises
+    # sweep reads as the list of things that used to be able to kill a render.
+    BROKEN = (
+        "echo 'unterminated",
+        'echo "unterminated',
+        "cat <<EOF\nno terminator ever",
+        "echo $(unbalanced",
+        "echo ${unbalanced",
+        "echo `unbalanced",
+        "trailing backslash \\",
+        "\\",
+        "echo \x00\x01\x1b[2J\x7f",
+        "",
+        "$" * 500,
+        '$"' * 500,          # deep nesting: capped, never raises
+        "$(" * 500,
+        "(" * 500 + ")" * 500,
+        "<<EOF " * 200,
+    )
+
+    def _toks(self, cmd):
+        """(kind, text) pairs, which is what most assertions below compare."""
+        return [(t.kind, t.text) for t in feed.tokenize_command(cmd)]
+
+    def _kinds_of(self, cmd, kind):
+        return [t.text for t in feed.tokenize_command(cmd) if t.kind == kind]
+
+    # ---- the two guarantees ----
+
+    def test_every_case_round_trips_losslessly(self):
+        for cmd in self.CASES:
+            toks = feed.tokenize_command(cmd)
+            assert "".join(t.text for t in toks) == cmd, cmd
+
+    def test_offsets_tile_every_case_end_to_end(self):
+        # start/end agree with the concatenation: no gap, no overlap, and each
+        # token's text is the slice it claims.
+        for cmd in self.CASES:
+            pos = 0
+            for tok in feed.tokenize_command(cmd):
+                assert tok.start == pos, (cmd, tok)
+                assert tok.end == pos + len(tok.text), (cmd, tok)
+                assert cmd[tok.start:tok.end] == tok.text, (cmd, tok)
+                pos = tok.end
+            assert pos == len(cmd), cmd
+
+    def test_lossless_over_generated_combinations(self):
+        # Every pair of cases joined by every operator: a heredoc followed by a
+        # pipeline, a comment swallowing what comes after it, a quote left open
+        # in front of a `$( )`. Combinations, not the cases alone, are where a
+        # scanner loses a character.
+        for joiner in (" && ", " | ", "; ", "\n", " || "):
+            for left in self.CASES:
+                for right in self.CASES:
+                    cmd = left + joiner + right
+                    toks = feed.tokenize_command(cmd)
+                    assert "".join(t.text for t in toks) == cmd, cmd
+
+    def test_never_raises_on_broken_input(self):
+        for cmd in self.BROKEN:
+            toks = feed.tokenize_command(cmd)          # a raise here IS the bug
+            assert "".join(t.text for t in toks) == cmd, cmd
+
+    def test_empty_command_is_no_tokens(self):
+        assert feed.tokenize_command("") == []
+
+    def test_a_52kb_command_tokenizes_in_well_under_a_frame(self):
+        # The longest command in the real log is 52,509 chars, and the feed
+        # re-tokenizes per frame. The bound is 200 ms rather than the plan's
+        # 50 ms: it is a BACKSTOP against a scan that is not linear (which takes
+        # seconds here), not a benchmark, and 50 ms against a measured ~26 ms on
+        # this machine is a 1.9x margin that a slower one can lose. What the
+        # plan really asks for is the shape of the curve, and the linearity test
+        # below is what pins that. Best-of-5 keeps a scheduling hiccup out.
+        import time
+        cmd, pipes = self._big_command()
+        assert len(cmd) >= 52_000
+        assert cmd.count(" | ") == pipes
+        best = 1e9
+        for _ in range(5):
+            t0 = time.perf_counter()
+            toks = feed.tokenize_command(cmd)
+            best = min(best, time.perf_counter() - t0)
+        assert "".join(t.text for t in toks) == cmd
+        assert best < 0.200, f"{best * 1000:.1f} ms for {len(cmd)} chars"
+
+    def test_tokenizing_is_linear_in_the_length_of_the_command(self):
+        # Doubling the input at most doubles the work, so twice the size must
+        # cost well under 3x the time (the slack absorbs machine noise; a
+        # quadratic scan costs 4x and a 52 KB command seconds). Two shapes,
+        # because they stress different loops: a pipeline is token-dense, while
+        # nested `$( )` is what `_find_close_paren` re-reads.
+        import time
+        for name, build, small_k in (("pipes", self._piped_command, 200),
+                                     ("nested $( )", self._nested_subst, 3000)):
+            small, large = build(small_k), build(small_k * 2)
+            assert len(large) > 1.9 * len(small)
+            best_small = best_large = 1e9
+            for _ in range(5):     # interleaved, so a slow moment hits both
+                t0 = time.perf_counter()
+                feed.tokenize_command(small)
+                best_small = min(best_small, time.perf_counter() - t0)
+                t0 = time.perf_counter()
+                feed.tokenize_command(large)
+                best_large = min(best_large, time.perf_counter() - t0)
+            assert best_large < 3.0 * best_small, (
+                f"{name}: {best_small * 1000:.1f} ms at {len(small)} chars, "
+                f"{best_large * 1000:.1f} ms at {len(large)} chars")
+
+    def _big_command(self, pipes=500):
+        stage = ("grep -n 'foo bar' /tmp/some/path/file.txt --color=auto "
+                 '"$HOME/x" && echo done')
+        pad = max(0, (52_000 - (len(stage) + 3) * (pipes + 1)) // (pipes + 1))
+        stage = stage + " " + "z" * pad
+        return " | ".join(stage for _ in range(pipes + 1)), pipes
+
+    def _piped_command(self, stages):
+        stage = ("grep -n 'foo bar' /tmp/some/path/file.txt --color=auto "
+                 '"$HOME/x" && echo done')
+        return " | ".join(stage for _ in range(stages))
+
+    def _nested_subst(self, levels):
+        return "$(" * levels + "echo hi" + ")" * levels
+
+    # ---- one case per token kind ----
+
+    def test_the_cases_cover_exactly_the_palette(self):
+        # Both directions: no case produces a kind the palette has no style for,
+        # and no palette entry is unreachable (a typo in either shows up here).
+        seen = set()
+        for cmd in self.CASES:
+            seen.update(t.kind for t in feed.tokenize_command(cmd))
+        assert seen == set(feed.CMD_STYLES)
+
+    def test_command_is_the_first_word(self):
+        assert self._toks("ls -la")[0] == ("command", "ls")
+
+    def test_command_restarts_after_an_operator_and_a_newline(self):
+        assert self._kinds_of("cd /tmp && ls; date | wc -l", "command") == [
+            "cd", "ls", "date", "wc"]
+        assert self._kinds_of("ls\ndate", "command") == ["ls", "date"]
+        assert self._kinds_of("( ls ) | { date; }", "command") == ["ls", "date"]
+
+    def test_keyword_opens_a_body_so_the_next_word_is_a_command(self):
+        kinds = self._toks("if true; then echo y; fi")
+        assert ("keyword", "if") in kinds
+        assert ("command", "true") in kinds
+        assert ("keyword", "then") in kinds
+        assert ("command", "echo") in kinds
+        assert ("keyword", "fi") in kinds
+
+    def test_keyword_only_in_command_position(self):
+        # `done` as an argument is an argument, not the loop terminator.
+        assert ("word", "done") in self._toks("echo done")
+        assert ("keyword", "done") in self._toks("for f in x; do :; done")
+
+    def test_in_is_a_keyword_only_in_a_for_word_list(self):
+        assert ("keyword", "in") in self._toks("for f in *.py; do :; done")
+        assert ("word", "in") in self._toks("grep in file.txt")
+
+    def test_command_wrappers_pass_the_command_slot_on(self):
+        for wrapper in ("sudo", "nohup", "time", "exec", "env", "xargs"):
+            toks = self._toks(f"{wrapper} python run.py")
+            assert toks[0] == ("command", wrapper)
+            assert ("command", "python") in toks
+
+    def test_a_flag_after_a_wrapper_closes_the_command_slot(self):
+        # Pinned, not fixed. The plan says the word after `xargs` names a
+        # command; here that word is `-n1`, which is a flag, and a flag ends the
+        # command slot, so `echo` renders as a plain argument. 135 of the
+        # 67,340 commands the phase 1 review measured (0.2%) read this way. The
+        # alternative rule (a flag keeps the slot open) would bold `root` in
+        # `sudo -u root ls` and `{}` in `xargs -I {} bash -c`, so the trade is
+        # deliberate.
+        toks = self._toks("xargs -n1 echo hi")
+        assert toks[0] == ("command", "xargs")
+        assert ("flag", "-n1") in toks
+        assert ("word", "echo") in toks
+        assert self._kinds_of("sudo -u root ls", "command") == ["sudo"]
+
+    def test_assign_is_the_name_and_equals_and_keeps_the_slot_open(self):
+        toks = self._toks("FOO=bar BAZ=1 python run.py")
+        assert toks[0] == ("assign", "FOO=")
+        assert toks[1] == ("word", "bar")
+        assert ("assign", "BAZ=") in toks
+        assert ("command", "python") in toks
+
+    def test_assign_value_may_be_quoted(self):
+        toks = self._toks('PATH="/usr/bin:$PATH" make')
+        assert toks[0] == ("assign", "PATH=")
+        assert ("string", '"/usr/bin:') in toks
+        assert ("var", "$PATH") in toks
+        assert ("command", "make") in toks
+
+    def test_flag_and_key_value_flag(self):
+        assert ("flag", "-la") in self._toks("ls -la")
+        assert ("flag", "--short") in self._toks("git status --short")
+        # `--key=value` is ONE flag token, not a flag plus an assignment.
+        assert ("flag", "--color=auto") in self._toks("grep --color=auto x")
+
+    def test_path_shapes(self):
+        toks = self._toks("echo /tmp/x ~/y ./z ../w a/b")
+        assert ("path", "/tmp/x") in toks
+        assert ("path", "~/y") in toks
+        assert ("path", "./z") in toks
+        assert ("path", "../w") in toks
+        assert ("path", "a/b") in toks
+
+    def test_a_url_is_a_word_not_a_path(self):
+        # It has slashes, but `://` says it is not a file.
+        assert ("word", "https://example.com/api?x=1") in self._toks(
+            "curl https://example.com/api?x=1")
+        # A slashed word WITHOUT `://` is still a path, so the test above is
+        # about the scheme and not about slashes in general.
+        assert ("path", "github.com/o/r") in self._toks("echo github.com/o/r")
+
+    def test_string_forms(self):
+        assert ("string", "'a b'") in self._toks("echo 'a b'")
+        assert ("string", '"a b"') in self._toks('echo "a b"')
+        assert ("string", "$'a\\nb'") in self._toks("printf $'a\\nb'")
+
+    def test_double_quoted_string_splits_around_its_expansions(self):
+        assert self._toks('echo "path $HOME/x ${FOO:-y} $(date)"')[2:] == [
+            ("string", '"path '),
+            ("var", "$HOME"),
+            ("string", "/x "),
+            ("var", "${FOO:-y}"),
+            ("string", " "),
+            ("subst", "$("),
+            ("command", "date"),
+            ("subst", ")"),
+            ("string", '"'),
+        ]
+
+    def test_escaped_quote_does_not_close_a_double_quoted_string(self):
+        cmd = 'echo "he said \\"hi\\" ok"'
+        assert ("string", '"he said \\"hi\\" ok"') in self._toks(cmd)
+
+    def test_a_quote_inside_the_other_quote_is_plain_text(self):
+        assert ("string", '"it\'s fine"') in self._toks('echo "it\'s fine"')
+        assert ("string", "'a \" b'") in self._toks("echo 'a \" b'")
+
+    def test_var_forms(self):
+        toks = self._toks("echo $HOME ${FOO} $1 $? $@ $# $$")
+        for text in ("$HOME", "${FOO}", "$1", "$?", "$@", "$#", "$$"):
+            assert ("var", text) in toks, text
+
+    def test_subst_delimiters_are_tokens_and_the_inside_is_a_command(self):
+        assert self._toks("echo $(date +%s)")[2:] == [
+            ("subst", "$("), ("command", "date"), ("space", " "),
+            ("word", "+%s"), ("subst", ")"),
+        ]
+
+    def test_subst_balances_nested_parens(self):
+        # The span closes where the shell closes it, and the body is tokenized
+        # recursively, so the inner `date` is a command too.
+        toks = self._toks("echo $(echo $(date) (x)) tail")
+        assert toks[-1] == ("word", "tail")
+        assert toks.count(("subst", "$(")) == 2
+        assert toks.count(("subst", ")")) == 2
+        assert ("command", "date") in toks
+
+    def test_arithmetic_expansion_is_one_var_token(self):
+        # `$(( ))` is not a command, so it is NOT read as `$(` plus a subshell:
+        # that painted `1+2` like a command name, the `>` like a redirect and
+        # found a `1<` redirect in `$((1<2))`.
+        assert self._toks("echo $((1+2))")[2:] == [("var", "$((1+2))")]
+        assert self._toks("echo $((x > 1))")[2:] == [("var", "$((x > 1))")]
+        assert self._toks("echo $((1<2))")[2:] == [("var", "$((1<2))")]
+        # Inner parens are balanced, so the span ends at the right `))`.
+        assert self._toks("echo $(( (1+2) * 3 )) tail")[2:] == [
+            ("var", "$(( (1+2) * 3 ))"), ("space", " "), ("word", "tail")]
+        assert self._toks("echo $(($((1+2)) * 3))")[2:] == [
+            ("var", "$(($((1+2)) * 3))")]
+        # A quoted one keeps its kind, like `${...}` does.
+        assert ("var", "$((1+2))") in self._toks('echo "$((1+2))"')
+
+    def test_a_command_substitution_around_a_subshell_is_still_a_subst(self):
+        # `$( (a) )` has a space, so it is a substitution, not arithmetic.
+        toks = self._toks("cat $( (a) )")
+        assert ("subst", "$(") in toks
+        assert ("command", "a") in toks
+        assert self._kinds_of("cat $( (a) )", "var") == []
+
+    def test_an_unterminated_arithmetic_expansion_degrades_and_never_raises(self):
+        # No `))` arrives, so it cannot be told apart from an unbalanced `$(`
+        # and is scanned as one: the span stays open, lossless, no raise.
+        for cmd in ("echo $((1+2", "$((", "$(()", "echo $(( (1+2)"):
+            toks = feed.tokenize_command(cmd)
+            assert "".join(t.text for t in toks) == cmd, cmd
+            assert self._kinds_of(cmd, "var") == [], cmd
+
+    def test_backticks_are_a_subst_too(self):
+        assert self._toks("echo `date` tail")[2:] == [
+            ("subst", "`"), ("command", "date"), ("subst", "`"),
+            ("space", " "), ("word", "tail"),
+        ]
+
+    def test_operator_forms(self):
+        assert ("operator", "&&") in self._toks("a && b")
+        assert ("operator", "||") in self._toks("a || b")
+        assert ("operator", "|") in self._toks("a | b")
+        assert ("operator", "|&") in self._toks("a |& b")
+        assert ("operator", ";") in self._toks("a; b")
+        assert ("operator", ";;") in self._toks("case x in y) a ;; esac")
+        assert ("operator", "&") in self._toks("a &")
+        assert ("operator", "(") in self._toks("( a )")
+        assert ("operator", ")") in self._toks("( a )")
+        assert ("operator", "{") in self._toks("{ a; }")
+        assert ("operator", "}") in self._toks("{ a; }")
+
+    def test_brace_expansion_stays_inside_its_word(self):
+        # `{` groups commands only when a space follows it.
+        assert ("word", "x{a,b}") in self._toks("ls x{a,b}")
+
+    def test_redirect_forms(self):
+        assert ("redirect", ">") in self._toks("a > out")
+        assert ("redirect", ">>") in self._toks("a >> out")
+        assert ("redirect", "<") in self._toks("a < in")
+        assert ("redirect", "<<<") in self._toks("a <<< 'x'")
+        assert ("redirect", ">|") in self._toks("a >| out")
+        assert ("redirect", "&>") in self._toks("a &> out")
+        assert ("redirect", "1>") in self._toks("a 1>/dev/null")
+        assert ("redirect", "2>&1") in self._toks("a 1>/dev/null 2>&1")
+        assert ("redirect", "3<&0") in self._toks("exec 3<&0")
+
+    def test_a_redirect_target_never_takes_the_command_slot(self):
+        # `> /tmp/out ls` still runs `ls`.
+        toks = self._toks("> /tmp/out ls")
+        assert ("path", "/tmp/out") in toks
+        assert ("command", "ls") in toks
+
+    def test_comment_runs_to_the_end_of_its_line(self):
+        toks = self._toks("ls  # look here\ndate")
+        assert ("comment", "# look here") in toks
+        assert ("command", "date") in toks
+
+    def test_a_hash_inside_a_word_or_a_string_is_not_a_comment(self):
+        assert ("word", "a#b") in self._toks("echo a#b")
+        assert ("string", '"# not a comment"') in self._toks(
+            'echo "# not a comment"')
+        assert self._kinds_of("echo a#b", "comment") == []
+
+    def test_space_covers_runs_and_a_line_continuation(self):
+        # `\` + newline is whitespace (the shell joins the lines), so it lands
+        # in the space token rather than in the word beside it.
+        assert self._toks("ls \\\n  -la") == [
+            ("command", "ls"), ("space", " \\\n  "), ("flag", "-la")]
+        assert ("space", "  \n\t") in self._toks("ls  \n\tdate")
+
+    def test_word_is_everything_else(self):
+        assert ("word", "status") in self._toks("git status")
+        assert ("word", "*.py") in self._toks("ls *.py")
+
+    # ---- heredocs ----
+
+    def test_quoted_heredoc_body_is_verbatim_through_its_terminator(self):
+        assert self._toks("cat <<'EOF'\nbody $x\nEOF") == [
+            ("command", "cat"), ("space", " "), ("heredoc_op", "<<'EOF'"),
+            ("space", "\n"), ("heredoc_body", "body $x\n"),
+            ("heredoc_end", "EOF"),
+        ]
+
+    def test_double_quoted_and_bare_heredoc_delimiters(self):
+        for opener in ('<<"EOF"', "<<EOF"):
+            toks = self._toks(f"cat {opener}\nbody\nEOF")
+            assert ("heredoc_op", opener) in toks
+            assert ("heredoc_body", "body\n") in toks
+            assert ("heredoc_end", "EOF") in toks
+
+    def test_dash_heredoc_allows_leading_tabs_before_the_terminator(self):
+        assert self._toks("cat <<-EOF\n\tbody\n\tEOF") == [
+            ("command", "cat"), ("space", " "), ("heredoc_op", "<<-EOF"),
+            ("space", "\n"), ("heredoc_body", "\tbody\n"),
+            ("heredoc_end", "\tEOF"),
+        ]
+        # Without the dash the tabbed line is body, not the terminator.
+        assert self._kinds_of("cat <<EOF\n\tbody\n\tEOF", "heredoc_end") == []
+
+    def test_two_heredocs_on_one_line_open_in_order(self):
+        toks = self._toks("cat <<A <<B\na\nA\nb\nB")
+        assert [t for t in toks if t[0].startswith("heredoc")] == [
+            ("heredoc_op", "<<A"), ("heredoc_op", "<<B"),
+            ("heredoc_body", "a\n"), ("heredoc_end", "A"),
+            ("heredoc_body", "b\n"), ("heredoc_end", "B"),
+        ]
+
+    def test_the_rest_of_the_opening_line_still_tokenizes_as_a_command(self):
+        toks = self._toks("python - <<'PY' > /tmp/out 2>&1\nprint(1)\nPY")
+        assert ("redirect", ">") in toks
+        assert ("path", "/tmp/out") in toks
+        assert ("redirect", "2>&1") in toks
+        assert ("heredoc_body", "print(1)\n") in toks
+
+    def test_an_unterminated_heredoc_swallows_the_rest_as_body(self):
+        toks = self._toks("cat <<EOF\nnever ends")
+        assert ("heredoc_body", "never ends") in toks
+        assert self._kinds_of("cat <<EOF\nnever ends", "heredoc_end") == []
+
+    def test_a_here_string_is_a_redirect_not_a_heredoc(self):
+        assert self._kinds_of("cat <<< 'x'", "heredoc_op") == []
+        assert ("redirect", "<<<") in self._toks("cat <<< 'x'")
+
+    # ---- degraded shapes ----
+
+    def test_an_unterminated_quote_degrades_to_a_string(self):
+        assert ("string", "'unterminated") in self._toks("echo 'unterminated")
+        assert ("string", '"unterminated') in self._toks('echo "unterminated')
+
+    def test_an_unbalanced_subst_stays_open(self):
+        toks = self._toks("echo $(unbalanced")
+        assert ("subst", "$(") in toks
+        assert toks.count(("subst", ")")) == 0
+
+    def test_a_lone_trailing_backslash_is_ordinary_text(self):
+        assert self._toks("echo trailing\\")[-1] == ("word", "trailing\\")
+
+    def test_control_characters_are_carried_through(self):
+        assert ("word", "\x01\x02") in self._toks("echo \x01\x02")
+
+    def test_a_deep_dollar_quote_chain_is_capped_not_left_to_the_fallback(self):
+        # `$"` reopens a double-quoted string, which can hold another `$"`:
+        # 3 stack frames per repeat, within ONE scanner, so nothing bounded it
+        # and 332 repeats raised RecursionError. The blanket `except` caught
+        # that and returned one `word`, which is lossless but uncolored. The
+        # `_quote_depth` cap means a real scan comes back instead.
+        cmd = '$"' * 2000
+        scanner = feed._CommandScanner(cmd, 0, len(cmd), 0)
+        scanner.run()                  # a RecursionError here IS the bug
+        assert feed._tokens_cover(scanner.out, cmd)
+        toks = feed.tokenize_command(cmd)
+        assert toks == scanner.out     # the scan, not the fallback
+        assert toks != [feed.Token("word", cmd, 0, len(cmd))]
+        assert {t.kind for t in toks} == {"string"}
+
+    def test_a_scan_that_does_not_tile_is_thrown_away_for_one_word(self):
+        # The other half of the guarantee: `tokenize_command` checks the tiling
+        # itself, so a scanner bug can only cost the color, never show text
+        # that is not what ran. Here the scan drops ` -la`.
+        def truncating_run(self):
+            self.out = [feed.Token("command", "ls", 0, 2)]
+
+        with patch.object(feed._CommandScanner, "run", truncating_run):
+            assert feed.tokenize_command("ls -la") == [
+                feed.Token("word", "ls -la", 0, 6)]
+            assert feed.highlight_command("ls -la").spans == []
+
+
+class TestHighlightCommand:
+    """`highlight_command`: the tokens painted with `CMD_STYLES`, never markup.
+
+    The palette is the single source of truth, so the command view (and later
+    the feed column and the turn page) cannot drift apart. The `Text` is built
+    with `Text.append` only, so a command holding `[bold]` or `[/tmp/x]` renders
+    literally instead of losing the span or raising MarkupError out of the live
+    update (the rule under `Column`).
+    """
+
+    def test_plain_text_is_the_command_verbatim(self):
+        for cmd in TestTokenizeCommand.CASES:
+            assert feed.highlight_command(cmd).plain == cmd, cmd
+
+    def test_the_palette_is_the_plan_s_table(self):
+        # Written out, not derived from `CMD_STYLES`: every other test here
+        # reads the palette to build its expectation, so recoloring an entry
+        # would leave them all green. Three views share this table today and
+        # phase 3 adds two more, so a change to it has to be deliberate in two
+        # places. The values are the plan's palette table, character for
+        # character (`plans/2026-09-21-command-highlighting.md`, the Highlighter
+        # section); `""` means the kind renders unstyled.
+        assert feed.CMD_STYLES == {
+            "command": "bold",
+            "keyword": "bold blue",
+            "assign": "yellow",
+            "flag": "cyan",
+            "path": "blue",
+            "string": "green",
+            "var": "yellow",
+            "subst": "yellow",
+            "heredoc_op": "magenta",
+            "heredoc_end": "magenta",
+            "heredoc_body": "dim",
+            "operator": "bold magenta",
+            "redirect": "magenta",
+            "comment": "dim italic",
+            "space": "",
+            "word": "",
+        }
+
+    def test_spans_are_exactly_the_palette_over_the_tokens(self):
+        # The placement of the spans, not their colors: the literal table above
+        # is what pins the colors themselves.
+        from rich.text import Span
+        cmd = "FOO=1 git log --oneline | head -5 > /tmp/out  # note"
+        text = feed.highlight_command(cmd)
+        expected = [Span(t.start, t.end, feed.CMD_STYLES[t.kind])
+                    for t in feed.tokenize_command(cmd)
+                    if feed.CMD_STYLES[t.kind]]
+        assert text.plain == cmd
+        assert text.spans == expected
+
+    def test_unstyled_kinds_carry_no_span(self):
+        # `word` and `space` map to "", so `ls -la` gets two spans, not four.
+        text = feed.highlight_command("echo hi there")
+        assert [s.style for s in text.spans] == ["bold"]
+
+    def test_a_heredoc_is_painted_by_its_own_kinds(self):
+        from rich.text import Span
+        cmd = "cat <<'EOF'\nbody\nEOF"
+        text = feed.highlight_command(cmd)
+        styles = {cmd[s.start:s.end]: s.style for s in text.spans}
+        assert styles["<<'EOF'"] == "magenta"
+        assert styles["body\n"] == "dim"
+        assert styles["EOF"] == "magenta"
+        assert Span(0, 3, "bold") in text.spans
+
+    def test_markup_in_a_command_is_never_parsed(self):
+        # `[bold]` is silently deleted and `[/tmp/x]` raises MarkupError when a
+        # bare str reaches Rich; both must survive as literal text here.
+        for probe in ("[/tmp/x]", "[bold]", "[/]"):
+            text = feed.highlight_command(f"echo {probe}")
+            assert probe in text.plain
+            console = Console(width=80, record=True)
+            console.print(text)              # a MarkupError here IS the bug
+            assert probe in console.export_text()
+
+    def test_reflow_is_accepted_and_changes_nothing_yet(self):
+        # Phase 2 fills it in; the keyword exists now so the call sites do not
+        # change when it lands.
+        cmd = "cd /tmp && ls | head -5"
+        assert feed.highlight_command(cmd, reflow=True).plain == cmd
+        assert (feed.highlight_command(cmd, reflow=True).spans
+                == feed.highlight_command(cmd).spans)
+
+    def test_empty_command_is_an_empty_text(self):
+        text = feed.highlight_command("")
+        assert text.plain == ""
+        assert text.spans == []
+
+    def test_broken_input_still_renders(self):
+        for cmd in TestTokenizeCommand.BROKEN:
+            console = Console(width=80, record=True)
+            console.print(feed.highlight_command(cmd))   # never raises
+
+    # ---- the danger prefix, which now takes a Text body ----
+
+    def test_danger_prefix_accepts_a_text_body(self):
+        from rich.text import Span, Text
+        body = feed.highlight_command("sudo rm -rf /tmp/x")
+        out = feed._danger_prefixed("sudo rm -rf /tmp/x", body)
+        assert isinstance(out, Text)
+        assert out.plain == "* sudo rm -rf /tmp/x"
+        assert Span(0, 2, "bold red") in out.spans
+        # the body's own styles survive, shifted past the marker
+        assert Span(2, 6, "bold") in out.spans
+
+    def test_danger_prefix_still_accepts_a_plain_string(self):
+        # Every existing caller passes a str and must be unaffected.
+        out = feed._danger_prefixed("ls -la", "ls -la")
+        assert out.plain == "ls -la"
+        assert out.spans == []
+
+    def test_danger_prefix_does_not_mutate_the_body(self):
+        body = feed.highlight_command("rm -rf /tmp/x")
+        before = (body.plain, list(body.spans))
+        feed._danger_prefixed("rm -rf /tmp/x", body)
+        assert (body.plain, list(body.spans)) == before
+
+    def test_danger_prefix_leaves_a_benign_command_alone(self):
+        out = feed._danger_prefixed("ls -la", feed.highlight_command("ls -la"))
+        assert out.plain == "ls -la"
+
+
 class TestParseTs:
     """`parse_ts` pads the fraction and widens an hours-only UTC offset first.
 
@@ -1535,6 +2159,57 @@ class TestRendering:
         assert "pending ingest" in out
         # nothing to drill into: Enter keeps its close meaning
         assert "esc / q / ↵ : back" in out
+
+    def _styled(self, panel):
+        console = Console(width=120, record=True, force_terminal=True,
+                          color_system="truecolor")
+        console.print(panel)
+        return console.export_text(styles=True)
+
+    def _rendered(self, text):
+        """The ANSI a `Text` renders to, for an `in` test against a panel."""
+        from rich.console import Console as _C
+        ref = _C(force_terminal=True, color_system="truecolor")
+        with ref.capture() as cap:
+            ref.print(text, end="")
+        return cap.get()
+
+    def test_detail_panel_colors_the_command(self):
+        from rich.text import Text
+        styled = self._styled(feed.build_detail_panel(
+            self._entry(command="cat /tmp/x"), 40))
+        # the palette reaches the panel: the command name is bold, the path blue
+        assert self._rendered(Text("cat", style=feed.CMD_STYLES["command"])) in styled
+        assert self._rendered(Text("/tmp/x", style=feed.CMD_STYLES["path"])) in styled
+
+    def test_detail_panel_keeps_the_marker_before_the_colored_command(self):
+        from rich.text import Text
+        panel = feed.build_detail_panel(self._entry(command="sudo rm -rf /tmp/x"), 40)
+        styled = self._styled(panel)
+        assert self._rendered(Text("* ", style="bold red")) in styled
+        assert self._rendered(Text("sudo", style=feed.CMD_STYLES["command"])) in styled
+        assert "sudo rm -rf /tmp/x" in self._text(panel)   # still readable plain
+
+    def test_detail_panel_preserves_newlines_in_a_colored_command(self):
+        # The full-screen view keeps the raw command, so a heredoc still reads
+        # line by line (and its body is dim, not colored as shell).
+        cmd = "cat <<'EOF'\nline one\nline two\nEOF"
+        out = self._text(feed.build_detail_panel(self._entry(command=cmd), 40))
+        for line in ("cat <<'EOF'", "line one", "line two", "EOF"):
+            assert line in out
+
+    def test_detail_panel_empty_command_keeps_the_placeholder(self):
+        out = self._text(feed.build_detail_panel(self._entry(command=""), 40))
+        assert "(empty)" in out
+
+    def test_detail_panel_command_markup_is_literal(self):
+        # The command is now a Text built by `highlight_command`, so console
+        # markup in it is still text: `[bold]` is not swallowed and `[/tmp/x]`
+        # does not raise MarkupError out of the live update.
+        for probe in ("[/tmp/x]", "[bold]", "[/]"):
+            out = self._text(feed.build_detail_panel(
+                self._entry(command=f"echo {probe}"), 40))
+            assert probe in out, probe
 
     def test_detail_panel_notes_shared_request(self):
         # A request that emitted 2 parallel tool calls: the share is half, and the
