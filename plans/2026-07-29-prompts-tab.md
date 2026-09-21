@@ -408,8 +408,43 @@ depend on the TUI.
       projects" measurement above no longer reproduces.
     - `search --project P` matched only the lossy `sessions.project`, so the name the column now
       shows found nothing. The phase 5 fix widened it to `project LIKE ? OR cwd LIKE ?` (same
-      substring match, both columns); CLAUDE.md's Subcommands section does not spell out
-      `--project` today, so this is new text, not a correction.
+      substring match, both columns). CLAUDE.md's Subcommands block already lists `--project`
+      (`CLAUDE.md:234`), so this is a correction to existing text (the phase 6 review caught an
+      earlier note here claiming otherwise).
+  - Carried from the phase 6 review and fix, the `prompts` CLI docs debt:
+    - CLAUDE.md's `Subcommands` code block (`CLAUDE.md:232-240`) and README's (`README.md:141-149`)
+      gain `prompts [--session S] [--limit N] [--since ISO] [--json]` and
+      `prompts (--at ISO --session S | --event-id E) [--json]`, plus a prose bullet next to the
+      `search`/`tokens` ones: the Prompts tab as plain text over the same read-only path, one line
+      per main-thread turn newest first with the tab's own numbers (calls with the Bash share,
+      subagent count, output tokens with the subagent part, first prompt line through
+      `slash_label`); `--limit` defaults to 30 and is filled by widening the raw scan until the raw
+      turns run out; `--session` takes an id prefix (ambiguous is exit 2); `--since` is a lower
+      bound applied inside the query; widths come from the content, never the terminal, so a pipe
+      prints what a tty prints; `--json` is the query's own dicts (str/int/None only). `--at`
+      resolves the newest turn at or before the bound, exact for a full-precision `ts` pasted from
+      `--json` and second-truncated for a time copied from the text list, and requires
+      `--session`; `--event-id` (the id `--json` prints) refuses `--session`; `--since`/`--limit`
+      refuse the one-turn forms. The one-turn dump: identity/work/tokens header, the quoted
+      preview capped at 10 lines, then every call oldest-first as `time agent tool detail` with
+      `main` or the 4-char subagent id and a trailing `[error]` on a failed call. Exit codes: 2
+      for a refused argument (including an unknown flag, unlike `search`/`tokens`), 1 for a
+      missing store or an unresolved turn, 0 otherwise including an empty list. Terminal control
+      characters in prompt text are stripped from the text output and kept in `--json`. README
+      gets one worked example: `prompts --limit 20`, then
+      `prompts --session <8 chars> --at "<the time it printed>"`.
+    - The same Subcommands block is also missing `prune-raw` (pre-existing); add it.
+    - `action_label` and `short_tool_name` now live in `claude_trail_store.py`, with lazy
+      same-name wrappers in the TUI (the `_slash_label` pattern); `short_path` stays in the TUI
+      and the CLI reads it upward through `_short_project_path`, because its default width comes
+      from the `.env` machinery. Reconcile wherever CLAUDE.md's Conventions name them.
+    - This plan's Verify example turn (`29dea45c`, 2026-07-27 10:30:38) still reproduces exactly
+      (73 calls, 3 subagents, 41 subagent calls) on the current store; it is not stale.
+    - Follow-ups, not docs: `cmd_search`/`cmd_tokens`/`cmd_cat`/`cmd_diff` traceback on a missing
+      store (`prompts` and `stats` guard); one guard in `cli_main` before dispatch would fix all
+      four. And the lazy `duckdb` import ends in a raw `ModuleNotFoundError` under an interpreter
+      without it (the pyenv `python3` here); a one-line message would cover every store
+      subcommand.
 
 ## Conventions for this run
 
@@ -427,9 +462,10 @@ That reads as a real regression and is not one. Caught during phase 4.
 ```bash
 cd /home/naka/Projects/personal/claude-trail
 .venv/bin/python -m pytest tests/ -q
-python3 claude_trail.py prompts --limit 20
-python3 claude_trail.py prompts --session <sid> --limit 5
-python3 claude_trail.py                     # Tab into Prompts, Enter a turn with subagents
+.venv/bin/python claude_trail.py prompts --limit 20
+.venv/bin/python claude_trail.py prompts --session <sid> --limit 5
+.venv/bin/python claude_trail.py prompts --session 29dea45c --at "2026-07-27 10:30:38"
+.venv/bin/python claude_trail.py            # Tab into Prompts, Enter a turn with subagents
 ```
 
 Sanity checks against the real store: a turn with subagents shows their calls under the
