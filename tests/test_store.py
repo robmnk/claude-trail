@@ -513,6 +513,130 @@ def test_ingest_incremental_append_and_partial_line(tmp_path, monkeypatch):
         con.close()
 
 
+class _CountingCon:
+    """Wraps a DuckDB connection and records the SQL of every execute/executemany,
+    so a test can count the queries a sweep issues. Everything else delegates."""
+
+    def __init__(self, con):
+        self._con = con
+        self.sql = []
+
+    def execute(self, sql, *args, **kwargs):
+        self.sql.append(sql)
+        return self._con.execute(sql, *args, **kwargs)
+
+    def executemany(self, sql, *args, **kwargs):
+        self.sql.append(sql)
+        return self._con.executemany(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._con, name)
+
+
+def test_idle_sweep_runs_one_state_query_not_one_per_transcript(tmp_path, monkeypatch):
+    """The sweep loads every stored offset in one query, so an idle sweep over N
+    unchanged transcripts (main and subagent) runs that query and nothing per
+    file: an unchanged file is skipped after its stat."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+
+    for i in range(4):
+        sid = f"sess-idle-{i:04d}"
+        _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl",
+                     [_user_prompt(f"u-idle-{i}", sid, "hi", "2026-06-30T02:00:00.000Z")])
+    _write_jsonl(projects / "-fake-proj" / "sess-idle-0000" / "subagents" / "agent-A1.jsonl",
+                 [_user_prompt("u-idle-sub", "sess-idle-0000", "task",
+                               "2026-06-30T02:00:01.000Z")])
+    n = len(store._transcript_paths())
+    assert n == 5
+
+    con = store.connect()
+    try:
+        assert store._sweep_transcripts(con) == (n, n, n)    # first sweep stores all
+        counting = _CountingCon(con)
+        assert store._sweep_transcripts(counting) == (n, 0, 0)
+        assert len(counting.sql) == 1                        # not 1 + n
+        assert "ingest_state" in counting.sql[0]
+        assert "WHERE" not in counting.sql[0]                # the bulk load, not a lookup
+    finally:
+        con.close()
+
+
+def test_sweep_starts_a_new_transcript_at_zero_and_rescans_a_truncated_one(
+        tmp_path, monkeypatch):
+    """With the offsets preloaded, a transcript absent from ingest_state still
+    starts at byte 0, and one rewritten shorter than its stored offset rescans
+    from 0 (`size < last`), exactly as the per-file lookup did."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+
+    sid_a, sid_b = "sess-trunc-000a", "sess-new-000b"
+    path_a = projects / "-fake-proj" / f"{sid_a}.jsonl"
+    path_b = projects / "-fake-proj" / f"{sid_b}.jsonl"
+    _write_jsonl(path_a, [
+        _user_prompt(f"u-a-{i}", sid_a, f"line {i}", f"2026-06-30T02:00:0{i}.000Z")
+        for i in range(3)])
+
+    con = store.connect()
+    try:
+        def offset(path):
+            row = con.execute("SELECT last_offset FROM ingest_state "
+                              "WHERE transcript_path=?", [str(path)]).fetchone()
+            return row[0] if row else None
+
+        assert store._sweep_transcripts(con) == (1, 1, 3)
+        stored_a = offset(path_a)
+        assert stored_a == path_a.stat().st_size
+
+        # a: rewritten with one new line, shorter than its stored offset.
+        # b: a brand-new transcript with no ingest_state row yet.
+        _write_jsonl(path_a, [_user_prompt("u-a-new", sid_a, "x",
+                                           "2026-06-30T03:00:00.000Z")])
+        assert path_a.stat().st_size < stored_a
+        _write_jsonl(path_b, [
+            _user_prompt(f"u-b-{i}", sid_b, f"b {i}", f"2026-06-30T04:00:0{i}.000Z")
+            for i in range(2)])
+        assert offset(path_b) is None
+
+        # b ingests both lines from 0; a rescans from 0 and finds its one line
+        assert store._sweep_transcripts(con) == (2, 2, 3)
+        assert offset(path_a) == path_a.stat().st_size
+        assert offset(path_b) == path_b.stat().st_size
+        assert con.execute("SELECT count(*) FROM raw_events "
+                           "WHERE uuid IN ('u-a-new', 'u-b-0', 'u-b-1')").fetchone()[0] == 3
+        assert store._sweep_transcripts(con) == (2, 0, 0)    # and both are now idle
+    finally:
+        con.close()
+
+
+def test_ingest_transcript_alone_still_looks_up_its_stored_offset(tmp_path, monkeypatch):
+    """Called without a preloaded offset, ingest_transcript queries ingest_state
+    itself, so a standalone caller keeps the old contract: an unchanged file
+    ingests nothing and an appended one only its new tail."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+
+    sid = "sess-alone-0001"
+    path = projects / "-fake-proj" / f"{sid}.jsonl"
+    _write_jsonl(path, [_user_prompt("u-alone-1", sid, "one", "2026-06-30T02:00:00.000Z")])
+
+    con = store.connect()
+    try:
+        assert store.ingest_transcript(con, path) == 1
+        counting = _CountingCon(con)
+        assert store.ingest_transcript(counting, path) == 0
+        assert len(counting.sql) == 1 and "WHERE transcript_path" in counting.sql[0]
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(_user_prompt("u-alone-2", sid, "two",
+                                            "2026-06-30T02:00:01.000Z")) + "\n")
+        assert store.ingest_transcript(con, path) == 1
+    finally:
+        con.close()
+
+
 def test_ingest_drops_nonsnapshot_raw_payload_keeps_index(tmp_path, monkeypatch):
     """Going-forward leanness: ingest keeps one raw_events index row per line
     (so tailing/idempotency are unchanged) but drops the bulky verbatim `raw`
