@@ -121,7 +121,11 @@ hint for data that is actually there. So `cmd_ingest` flushes only when it is du
 (`_checkpoint_due`): never on a sweep that stored nothing, otherwise at most once
 per `CHECKPOINT_MIN_INTERVAL` (300s), tracked by `<store>.checkpoint-stamp`.
 `--compact` and `--watch` force the flush (a rewrite follows; a shutdown flush is
-the point). Skipping is safe: the WAL is durable and replays on the next open,
+the point). A skipped run also sets `PRAGMA disable_checkpoint_on_shutdown`
+before `con.close()`, because DuckDB otherwise checkpoints on close and the
+throttle saved nothing (until 2026-10-19 every storing run paid it, up to 22s
+once `blobs` held 736 MB). A WAL left by a skipped run counts as something to
+flush, so an idle run still flushes it once the interval has passed. Skipping is safe: the WAL is durable and replays on the next open,
 and DuckDB auto-checkpoints on its own WAL-size threshold, so a skipped flush
 costs a slightly larger `.wal`, never data.
 

@@ -2588,6 +2588,34 @@ def test_ingest_skips_the_checkpoint_on_an_idle_rerun(tmp_path, monkeypatch, cap
     assert "checkpoint: skipped (nothing stored)" in second
 
 
+def test_a_throttled_run_really_skips_the_flush(tmp_path, monkeypatch, capsys):
+    """DuckDB checkpoints on close unless told not to, which once made the
+    throttle a no-op. A skipped run must leave its WAL on disk with the rows
+    still readable, and the next due run flushes that WAL even when it stores
+    nothing new."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    for sid in ("sess-ckpt-0002", "sess-ckpt-0003"):
+        _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", _main_transcript_events(sid))
+        assert store.cmd_ingest(["ingest"]) == 0
+    out = capsys.readouterr().out
+    assert "checkpoint: flushing WAL to disk (no flush recorded yet)" in out
+    assert "checkpoint: skipped (last flush" in out
+    assert store._wal_path().exists(), "close() must not flush a skipped run"
+    con = store.connect(read_only=True)
+    try:
+        assert con.execute("SELECT count(*) FROM sessions").fetchone()[0] == 2
+    finally:
+        con.close()
+
+    old = time.time() - store.CHECKPOINT_MIN_INTERVAL - 60
+    os.utime(store._checkpoint_stamp(), (old, old))
+    assert store.cmd_ingest(["ingest"]) == 0
+    assert "checkpoint: flushing WAL to disk" in capsys.readouterr().out
+    assert not store._wal_path().exists()
+
+
 def test_is_lock_conflict_matches_duckdb_lock_errors_only():
     """The lock check keys off DuckDB's message; unrelated failures must still
     surface as themselves."""

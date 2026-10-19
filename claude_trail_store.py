@@ -567,16 +567,23 @@ def _checkpoint_stamp():
     return Path(str(STORE_PATH) + ".checkpoint-stamp")
 
 
+def _wal_path():
+    """The store's write-ahead log, left on disk by a run that skipped its flush."""
+    return Path(str(STORE_PATH) + ".wal")
+
+
 def _checkpoint_due(stored_anything, force=False):
     """`(should_flush, reason)` for the end-of-run CHECKPOINT.
 
     `force` covers the two runs that must land on a flushed store: `--compact`
     (a full rewrite follows) and `--watch` (its one flush is at shutdown). A
-    sweep that stored nothing has nothing to flush, so it never pays the lock.
+    sweep that stored nothing has nothing to flush, so it never pays the lock,
+    unless an earlier skipped run left its WAL behind: that one is flushed on
+    the same schedule, or every reader would keep replaying it.
     """
     if force:
         return True, "forced"
-    if not stored_anything:
+    if not stored_anything and not _wal_path().exists():
         return False, "nothing stored"
     try:
         age = time.time() - _checkpoint_stamp().stat().st_mtime
@@ -590,7 +597,7 @@ def _checkpoint_due(stored_anything, force=False):
 def _store_size():
     """On-disk size of the store file plus its WAL (0 for parts not present)."""
     total = 0
-    for p in (STORE_PATH, Path(str(STORE_PATH) + ".wal")):
+    for p in (STORE_PATH, _wal_path()):
         try:
             total += p.stat().st_size
         except OSError:
@@ -1657,6 +1664,10 @@ def cmd_ingest(argv):
             except OSError:
                 pass   # a stamp we cannot write just means the next run flushes
         else:
+            # DuckDB checkpoints on close by default, and that implicit flush
+            # is the same rewrite as the explicit one (up to 22s once the
+            # blobs table is large). Without this the throttle saved nothing.
+            con.execute("PRAGMA disable_checkpoint_on_shutdown")
             _log(f"checkpoint: skipped ({why})")
         con.close()
     if compact:  # after con.close(), so the store file is unlocked for the rewrite
