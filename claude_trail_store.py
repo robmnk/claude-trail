@@ -374,17 +374,23 @@ def _insert_raw(con, raw_rows):
     con.execute("DELETE FROM _raw_stage")
 
 
-def ingest_transcript(con, path):
+def ingest_transcript(con, path, last_offset=None):
     """Read new lines from `path` since last_offset; insert events; advance offset.
-    Returns number of events inserted."""
+    Returns number of events inserted.
+
+    `last_offset` is the stored offset when the caller already has it (the sweep
+    loads all of `ingest_state` in one query; 0 for a file it has never seen).
+    None looks it up here, one query per call."""
     try:
         st = path.stat()
     except OSError:
         return 0
     size = st.st_size
-    row = con.execute("SELECT last_offset FROM ingest_state WHERE transcript_path=?",
-                      [str(path)]).fetchone()
-    last = row[0] if row else 0
+    if last_offset is None:
+        row = con.execute("SELECT last_offset FROM ingest_state WHERE transcript_path=?",
+                          [str(path)]).fetchone()
+        last_offset = row[0] if row else 0
+    last = last_offset
     if size < last:            # truncated/rewritten -> rescan
         last = 0
     if size == last:
@@ -705,9 +711,16 @@ def _sweep_transcripts(con, paths=None, verbose=False, tick=None):
     transcript when `verbose`."""
     if paths is None:
         paths = _transcript_paths()
+    # Every stored offset in ONE query, instead of one lookup per transcript: an
+    # unchanged file then costs a stat and no query (profiled 2026-10-19: ~1,008
+    # lookups per run, 0.77s, the largest single cost of an ordinary run). A path
+    # missing from the dict is a new file and starts at 0. Each path is visited
+    # once per sweep, so no entry goes stale mid-loop.
+    offsets = dict(con.execute(
+        "SELECT transcript_path, last_offset FROM ingest_state").fetchall())
     changed = lines = 0
     for path in paths:
-        n = ingest_transcript(con, path)
+        n = ingest_transcript(con, path, offsets.get(str(path), 0))
         if n:
             changed += 1
             lines += n
