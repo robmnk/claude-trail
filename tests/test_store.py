@@ -674,8 +674,9 @@ def test_ingest_drops_nonsnapshot_raw_payload_keeps_index(tmp_path, monkeypatch)
 
 
 def test_ingest_keeps_snapshot_raw(tmp_path, monkeypatch):
-    """The file-history-snapshot payload IS retained (the backfill reads it back),
-    even as the neighbouring user line's payload is dropped."""
+    """The file-history snapshot and delta payloads ARE retained (the full
+    backfill pass reads them back), even as the neighbouring user line's payload
+    is dropped."""
     projects = tmp_path / "projects"
     monkeypatch.setattr(store, "PROJECTS_DIR", projects)
     monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
@@ -685,6 +686,7 @@ def test_ingest_keeps_snapshot_raw(tmp_path, monkeypatch):
         _fh_snapshot_event("m1", {"/tmp/a.txt": {
             "backupFileName": "h1@v1", "version": 1,
             "backupTime": "2026-07-01T10:00:00.000Z"}}),
+        _fh_delta_event("m2", "/tmp/b.txt", "h2@v1", 1, "2026-07-01T10:00:01.000Z", "/tmp"),
     ]
     _write_jsonl(projects / "-fake-proj" / f"{sid}.jsonl", events)
     con = store.connect()
@@ -692,15 +694,17 @@ def test_ingest_keeps_snapshot_raw(tmp_path, monkeypatch):
         store.ingest_all(con)
         c = lambda sql: con.execute(sql).fetchone()[0]
         assert c("SELECT raw FROM raw_events WHERE type='file-history-snapshot'") is not None
-        assert c("SELECT count(*) FROM raw_events WHERE type<>'file-history-snapshot' AND raw IS NOT NULL") == 0
-        assert c("SELECT count(*) FROM raw_events") == 2                      # both index rows kept
+        assert c("SELECT raw FROM raw_events WHERE type='file-history-delta'") is not None
+        assert c("SELECT count(*) FROM raw_events WHERE type='user' AND raw IS NOT NULL") == 0
+        assert c("SELECT count(*) FROM raw_events") == 3                      # every index row kept
     finally:
         con.close()
 
 
 def test_prune_raw_events_clears_payload_keeps_snapshots_and_malformed(tmp_path, monkeypatch):
-    """prune_raw_events nulls only the non-snapshot payloads: file-history-snapshot
-    (read back) and malformed (type NULL) rows keep theirs, and it is idempotent."""
+    """prune_raw_events nulls only the payloads nothing reads: file-history
+    snapshot and delta rows (read back) and malformed (type NULL) rows keep
+    theirs, and it is idempotent."""
     monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
     con = store.connect()
     try:
@@ -708,14 +712,16 @@ def test_prune_raw_events_clears_payload_keeps_snapshots_and_malformed(tmp_path,
             "INSERT INTO raw_events(uuid,session_id,ts,type,transcript_path,raw) VALUES (?,?,?,?,?,?)",
             [("u1", "s", None, "user", "/p", '{"big":"payload"}'),
              ("snap", "s", None, "file-history-snapshot", "/p", '{"snapshot":1}'),
+             ("delta", "s", None, "file-history-delta", "/p", '{"backup":1}'),
              ("bad", "s", None, None, "/p", "not-json")])          # malformed: type NULL
         cleared, nbytes = store.prune_raw_events(con)
         assert cleared == 1 and nbytes > 0
         val = lambda u: con.execute("SELECT raw FROM raw_events WHERE uuid=?", [u]).fetchone()[0]
         assert val("u1") is None            # non-snapshot payload cleared
         assert val("snap") is not None      # snapshot kept
+        assert val("delta") is not None     # delta kept
         assert val("bad") is not None       # malformed kept
-        assert con.execute("SELECT count(*) FROM raw_events").fetchone()[0] == 3  # index intact
+        assert con.execute("SELECT count(*) FROM raw_events").fetchone()[0] == 4  # index intact
         assert store.prune_raw_events(con) == (0, 0)  # idempotent
     finally:
         con.close()
@@ -4026,6 +4032,586 @@ def test_file_history_promotes_after_dir_pruned(tmp_path, monkeypatch):
                            "AND path=?", [abspath]).fetchone()[0] == 1  # emitted from the stored blob
     finally:
         con.close()
+
+
+# --- Incremental file-history pass (ingest CPU plan, phase 3) ------------------
+#
+# Ordinary `ingest` runs parse only the snapshot/delta lines their own sweep
+# stored; the full pass (every stored payload plus the orphan glob) runs on
+# --compact, --file-history-only, ingest_all, and in any run once
+# `<store>.fh-full-stamp` is FILE_HISTORY_FULL_INTERVAL old (or missing, as on
+# a fresh store). These tests pin both halves and that they leave the same rows.
+
+
+def _full_pass_ran_recently():
+    """Record a fresh full pass, so the next ordinary runs stay incremental."""
+    store._fh_full_stamp().touch()
+
+
+def _age_full_pass_stamp():
+    """Make the recorded full pass one interval (plus a minute) old."""
+    old = time.time() - store.FILE_HISTORY_FULL_INTERVAL - 60
+    os.utime(store._fh_full_stamp(), (old, old))
+
+
+def _fh_delta_event(message_id, tracking_path, bfn, version, btime, real_parent_dir):
+    """A file-history-delta transcript line as it really appears: one file per
+    line, `trackingPath` absolute or relative to the launch dir, and the same
+    meta shape as a trackedFileBackups entry under `backup`. No uuid/sessionId."""
+    return {"type": "file-history-delta", "messageId": message_id,
+            "snapshotMessageId": "snap-" + message_id, "trackingPath": tracking_path,
+            "backup": {"backupFileName": bfn, "version": version, "backupTime": btime,
+                       "realParentDir": real_parent_dir},
+            "timestamp": btime}
+
+
+def _fh_rows(con):
+    """Everything the file-history pass writes, in a comparable order."""
+    return (con.execute("SELECT session_id, pathhash, version, path, sha, "
+                        "epoch_ms(snapshot_ts), note FROM file_history "
+                        "ORDER BY 1, 2, 3").fetchall(),
+            con.execute("SELECT event_id, session_id, epoch_ms(ts), path, pre_sha, "
+                        "post_sha, patch FROM file_versions WHERE source='file-history' "
+                        "ORDER BY 1").fetchall(),
+            con.execute("SELECT sha FROM blobs ORDER BY 1").fetchall())
+
+
+def _forbid(monkeypatch, *names):
+    """Make the full-pass helpers fail loudly if an ordinary run reaches them."""
+    for name in names:
+        def boom(*a, _name=name, **k):
+            raise AssertionError(f"{_name} ran on an incremental pass")
+        monkeypatch.setattr(store, name, boom)
+
+
+def test_incremental_pass_stores_and_resolves_a_new_snapshot_in_the_same_run(
+        tmp_path, monkeypatch, capsys):
+    """One ordinary run stores and resolves new snapshots from the lines it just
+    read, through each cheap route (an absolute key, sessions.cwd plus a relative
+    key, a delta line's realParentDir) and with no payload scan or reverse index.
+    The delta row takes its backupTime, not the file's mtime."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    sid, cwd = "sess-fh-inc-0001", "/home/naka/proj"
+    p_abs, p_rel, p_delta = f"{cwd}/abs.py", f"{cwd}/sub/rel.py", f"{cwd}/pkg/delta.py"
+    h_abs, h_rel, h_delta = _pathhash(p_abs), _pathhash(p_rel), _pathhash(p_delta)
+    _write_fh_files(fh_dir, sid, {f"{h_abs}@v1": "abs\n", f"{h_rel}@v1": "rel\n",
+                                  f"{h_delta}@v1": "delta\n"})
+    _write_jsonl(projects / "-home-naka-proj" / f"{sid}.jsonl", [
+        _fh_snapshot_event("mi1", {
+            p_abs: {"backupFileName": f"{h_abs}@v1", "version": 1,
+                    "backupTime": "2026-07-02T10:00:01.000Z"},
+            "sub/rel.py": {"backupFileName": f"{h_rel}@v1", "version": 1,
+                           "backupTime": "2026-07-02T10:00:02.000Z"}}),
+        {**_user_prompt("u-inc-1", sid, "edit things", "2026-07-02T10:00:00.000Z"),
+         "cwd": cwd},
+        _fh_delta_event("mi2", "pkg/delta.py", f"{h_delta}@v1", 1,
+                        "2026-07-02T10:00:03.000Z", f"{cwd}/pkg"),
+    ])
+    _full_pass_ran_recently()
+    _forbid(monkeypatch, "_snapshot_records", "_known_paths")
+
+    assert store.cmd_ingest(["ingest"]) == 0
+    out = capsys.readouterr().out
+    assert "file-history: 3 new snapshots, 3 resolved" in out
+    assert "(full pass)" not in out
+    con = store.connect(read_only=True)
+    try:
+        assert dict(con.execute("SELECT pathhash, path FROM file_history").fetchall()) == {
+            h_abs: p_abs, h_rel: p_rel, h_delta: p_delta}
+        assert con.execute("SELECT count(*) FROM file_versions WHERE source='file-history' "
+                           "AND post_sha IS NOT NULL").fetchone()[0] == 3
+        assert con.execute("SELECT epoch_ms(snapshot_ts) FROM file_history WHERE pathhash=?",
+                           [h_delta]).fetchone()[0] == 1782986403000   # its backupTime
+    finally:
+        con.close()
+
+
+def test_idle_ingest_reads_no_snapshot_payload(tmp_path, monkeypatch, capsys):
+    """The point of the phase: once a snapshot is stored, an ordinary run that
+    finds no new transcript lines reads no snapshot payload, builds no reverse
+    index and asks file_history nothing beyond the stored-rows count. The first
+    run on a fresh store has no full pass recorded, so it takes one and records
+    it; that stamp is what keeps the idle run incremental."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    sid, path = "sess-fh-idle-0001", "/home/naka/proj/idle.py"
+    ph = _pathhash(path)
+    _write_fh_files(fh_dir, sid, {f"{ph}@v1": "idle\n"})
+    _write_jsonl(projects / "-proj" / f"{sid}.jsonl", [
+        _fh_snapshot_event("mid", {path: {"backupFileName": f"{ph}@v1", "version": 1,
+                                          "backupTime": "2026-07-02T11:00:01.000Z"}})])
+    assert not store._fh_full_stamp().exists()
+    assert store.cmd_ingest(["ingest"]) == 0                       # stores the snapshot
+    assert "(full pass)" in capsys.readouterr().out
+    assert store._fh_full_stamp().exists()
+
+    _forbid(monkeypatch, "_snapshot_records", "_known_paths")
+    counting = _CountingCon(store.connect())
+    monkeypatch.setattr(store, "connect_writer", lambda *a, **k: counting)
+    assert store.cmd_ingest(["ingest"]) == 0
+    assert "(full pass)" not in capsys.readouterr().out
+    fh_sql = [s for s in counting.sql if "file-history" in s or "file_history" in s]
+    assert fh_sql and all(s == "SELECT count(*) FROM file_history" for s in fh_sql)
+
+
+def test_incremental_pass_resolves_from_an_earlier_row_of_the_same_file(
+        tmp_path, monkeypatch):
+    """A later version whose own line cannot name its path (a relative key in a
+    session with no cwd) resolves from an earlier row of the same pathhash, and
+    its synthetic file_versions row chains pre_sha over the version gap to the
+    blob a previous run stored."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    sid, path = "sess-fh-chain-0001", "/home/naka/proj/chain.py"
+    ph = _pathhash(path)
+    v2, v4 = "chain v2\n", "chain v2\nchain v4\n"
+    _write_fh_files(fh_dir, sid, {f"{ph}@v2": v2, f"{ph}@v4": v4})
+    transcript = projects / "-proj" / f"{sid}.jsonl"
+    _write_jsonl(transcript, [
+        _fh_snapshot_event("mc2", {path: {"backupFileName": f"{ph}@v2", "version": 2,
+                                          "backupTime": "2026-07-02T12:00:02.000Z"}})])
+    _full_pass_ran_recently()            # else the orphan glob would store v4 already
+    assert store.cmd_ingest(["ingest"]) == 0
+
+    _forbid(monkeypatch, "_snapshot_records", "_known_paths")
+    with open(transcript, "a", encoding="utf-8") as f:
+        f.write(json.dumps(_fh_snapshot_event("mc4", {"chain.py": {
+            "backupFileName": f"{ph}@v4", "version": 4,
+            "backupTime": "2026-07-02T12:00:04.000Z"}})) + "\n")
+    assert store.cmd_ingest(["ingest"]) == 0
+    con = store.connect(read_only=True)
+    try:
+        assert con.execute("SELECT count(*) FROM file_history WHERE path=?",
+                           [path]).fetchone()[0] == 2
+        (pre2, post2, _), (pre4, post4, patch4) = con.execute(
+            "SELECT pre_sha, post_sha, patch FROM file_versions "
+            "WHERE source='file-history' ORDER BY ts").fetchall()
+        assert pre2 is None and pre4 == post2 == store._sha(v2)
+        assert post4 == store._sha(v4) and "chain v4" in patch4
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize("flag", ["--compact", "--file-history-only"])
+def test_full_pass_picks_up_an_orphan_and_a_crashed_runs_lines(
+        tmp_path, monkeypatch, capsys, flag):
+    """The full pass is the safety net. A snapshot and a delta line stored by a
+    run that died before its parse (simulated: swept without collecting) are
+    never seen by an ordinary run again, since their offset has advanced, and an
+    on-disk orphan has no line at all. --compact and --file-history-only pick up
+    all three; the delta row still gets its backupTime, because its payload is
+    kept for exactly this."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    sid, orphan_sid = "sess-fh-crash-0001", "sess-fh-orphan-0001"
+    p_snap, p_delta = "/home/naka/proj/crash.py", "/home/naka/proj/crash_delta.py"
+    h_snap, h_delta, h_orphan = (_pathhash(p_snap), _pathhash(p_delta),
+                                 _pathhash("/home/naka/proj/orphan.py"))
+    _write_fh_files(fh_dir, sid, {f"{h_snap}@v1": "crash\n", f"{h_delta}@v1": "delta\n"})
+    _write_fh_files(fh_dir, orphan_sid, {f"{h_orphan}@v1": "orphan\n"})
+    _write_jsonl(projects / "-proj" / f"{sid}.jsonl", [
+        _fh_snapshot_event("mcr", {p_snap: {"backupFileName": f"{h_snap}@v1", "version": 1,
+                                            "backupTime": "2026-07-02T13:00:01.000Z"}}),
+        _fh_delta_event("mcd", p_delta, f"{h_delta}@v1", 1,
+                        "2026-07-02T13:00:02.000Z", "/home/naka/proj")])
+    con = store.connect()
+    try:
+        store._sweep_transcripts(con)                 # the crashed run: lines in, no parse
+    finally:
+        con.close()
+
+    _full_pass_ran_recently()                         # --compact / --file-history-only force it
+    assert store.cmd_ingest(["ingest"]) == 0          # ordinary run: sees none of it
+    assert "file-history: 0 new snapshots, 0 resolved" in capsys.readouterr().out
+    assert store.cmd_ingest(["ingest", flag]) == 0
+    assert "file-history: 3 new snapshots, 2 resolved (full pass)" in capsys.readouterr().out
+    con = store.connect(read_only=True)
+    try:
+        assert dict(con.execute("SELECT pathhash, path FROM file_history").fetchall()) == {
+            h_snap: p_snap, h_delta: p_delta, h_orphan: None}  # orphan path never seen
+        assert con.execute("SELECT epoch_ms(snapshot_ts) FROM file_history WHERE pathhash=?",
+                           [h_delta]).fetchone()[0] == 1782997202000
+        assert con.execute("SELECT count(*) FROM blobs").fetchone()[0] == 3
+    finally:
+        con.close()
+    before = _fh_rows(store.connect(read_only=True))
+    assert store.cmd_ingest(["ingest", flag]) == 0    # idempotent
+    con = store.connect(read_only=True)
+    try:
+        assert _fh_rows(con) == before
+    finally:
+        con.close()
+
+
+def test_incremental_pass_defers_an_unresolvable_row_to_the_full_pass(
+        tmp_path, monkeypatch):
+    """A new row no cheap route resolves pays for one reverse-index scan on the
+    run that inserts it, then stays path-less without costing later ordinary
+    runs anything, even one whose new snapshot line names the file again (Claude
+    Code repeats every tracked file in each snapshot, so the `scan_for` gate is
+    what keeps that run from scanning): a path revealed by a later event is found
+    by the next full pass, which also emits the row."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    sid, abspath = "sess-fh-defer2-0001", "/home/naka/proj/later.py"
+    ph = _pathhash(abspath)
+    _write_fh_files(fh_dir, sid, {f"{ph}@v1": "later v1\n"})
+    transcript = projects / "-proj" / f"{sid}.jsonl"
+    _write_jsonl(transcript, [                                     # relative key, no cwd
+        _fh_snapshot_event("mL", {"later.py": {"backupFileName": f"{ph}@v1", "version": 1,
+                                               "backupTime": "2026-07-02T14:00:01.000Z"}})])
+    scans = []
+    real_known = store._known_paths
+    monkeypatch.setattr(store, "_known_paths", lambda con: scans.append(1) or real_known(con))
+    _full_pass_ran_recently()
+
+    def path_and_emits():
+        con = store.connect(read_only=True)
+        try:
+            return (con.execute("SELECT path FROM file_history").fetchone()[0],
+                    con.execute("SELECT count(*) FROM file_versions "
+                                "WHERE source='file-history'").fetchone()[0])
+        finally:
+            con.close()
+
+    assert store.cmd_ingest(["ingest"]) == 0
+    assert path_and_emits() == (None, 0) and len(scans) == 1     # stored, scanned once
+    with open(transcript, "a", encoding="utf-8") as f:            # reveal the path (a Read)
+        f.write(json.dumps(_read_tool_use("mLr", sid, abspath, "2026-07-02T14:05:00.000Z")) + "\n")
+        f.write(json.dumps(_fh_snapshot_event("mL2", {"later.py": {   # the file, tracked again
+            "backupFileName": f"{ph}@v1", "version": 1,
+            "backupTime": "2026-07-02T14:00:01.000Z"}})) + "\n")
+    assert store.cmd_ingest(["ingest"]) == 0
+    assert path_and_emits() == (None, 0) and len(scans) == 1     # ordinary run: no rescan
+    assert store.cmd_ingest(["ingest", "--file-history-only"]) == 0
+    assert path_and_emits() == (abspath, 1)
+
+
+def test_incremental_and_full_pass_leave_the_same_rows(tmp_path, monkeypatch):
+    """Correctness first: two ordinary runs over a transcript that grows in
+    between (snapshot and delta lines, absolute and relative keys, a version gap,
+    a repeated entry) leave exactly the file_history rows, synthetic
+    file_versions rows and blobs that one full pass over the final transcript
+    leaves in a fresh store."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    sid, cwd = "sess-fh-same-0001", "/home/naka/proj"
+    pa, pb, pc = f"{cwd}/a.py", f"{cwd}/lib/b.py", f"{cwd}/lib/c.py"
+    ha, hb, hc = _pathhash(pa), _pathhash(pb), _pathhash(pc)
+    _write_fh_files(fh_dir, sid, {f"{ha}@v1": "a1\n", f"{ha}@v3": "a1\na3\n",
+                                  f"{hb}@v1": "b1\n", f"{hc}@v2": "c2\n",
+                                  f"{hc}@v5": "c2\nc5\n"})
+    head = [
+        {**_user_prompt("u-same-1", sid, "go", "2026-07-02T15:00:00.000Z"), "cwd": cwd},
+        _fh_snapshot_event("ms1", {
+            pa: {"backupFileName": f"{ha}@v1", "version": 1,
+                 "backupTime": "2026-07-02T15:00:01.000Z"},
+            "lib/b.py": {"backupFileName": f"{hb}@v1", "version": 1,
+                         "backupTime": "2026-07-02T15:00:02.000Z"}}),
+        _fh_delta_event("md1", "lib/c.py", f"{hc}@v2", 2, "2026-07-02T15:00:03.000Z",
+                        f"{cwd}/lib"),
+    ]
+    tail = [
+        _fh_snapshot_event("ms2", {
+            pa: {"backupFileName": f"{ha}@v3", "version": 3,
+                 "backupTime": "2026-07-02T15:00:04.000Z"},
+            "lib/b.py": {"backupFileName": f"{hb}@v1", "version": 1,
+                         "backupTime": "2026-07-02T15:00:02.000Z"}}),
+        _fh_delta_event("md2", "lib/c.py", f"{hc}@v5", 5, "2026-07-02T15:00:05.000Z",
+                        f"{cwd}/lib"),
+    ]
+    transcript = projects / "-home-naka-proj" / f"{sid}.jsonl"
+    _write_jsonl(transcript, head)
+    _full_pass_ran_recently()                       # both runs below stay incremental
+    real_records = store._snapshot_records
+    _forbid(monkeypatch, "_snapshot_records")
+    assert store.cmd_ingest(["ingest"]) == 0
+    with open(transcript, "a", encoding="utf-8") as f:
+        f.write("".join(json.dumps(e) + "\n" for e in tail))
+    assert store.cmd_ingest(["ingest"]) == 0
+    monkeypatch.setattr(store, "_snapshot_records", real_records)   # ingest_all needs it
+    con = store.connect(read_only=True)
+    try:
+        incremental = _fh_rows(con)
+    finally:
+        con.close()
+
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "full.duckdb")
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        full = _fh_rows(con)
+    finally:
+        con.close()
+    assert len(incremental[0]) == 5 and all(r[3] for r in incremental[0])   # all resolved
+    assert len(incremental[1]) == 5
+    assert incremental == full
+
+
+def test_watch_runs_the_full_pass_first_then_incremental(tmp_path, monkeypatch):
+    """A --watch process holds the store, so no --compact run can reach it. It
+    follows the same stamp rule as a one-shot run, checked per sweep: on a fresh
+    store its first sweep takes the full pass and later sweeps the incremental
+    one, a restart within the interval stays incremental, and once
+    FILE_HISTORY_FULL_INTERVAL has passed a sweep takes it again."""
+    projects, _fh_dir = _setup_fh(tmp_path, monkeypatch)
+    _write_jsonl(projects / "-proj" / "sess-fh-watch-0001.jsonl",
+                 [_user_prompt("u-w-1", "sess-fh-watch-0001", "hi", "2026-07-02T16:00:00.000Z")])
+    modes = []
+    real = store.ingest_file_history
+    monkeypatch.setattr(store, "ingest_file_history", lambda con, **k: (
+        modes.append("full" if k.get("records") is None else "incremental"), real(con, **k))[1])
+
+    class _Stop(Exception):
+        pass
+
+    def run(sweeps):
+        modes.clear()
+        sleeps = []
+
+        def sleep(_s):
+            sleeps.append(1)
+            if len(sleeps) == sweeps:
+                raise _Stop
+
+        monkeypatch.setattr(store.time, "sleep", sleep)
+        with pytest.raises(_Stop):
+            store.cmd_ingest(["ingest", "--watch"])
+        return list(modes)
+
+    assert run(3) == ["full", "incremental", "incremental"]
+    assert run(2) == ["incremental", "incremental"]
+    monkeypatch.setattr(store, "FILE_HISTORY_FULL_INTERVAL", 0.0)
+    assert run(2) == ["full", "full"]
+
+
+def test_fh_full_due_follows_its_stamp(tmp_path, monkeypatch):
+    """The full pass is due with no stamp (a fresh store), with one at least an
+    interval old, and with one from the future (a clock moved back); a fresh
+    stamp keeps it off unless the run forces it."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    assert store._fh_full_due() is True
+    _full_pass_ran_recently()
+    assert store._fh_full_due() is False
+    assert store._fh_full_due(force=True) is True
+    _age_full_pass_stamp()
+    assert store._fh_full_due() is True
+    future = time.time() + 600
+    os.utime(store._fh_full_stamp(), (future, future))
+    assert store._fh_full_due() is True
+
+
+def test_ordinary_run_takes_the_full_pass_once_its_stamp_is_due(
+        tmp_path, monkeypatch, capsys):
+    """Setups that never pass --compact (plain cron, `ingest --detach`) still get
+    the safety net. A line a crashed run stored and an orphan file wait only
+    until the recorded full pass is FILE_HISTORY_FULL_INTERVAL old; then the next
+    ordinary run takes the full pass and records it, and the runs after it are
+    incremental again."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    sid, orphan_sid = "sess-fh-due-0001", "sess-fh-due-orphan"
+    path = "/home/naka/proj/due.py"
+    ph, h_orphan = _pathhash(path), _pathhash("/home/naka/proj/due_orphan.py")
+    _write_fh_files(fh_dir, sid, {f"{ph}@v1": "due\n"})
+    _write_fh_files(fh_dir, orphan_sid, {f"{h_orphan}@v1": "orphan\n"})
+    _write_jsonl(projects / "-proj" / f"{sid}.jsonl", [
+        _fh_snapshot_event("mdu", {path: {"backupFileName": f"{ph}@v1", "version": 1,
+                                          "backupTime": "2026-07-02T17:00:01.000Z"}})])
+    con = store.connect()
+    try:
+        store._sweep_transcripts(con)                 # the crashed run: line in, no parse
+    finally:
+        con.close()
+    _full_pass_ran_recently()
+
+    assert store.cmd_ingest(["ingest"]) == 0          # stamp fresh: incremental, sees none
+    out = capsys.readouterr().out
+    assert "file-history: 0 new snapshots, 0 resolved" in out and "(full pass)" not in out
+    _age_full_pass_stamp()
+    aged = store._fh_full_stamp().stat().st_mtime
+    assert store.cmd_ingest(["ingest"]) == 0          # no flag, the stamp is due
+    assert ("file-history: 2 new snapshots, 1 resolved (full pass)"
+            in capsys.readouterr().out)
+    assert store._fh_full_stamp().stat().st_mtime > aged
+    assert store.cmd_ingest(["ingest"]) == 0
+    assert "(full pass)" not in capsys.readouterr().out
+    con = store.connect(read_only=True)
+    try:
+        assert dict(con.execute("SELECT pathhash, path FROM file_history").fetchall()) == {
+            ph: path, h_orphan: None}
+    finally:
+        con.close()
+
+
+def test_full_pass_stamp_moves_only_when_the_pass_finishes(tmp_path, monkeypatch):
+    """The stamp records a full pass that finished. A run whose full pass raises
+    and a run skipped on a reader's lock both leave it due, so the next run
+    takes the pass instead of waiting another interval."""
+    projects, _fh_dir = _setup_fh(tmp_path, monkeypatch)
+    _write_jsonl(projects / "-proj" / "sess-fh-stamp-0001.jsonl",
+                 [_user_prompt("u-st-1", "sess-fh-stamp-0001", "hi", "2026-07-02T18:00:00.000Z")])
+    real = store.ingest_file_history
+
+    def broken(con, **k):
+        if k.get("records") is None:
+            raise RuntimeError("full pass failed")
+        return real(con, **k)
+
+    monkeypatch.setattr(store, "ingest_file_history", broken)
+    with pytest.raises(RuntimeError, match="full pass failed"):
+        store.cmd_ingest(["ingest"])
+    assert not store._fh_full_stamp().exists()
+
+    monkeypatch.setattr(store, "ingest_file_history", real)
+    monkeypatch.setattr(store, "connect_writer", lambda *a, **k: None)   # a reader holds it
+    assert store.cmd_ingest(["ingest"]) == 0
+    assert not store._fh_full_stamp().exists()
+
+
+@pytest.mark.parametrize("late", ["crashed-run", "orphan", "out-of-order"])
+def test_a_late_lower_version_rechains_its_emitted_successor(
+        tmp_path, monkeypatch, capsys, late):
+    """v2 is emitted while v1 is missing, so its row has pre_sha NULL and no
+    patch. When v1 arrives later (a line a crashed run stored, found by the full
+    pass; an orphan file the full pass globs; a line naming v1 after v2, read by
+    an ordinary run) the emit walk re-chains v2 to it, so the store ends with the
+    rows one full pass over the final state leaves in a fresh store. The
+    re-emitted row is not counted as new, and a re-run changes nothing."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    sid, path = "sess-fh-late-0001", "/home/naka/proj/late.py"
+    ph = _pathhash(path)
+    v1, v2 = "one\n", "one\ntwo\n"
+    _write_fh_files(fh_dir, sid, {f"{ph}@v1": v1, f"{ph}@v2": v2})
+    transcript = projects / "-proj" / f"{sid}.jsonl"
+
+    def line(mid, ver, btime):
+        return _fh_snapshot_event(mid, {path: {"backupFileName": f"{ph}@v{ver}",
+                                               "version": ver, "backupTime": btime}})
+
+    def append(ev):
+        with open(transcript, "a", encoding="utf-8") as f:
+            f.write(json.dumps(ev) + "\n")
+
+    def v2_rows():
+        con = store.connect(read_only=True)
+        try:
+            return con.execute("SELECT pre_sha, patch FROM file_versions WHERE event_id=?",
+                               [f"fh:{sid}:{ph}@v2"]).fetchall()
+        finally:
+            con.close()
+
+    def all_rows():
+        con = store.connect(read_only=True)
+        try:
+            return _fh_rows(con)
+        finally:
+            con.close()
+
+    l1 = line("mla1", 1, "2026-07-02T19:00:01.000Z")
+    l2 = line("mla2", 2, "2026-07-02T19:05:01.000Z")
+    _full_pass_ran_recently()
+    if late == "crashed-run":
+        _write_jsonl(transcript, [l1])
+        con = store.connect()
+        try:
+            store._sweep_transcripts(con)             # the crashed run: v1's line in, no parse
+        finally:
+            con.close()
+        append(l2)
+    else:
+        _write_jsonl(transcript, [l2])
+    assert store.cmd_ingest(["ingest"]) == 0          # ordinary run: emits v2 alone
+    assert v2_rows() == [(None, None)]
+    capsys.readouterr()
+
+    if late == "out-of-order":
+        append(l1)
+        assert store.cmd_ingest(["ingest"]) == 0      # the incremental pass repairs it
+    else:
+        assert store.cmd_ingest(["ingest", "--file-history-only"]) == 0
+    out = capsys.readouterr().out
+    assert "file-history: 1 new snapshots, 1 resolved" in out
+    assert ("(full pass)" in out) == (late != "out-of-order")
+    [(pre, patch)] = v2_rows()
+    assert pre == store._sha(v1) and "+two" in patch
+    got = all_rows()
+    assert store.cmd_ingest(["ingest", "--file-history-only"]) == 0
+    assert all_rows() == got                          # idempotent
+
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "fresh.duckdb")
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+        assert _fh_rows(con) == got
+    finally:
+        con.close()
+
+
+def test_resolution_checks_every_candidate_against_its_pathhash(tmp_path, monkeypatch):
+    """Route 2 (realParentDir plus the key's file name) is checked like every
+    other route. Claude Code's realParentDir is realpath(dirname), while the
+    backup name hashes the logical path, so under a symlinked project the
+    route-2 candidate is a different string: it must be rejected, and the row
+    resolves to the logical path through sessions.cwd. In a session with no cwd,
+    a realParentDir that does match is what resolves a relative key, with no
+    reverse-index scan."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    s_link, s_nocwd = "sess-fh-link-0001", "sess-fh-nocwd-0001"
+    cwd = "/home/naka/proj"                           # a symlink to /mnt/real/proj
+    p_link, p_nocwd = f"{cwd}/sub/linked.py", "/home/naka/other/pkg/m.py"
+    h_link, h_nocwd = _pathhash(p_link), _pathhash(p_nocwd)
+    _write_fh_files(fh_dir, s_link, {f"{h_link}@v1": "linked\n"})
+    _write_fh_files(fh_dir, s_nocwd, {f"{h_nocwd}@v1": "nocwd\n"})
+    _write_jsonl(projects / "-home-naka-proj" / f"{s_link}.jsonl", [
+        {**_user_prompt("u-link-1", s_link, "go", "2026-07-02T20:00:00.000Z"), "cwd": cwd},
+        _fh_delta_event("mlk", "sub/linked.py", f"{h_link}@v1", 1,
+                        "2026-07-02T20:00:01.000Z", "/mnt/real/proj/sub")])
+    _write_jsonl(projects / "-home-naka-other" / f"{s_nocwd}.jsonl", [   # no cwd line at all
+        _fh_delta_event("mnc", "pkg/m.py", f"{h_nocwd}@v1", 1,
+                        "2026-07-02T20:00:02.000Z", "/home/naka/other/pkg")])
+    _full_pass_ran_recently()
+    _forbid(monkeypatch, "_snapshot_records", "_known_paths")
+    assert store.cmd_ingest(["ingest"]) == 0
+    con = store.connect(read_only=True)
+    try:
+        assert dict(con.execute("SELECT pathhash, path FROM file_history").fetchall()) == {
+            h_link: p_link, h_nocwd: p_nocwd}
+        assert con.execute("SELECT count(*) FROM file_versions "
+                           "WHERE source='file-history'").fetchone()[0] == 2
+    finally:
+        con.close()
+
+
+def test_ordinary_run_emits_a_row_it_resolves_for_an_earlier_run(
+        tmp_path, monkeypatch, capsys):
+    """A row an earlier run stored path-less is emitted by the ordinary run that
+    resolves it, not left for the next full pass: here a later delta line for
+    the same version carries the realParentDir the snapshot line lacked."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    sid, path = "sess-fh-reveal-0001", "/home/naka/proj/reveal.py"
+    ph = _pathhash(path)
+    _write_fh_files(fh_dir, sid, {f"{ph}@v1": "reveal\n"})
+    transcript = projects / "-proj" / f"{sid}.jsonl"
+    _write_jsonl(transcript, [                                     # relative key, no cwd
+        _fh_snapshot_event("mrv", {"reveal.py": {"backupFileName": f"{ph}@v1", "version": 1,
+                                                 "backupTime": "2026-07-02T21:00:01.000Z"}})])
+
+    def path_and_emits():
+        con = store.connect(read_only=True)
+        try:
+            return (con.execute("SELECT path FROM file_history").fetchone()[0],
+                    con.execute("SELECT count(*) FROM file_versions "
+                                "WHERE source='file-history'").fetchone()[0])
+        finally:
+            con.close()
+
+    _full_pass_ran_recently()
+    assert store.cmd_ingest(["ingest"]) == 0
+    assert path_and_emits() == (None, 0)
+    _forbid(monkeypatch, "_snapshot_records", "_known_paths")
+    with open(transcript, "a", encoding="utf-8") as f:
+        f.write(json.dumps(_fh_delta_event("mrv2", "reveal.py", f"{ph}@v1", 1,
+                                           "2026-07-02T21:00:01.000Z",
+                                           "/home/naka/proj")) + "\n")
+    capsys.readouterr()
+    assert store.cmd_ingest(["ingest"]) == 0
+    assert "file-history: 0 new snapshots, 1 resolved" in capsys.readouterr().out
+    assert path_and_emits() == (path, 1)
 
 
 # --- ingest --detach: singleton lock + background fork (Phase 1) ---------------
