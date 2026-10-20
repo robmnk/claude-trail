@@ -6,6 +6,7 @@ reconstruction. Single-writer ingester, read-only readers.
 """
 import difflib
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -1575,6 +1576,22 @@ def _ingest_detach(argv):
     os._exit(0)
 
 
+def _block_missing_pandas():
+    """Make DuckDB's optional `import pandas` fail at once in this process.
+
+    DuckDB tries `import pandas` twice per parameterised `execute` and more per
+    `executemany` row, and does not cache a failed import, so without pandas
+    every probe is a full `sys.path` search: 4,233 of them in one profiled
+    ingest run (0.64 s). A None entry in `sys.modules` makes the import raise
+    ImportError before any finder runs (measured: 1,000 parameterised SELECTs
+    plus 1,000 `executemany` rows went from 6,000 searches to 0, 0.9 s to
+    0.45 s). The probe imports per call, so this works whenever it runs before
+    the queries. Only `cmd_ingest` calls it: readers run a few queries per open
+    and keep the normal import. An installed pandas is left alone."""
+    if "pandas" not in sys.modules and importlib.util.find_spec("pandas") is None:
+        sys.modules["pandas"] = None
+
+
 def cmd_ingest(argv):
     # --detach: fork a one-shot ingest into the background and return at once (for
     # a Claude Code hook). Dispatched here so `claude-trail ingest --detach` needs
@@ -1596,6 +1613,7 @@ def cmd_ingest(argv):
     if "--compact" in argv and watch:
         _log("note: --compact is ignored with --watch (never compact inside the poll loop)")
     interval = 5.0
+    _block_missing_pandas()   # before connect() imports duckdb and the sweep queries
     con = connect_writer()
     if con is None:
         # A reader (the TUI's Tokens/prompt/database lookups, or an ad-hoc

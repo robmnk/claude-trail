@@ -1,3 +1,5 @@
+import importlib
+import importlib.util
 import json
 import os
 import sys
@@ -38,6 +40,18 @@ def _isolate_file_history(tmp_path, monkeypatch):
     and never reads the developer's real ~/.claude/file-history. The Phase 8 tests
     that exercise the backfill override this with their own populated tmp dir."""
     monkeypatch.setattr(store, "FILE_HISTORY_DIR", tmp_path / "no-file-history")
+
+
+@pytest.fixture(autouse=True)
+def _restore_pandas_entry(monkeypatch):
+    """cmd_ingest writes sys.modules['pandas'] = None when pandas is missing
+    (`_block_missing_pandas`). Register the entry with monkeypatch so every test
+    hands it back as it found it, set or absent."""
+    if "pandas" in sys.modules:
+        monkeypatch.setitem(sys.modules, "pandas", sys.modules["pandas"])
+    else:
+        monkeypatch.setitem(sys.modules, "pandas", None)   # undo deletes it again
+        monkeypatch.delitem(sys.modules, "pandas")
 
 
 def test_schema_bootstraps_and_reopens_read_only(tmp_path, monkeypatch):
@@ -2874,6 +2888,81 @@ def test_cmd_ingest_verbose_logs_per_transcript(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "transcript" in out
     assert sid in out
+
+
+class _PandasSearchCounter:
+    """A meta-path finder that only counts `pandas` lookups. A None entry in
+    sys.modules stops an import before any finder runs, so a count of 0 means
+    no import searched sys.path for pandas."""
+
+    def __init__(self):
+        self.hits = 0
+
+    def find_spec(self, name, path=None, target=None):
+        if name.partition(".")[0] == "pandas":
+            self.hits += 1
+        return None
+
+
+def _entry_at_connect(monkeypatch, real=True):
+    """Wrap connect_writer to record the sys.modules['pandas'] entry at the
+    moment cmd_ingest opens the store (that is where duckdb gets imported).
+    `real=False` stands in for a reader holding the store: no DuckDB runs."""
+    seen = []
+    real_writer = store.connect_writer
+
+    def writer(*a, **k):
+        seen.append(sys.modules.get("pandas", "absent"))
+        return real_writer(*a, **k) if real else None
+
+    monkeypatch.setattr(store, "connect_writer", writer)
+    return seen
+
+
+def test_cmd_ingest_blocks_a_missing_pandas_before_duckdb_probes_it(tmp_path, monkeypatch):
+    """Without pandas, cmd_ingest sets sys.modules['pandas'] = None before it
+    opens the store, so DuckDB's per-query `import pandas` never searches
+    sys.path, and the ingest still round-trips."""
+    real_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: (
+        None if name == "pandas" else real_find_spec(name, *a)))
+    counter = _PandasSearchCounter()
+    monkeypatch.setattr(sys, "meta_path", [counter, *sys.meta_path])
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    sid = "sess-pandas-01"
+    _write_jsonl(projects / "-fake" / f"{sid}.jsonl", _main_transcript_events(sid))
+    seen = _entry_at_connect(monkeypatch)
+
+    assert store.cmd_ingest(["ingest"]) == 0
+    assert seen == [None]               # in place before connect() imports duckdb
+    assert counter.hits == 0            # every probe failed without a search
+    with pytest.raises(ImportError):
+        importlib.import_module("pandas")
+    con = store.connect(read_only=True)
+    try:
+        assert con.execute("SELECT count(*) FROM sessions WHERE session_id = ?",
+                           [sid]).fetchone()[0] == 1
+        assert con.execute("SELECT count(*) FROM events").fetchone()[0] > 0
+    finally:
+        con.close()
+
+
+def test_cmd_ingest_leaves_an_importable_pandas_alone(tmp_path, monkeypatch):
+    """With a pandas on sys.path, nothing is blocked. The store open is stubbed
+    out (a reader holds it), because DuckDB keeps a pandas it imported for the
+    rest of the process, and a fake one would leak into every later test."""
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "pandas.py").write_text('"""fake pandas: importable, never imported"""\n')
+    monkeypatch.syspath_prepend(str(site))
+    seen = _entry_at_connect(monkeypatch, real=False)
+
+    assert store.cmd_ingest(["ingest"]) == 0
+    assert seen == ["absent"]
+    assert "pandas" not in sys.modules
+    assert importlib.util.find_spec("pandas").origin == str(site / "pandas.py")
 
 
 def test_cmd_reset_db_deletes_with_yes(tmp_path, monkeypatch, capsys):
