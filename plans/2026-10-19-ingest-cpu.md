@@ -120,7 +120,7 @@ Evidence:
   - Expected saving: 0.1 to 0.3 s per run. It grows with the rows inserted, since
     `executemany` probes once per row.
   - Optional: report it upstream, since DuckDB does not cache a failed optional import.
-- [ ] 3. Make the file-history pass incremental
+- [x] 3. Make the file-history pass incremental
   - `ingest_transcript` already sees every `file-history-snapshot` line it inserts. Collect
     those payloads in the sweep and hand them to `ingest_file_history`, which parses only
     them and no longer calls `_snapshot_records` on every run.
