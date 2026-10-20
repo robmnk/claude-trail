@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS raw_events(
   ts              TIMESTAMPTZ,
   type            TEXT,               -- every event type, kept as-is (system, mode, attachment, ...)
   transcript_path TEXT,
-  raw             TEXT                -- verbatim JSONL line, kept only for file-history-snapshot + malformed lines; NULL otherwise (see ingest_transcript / prune_raw_events)
+  raw             TEXT                -- verbatim JSONL line, kept only for file-history-snapshot/-delta + malformed lines; NULL otherwise (see ingest_transcript / prune_raw_events)
 );                                    -- TEXT (not JSON) so malformed lines persist too; query via json_extract(raw,...) / raw::JSON
 CREATE INDEX IF NOT EXISTS raw_session_ts ON raw_events(session_id, ts);
 CREATE INDEX IF NOT EXISTS raw_type ON raw_events(type);
@@ -375,13 +375,17 @@ def _insert_raw(con, raw_rows):
     con.execute("DELETE FROM _raw_stage")
 
 
-def ingest_transcript(con, path, last_offset=None):
+def ingest_transcript(con, path, last_offset=None, fh_records=None):
     """Read new lines from `path` since last_offset; insert events; advance offset.
     Returns number of events inserted.
 
     `last_offset` is the stored offset when the caller already has it (the sweep
     loads all of `ingest_state` in one query; 0 for a file it has never seen).
-    None looks it up here, one query per call."""
+    None looks it up here, one query per call.
+
+    `fh_records`, when a dict, collects the file-history records of the
+    snapshot and delta lines read here (`_add_fh_records`), so the incremental
+    file-history pass parses only what this sweep stored."""
     try:
         st = path.stat()
     except OSError:
@@ -405,6 +409,7 @@ def ingest_transcript(con, path, last_offset=None):
     complete, new_off = data[:nl + 1], last + nl + 1
     # subagent transcripts: <project>/<sid>/subagents/agent-<id>.jsonl
     agent_id = path.stem.removeprefix("agent-") if path.parent.name == "subagents" else None
+    fh_sid = _fh_session_id(path)
     raw_rows, rows, ureqs, fvs = [], [], [], []
     cwd = None   # the session's launch dir, from the first main-thread line carrying one
     full_read = last == 0   # this chunk starts at byte 0, so its first cwd IS the file's
@@ -421,13 +426,17 @@ def ingest_transcript(con, path, last_offset=None):
         typ = ev.get("type")
         # Keep the lightweight index row for every line, but store the verbatim
         # `raw` payload only for what the store still reads back: file-history
-        # -snapshot lines (via _snapshot_records). Every other line's payload is
-        # a redundant third copy (the transcript on disk + the `events`
-        # projection already hold it) and nothing reads it, so drop it to keep
-        # the store lean. Malformed lines (except branch above) keep their raw.
-        raw_val = line if typ == "file-history-snapshot" else None
+        # snapshot and delta lines (the full file-history pass re-reads them via
+        # _snapshot_records). Every other line's payload is a redundant third
+        # copy (the transcript on disk + the `events` projection already hold
+        # it) and nothing reads it, so drop it to keep the store lean. Malformed
+        # lines (except branch above) keep their raw.
+        is_fh = typ in _FH_LINE_TYPES
+        raw_val = line if is_fh else None
         raw_rows.append((uid, ev.get("sessionId", ""), ev.get("timestamp"),
                          typ, str(path), raw_val))
+        if is_fh and fh_records is not None:
+            _add_fh_records(fh_records, _fh_line_records(fh_sid, ev))
         # Main transcripts only: a subagent runs under the PARENT session id but
         # in its own cwd (measured: a scratchpad under /tmp for 2 of 5 sampled
         # subagent transcripts), so taking its cwd would mislabel the parent.
@@ -568,6 +577,10 @@ def _table_counts(con):
 # skipped flush costs a slightly larger `.wal`, never data.
 CHECKPOINT_MIN_INTERVAL = 300.0  # seconds between ingest-driven flushes
 
+# How often a --watch process runs the file-history full pass (one-shot runs
+# leave it to --compact, which the wrapper adds hourly). See cmd_ingest.
+FILE_HISTORY_FULL_INTERVAL = 3600.0
+
 
 def _checkpoint_stamp():
     """Marker whose mtime is the last ingest-driven CHECKPOINT (per store)."""
@@ -705,11 +718,12 @@ def backfill_session_cwd(con, paths=None):
     return filled
 
 
-def _sweep_transcripts(con, paths=None, verbose=False, tick=None):
+def _sweep_transcripts(con, paths=None, verbose=False, tick=None, fh_records=None):
     """Ingest every transcript under PROJECTS_DIR. Returns (files, changed, lines):
     transcript files seen, how many had new data, and lines ingested. Calls
     `tick()` once per file (drives the progress bar) and logs one line per changed
-    transcript when `verbose`."""
+    transcript when `verbose`. `fh_records` (a dict) collects the file-history
+    records of every snapshot/delta line stored, see `ingest_transcript`."""
     if paths is None:
         paths = _transcript_paths()
     # Every stored offset in ONE query, instead of one lookup per transcript: an
@@ -721,7 +735,7 @@ def _sweep_transcripts(con, paths=None, verbose=False, tick=None):
         "SELECT transcript_path, last_offset FROM ingest_state").fetchall())
     changed = lines = 0
     for path in paths:
-        n = ingest_transcript(con, path, offsets.get(str(path), 0))
+        n = ingest_transcript(con, path, offsets.get(str(path), 0), fh_records)
         if n:
             changed += 1
             lines += n
@@ -737,7 +751,9 @@ def ingest_all(con, verbose=False):
     transcript sweep, so a path first revealed this run resolves its snapshots
     this run; within the pass the promotion UPDATE runs after the index build,
     before emitting rows). Returns the transcript-line count (the historical
-    contract); per-file lines are logged when `verbose`."""
+    contract); per-file lines are logged when `verbose`. Runs the FULL
+    file-history pass every call: this is the standalone entry, and `cmd_ingest`
+    is where ordinary runs take the incremental one."""
     _files, _changed, lines = _sweep_transcripts(con, verbose=verbose)
     # Rows ingested before the ingester wrote `cwd` (and rows whose sweep read
     # started mid-file, which writes no cwd at all). Safe AFTER the sweep, and
@@ -1030,32 +1046,65 @@ def _fh_session_id(transcript_path):
     return p.parent.parent.name if p.parent.name == "subagents" else p.stem
 
 
+# The two transcript line types that name file-history snapshots. A snapshot
+# line repeats every tracked file of the session (`snapshot.trackedFileBackups`,
+# key -> meta); a delta line names one file (`trackingPath` + `backup`, the same
+# meta shape: backupFileName, version, backupTime, realParentDir). Delta lines
+# carry no uuid/sessionId either, and about 8% of new snapshots appear ONLY in
+# one (measured 2026-10-19; until then they entered through the orphan glob).
+_FH_LINE_TYPES = ("file-history-snapshot", "file-history-delta")
+
+
+def _fh_line_records(sid, ev):
+    """Yield (session_id, pathhash, version, backup_file_name, backup_time, key,
+    real_parent_dir) for every backed-up file one parsed snapshot or delta line
+    names. version + timestamp come from the transcript, not the filesystem.
+    Never raises on an odd shape: a bad entry is skipped."""
+    typ = ev.get("type")
+    if typ == "file-history-snapshot":
+        snap = ev.get("snapshot")
+        tfb = snap.get("trackedFileBackups") if isinstance(snap, dict) else None
+        entries = tfb.items() if isinstance(tfb, dict) else ()
+    elif typ == "file-history-delta":
+        entries = ((ev.get("trackingPath"), ev.get("backup")),)
+    else:
+        return
+    for key, meta in entries:
+        if not isinstance(meta, dict):
+            continue
+        bfn = meta.get("backupFileName")
+        if not isinstance(bfn, str):        # null = tracked but not yet backed up
+            continue
+        m = _FH_NAME_RE.match(bfn)
+        if not m:
+            continue
+        yield (sid, m.group(1), int(m.group(2)), bfn, meta.get("backupTime"), key,
+               meta.get("realParentDir"))
+
+
+def _add_fh_records(records, found):
+    """Fold `_fh_line_records` tuples into `records`, deduped by PK: the same
+    (session, file, version) recurs across many snapshot lines with an identical
+    backupTime, so first-seen wins (and the dict stays as small as the PK set)."""
+    for sid, ph, ver, *rest in found:
+        records.setdefault((sid, ph, ver), tuple(rest))
+
+
 def _snapshot_records(con):
-    """Authoritative driver: yield (session_id, pathhash, version, backup_file_name,
-    backup_time, key) for every non-null trackedFileBackups entry across every
-    file-history-snapshot raw_event. version + timestamp come from the transcript,
-    not the filesystem. Never raises on a malformed line."""
+    """Authoritative driver of the FULL pass: the `_fh_line_records` of every
+    file-history snapshot and delta payload in raw_events. Delta payloads are kept
+    only since 2026-10-19 (older rows have raw NULL; their files came in through
+    the orphan glob and are already stored). Never raises on a malformed line."""
     for tp, raw in con.execute(
             "SELECT transcript_path, raw FROM raw_events "
-            "WHERE type='file-history-snapshot'").fetchall():
+            "WHERE type IN ('file-history-snapshot', 'file-history-delta') "
+            "AND raw IS NOT NULL").fetchall():
         try:
             ev = json.loads(raw)
         except (json.JSONDecodeError, ValueError, TypeError):
             continue
-        tfb = (ev.get("snapshot") or {}).get("trackedFileBackups")
-        if not isinstance(tfb, dict):
-            continue
-        sid = _fh_session_id(tp)
-        for key, meta in tfb.items():
-            if not isinstance(meta, dict):
-                continue
-            bfn = meta.get("backupFileName")
-            if not isinstance(bfn, str):        # null = tracked but not yet backed up
-                continue
-            m = _FH_NAME_RE.match(bfn)
-            if not m:
-                continue
-            yield (sid, m.group(1), int(m.group(2)), bfn, meta.get("backupTime"), key)
+        if isinstance(ev, dict):
+            yield from _fh_line_records(_fh_session_id(tp), ev)
 
 
 def _known_paths(con):
@@ -1072,6 +1121,68 @@ def _known_paths(con):
             if p:
                 paths.add(p)
     return {_sha(p)[:16]: p for p in paths}
+
+
+def _resolve_fh_paths(con, records, pathhashes, scan_for=None):
+    """Fill `file_history.path` for the path-less rows of `pathhashes`; return the
+    set of pathhashes resolved.
+
+    Cheapest route first, every candidate checked against its pathhash
+    (sha256(path)[:16]), so whichever route finds a path finds the same string:
+      1. a record's own absolute key,
+      2. its realParentDir plus the key's file name,
+      3. the session's launch dir (`sessions.cwd`) plus a relative key,
+      4. an earlier file_history row of the same pathhash that has a path.
+    Phase 0 (2026-10-19) found these cover all 659 new rows of a week. Only a
+    pathhash still unresolved after them pays for `_known_paths` (two DISTINCT
+    scans over `events`, about 0.23 s), and only when it is in `scan_for` (the
+    rows this run inserted); `scan_for=None` lets any leftover pay (the full pass).
+    """
+    todo = set(pathhashes)
+    if not todo:
+        return set()
+    by_ph = {}                                 # pathhash -> [(session_id, key, realParentDir)]
+    for (sid, ph, _ver), (_bfn, _btime, key, rpd) in records.items():
+        if ph in todo and isinstance(key, str) and key:
+            by_ph.setdefault(ph, []).append((sid, key, rpd))
+    found = {}
+
+    def take(ph, cand):
+        if ph not in found and _sha(cand)[:16] == ph:
+            found[ph] = cand
+
+    for ph, recs in by_ph.items():
+        for _sid, key, _rpd in recs:
+            if os.path.isabs(key):
+                take(ph, key)
+        for _sid, key, rpd in recs:
+            if isinstance(rpd, str) and os.path.isabs(rpd):
+                take(ph, os.path.join(rpd, os.path.basename(key)))
+    need = {sid for ph, recs in by_ph.items() if ph not in found
+            for sid, key, _rpd in recs if not os.path.isabs(key)}
+    if need:
+        cwds = dict(con.execute(
+            "SELECT session_id, cwd FROM sessions "
+            "WHERE cwd IS NOT NULL AND session_id IN (SELECT unnest(?))",
+            [sorted(need)]).fetchall())
+        for ph, recs in by_ph.items():
+            for sid, key, _rpd in recs:
+                if sid in cwds and not os.path.isabs(key):
+                    take(ph, os.path.join(cwds[sid], key))
+    left = todo - found.keys()
+    if left:
+        found.update(con.execute(
+            "SELECT pathhash, min(path) FROM file_history "
+            "WHERE path IS NOT NULL AND pathhash IN (SELECT unnest(?)) GROUP BY pathhash",
+            [sorted(left)]).fetchall())
+        left -= found.keys()
+    if left and (scan_for is None or left & set(scan_for)):
+        known = _known_paths(con)
+        found.update((ph, known[ph]) for ph in left if ph in known)
+    for ph, p in found.items():
+        con.execute("UPDATE file_history SET path=? WHERE pathhash=? AND path IS NULL",
+                    [p, ph])
+    return set(found)
 
 
 _FH_COLS = ["session_id", "pathhash", "version", "path", "sha", "snapshot_ts", "note"]
@@ -1136,24 +1247,37 @@ def _fh_row(sid, pathhash, version, sha, ts, note):
             "path": None, "sha": sha, "snapshot_ts": ts, "note": note}
 
 
-def _emit_file_history_versions(con):
+def _emit_file_history_versions(con, pathhashes=None):
     """Emit a source='file-history' file_versions row for every resolved (path +
     sha) file_history row, so cat sees snapshot content. pre_sha is the blob of the
     highest PRESENT lower version in the same (session_id, pathhash) group (B1:
     never a naive v-1); patch is a difflib unified diff when a predecessor exists.
     Idempotent via the _insert_file_versions anti-join on the synthetic 'fh:'
     event_id; already-emitted rows are skipped so a re-run does no difflib work.
+    `pathhashes` limits the walk to those files (the incremental pass: what it
+    inserted or resolved); a group never spans two pathhashes, so each chain is
+    still walked whole. None walks every resolved row (the full pass).
     Returns the number of NEW file_versions rows."""
-    before = con.execute(
-        "SELECT count(*) FROM file_versions WHERE source='file-history'").fetchone()[0]
-    done = {r[0] for r in con.execute(
-        "SELECT event_id FROM file_versions WHERE source='file-history'").fetchall()}
+    scope, params = "", []
+    if pathhashes is not None:
+        if not pathhashes:
+            return 0
+        scope, params = " AND pathhash IN (SELECT unnest(?))", [sorted(pathhashes)]
     # epoch_ms(): read the TIMESTAMPTZ as a plain int (no pytz), re-boxed as a
     # tz-aware UTC datetime for the insert (binding a datetime needs no pytz).
     rows = con.execute(
         "SELECT session_id, pathhash, version, path, sha, epoch_ms(snapshot_ts) "
-        "FROM file_history WHERE path IS NOT NULL AND sha IS NOT NULL "
-        "ORDER BY session_id, pathhash, version").fetchall()
+        "FROM file_history WHERE path IS NOT NULL AND sha IS NOT NULL" + scope +
+        " ORDER BY session_id, pathhash, version", params).fetchall()
+    if not rows:
+        return 0
+    if pathhashes is None:
+        done = {r[0] for r in con.execute(
+            "SELECT event_id FROM file_versions WHERE source='file-history'").fetchall()}
+    else:
+        done = {r[0] for r in con.execute(
+            "SELECT event_id FROM file_versions WHERE event_id IN (SELECT unnest(?))",
+            [[f"fh:{sid}:{ph}@v{ver}" for sid, ph, ver, *_ in rows]]).fetchall()}
     fvs, prev = [], {}     # prev[(session_id, pathhash)] = highest present lower version's sha
     for sid, ph, ver, path, sha, ms in rows:
         gk = (sid, ph)
@@ -1176,36 +1300,56 @@ def _emit_file_history_versions(con):
             "path": path, "pre_sha": pre_sha, "post_sha": sha,
             "patch": patch, "source": "file-history",
         })
-    if fvs:
-        _insert_file_versions(con, fvs)
+    if not fvs:
+        return 0
+    before = con.execute(
+        "SELECT count(*) FROM file_versions WHERE source='file-history'").fetchone()[0]
+    _insert_file_versions(con, fvs)
     after = con.execute(
         "SELECT count(*) FROM file_versions WHERE source='file-history'").fetchone()[0]
     return after - before
 
 
-def ingest_file_history(con, verbose=False, on_total=None, tick=None):
+def ingest_file_history(con, verbose=False, on_total=None, tick=None, records=None):
     """Backfill ~/.claude/file-history snapshots into blobs + file_history, and emit
     resolved snapshots as source='file-history' file_versions rows so cat can
     reconstruct the ~61% of edits that are patch-only in transcripts. Returns
     (new_snapshots, resolved). Never raises on a bad file: skip and continue.
 
-    M4 (--watch cost): snapshots are immutable, so an already-present PK is skipped
-    BEFORE any byte is read/hashed (a steady sweep reads no snapshot bytes). The
-    reverse-index rebuild + promotion + emit run only when there is new work (new
-    snapshots this sweep) or unresolved (path IS NULL) rows remain; the residual
-    per-sweep cost is a directory walk plus a raw_events scan, which is acceptable.
+    Two modes, the same rows either way:
+      * FULL (`records=None`): every snapshot and delta payload in raw_events
+        (`_snapshot_records`), the orphan glob over FILE_HISTORY_DIR, a retry of
+        every path-less row, and an emit walk over every resolved row. The safety
+        net: it catches what the incremental pass cannot see (an orphan file, a
+        line stored by a run that died before its parse, a deferred row whose path
+        a later event revealed). Run by `ingest_all`, `--compact` (hourly from the
+        wrapper), `--file-history-only`, and hourly inside a `--watch` process.
+      * INCREMENTAL (`records` = what this sweep's transcript reads collected, see
+        `ingest_transcript`): only those records, no payload read and no glob, and
+        only their pathhashes are resolved and emitted. An idle sweep passes an
+        empty dict and runs no query at all. Profiled 2026-10-19, the full pass
+        cost every run about 0.7 s (6,609 payloads, 32 MB, 110k records) plus
+        0.23 s for `_known_paths` whenever one snapshot was new.
+    Snapshots are immutable, so in both modes an already-present PK is skipped
+    BEFORE any byte is read/hashed.
     """
-    existing = set(con.execute(
-        "SELECT session_id, pathhash, version FROM file_history").fetchall())
-
-    # Authoritative driver first (trackedFileBackups), deduped by PK: the same
-    # (session, file, version) recurs across many snapshot events with an identical
-    # backupTime, so first-seen wins. This scans raw_events, NOT the on-disk dir, so
-    # it runs even after file-history has been pruned: its keys still drive deferred
-    # path resolution for the snapshots already preserved in file_history.
-    records = {}
-    for sid, ph, ver, bfn, btime, key in _snapshot_records(con):
-        records.setdefault((sid, ph, ver), (bfn, btime, key))
+    full = records is None
+    if full:
+        existing = set(con.execute(
+            "SELECT session_id, pathhash, version FROM file_history").fetchall())
+        # Authoritative driver (trackedFileBackups and delta lines). This scans
+        # raw_events, NOT the on-disk dir, so it runs even after file-history has
+        # been pruned: its keys still drive deferred path resolution for the
+        # snapshots already preserved in file_history.
+        records = {}
+        _add_fh_records(records, _snapshot_records(con))
+    elif records:
+        existing = set(con.execute(
+            "SELECT session_id, pathhash, version FROM file_history "
+            "WHERE session_id IN (SELECT unnest(?))",
+            [sorted({pk[0] for pk in records})]).fetchall())
+    else:
+        existing = set()
 
     # Snapshots to read this sweep (immutable; already-stored PKs are skipped
     # before any byte is read). Report the total up front so the caller can size a
@@ -1215,7 +1359,8 @@ def ingest_file_history(con, verbose=False, on_total=None, tick=None):
     if on_total:
         on_total(pending)
     if verbose:
-        _log(f"  file-history: {len(records)} records, {pending} new snapshots to read")
+        _log(f"  file-history: {len(records)} records, {pending} new snapshots to read"
+             + (" (full pass)" if full else ""))
 
     new_rows, new_count = [], 0
     # Disk-reading passes only when the file-history dir still exists. When it has
@@ -1223,7 +1368,7 @@ def ingest_file_history(con, verbose=False, on_total=None, tick=None):
     # already preserved as blobs, so we skip straight to promotion + emit below so
     # deferred resolution of the stored rows keeps working.
     if FILE_HISTORY_DIR.exists():
-        for (sid, ph, ver), (bfn, btime, key) in records.items():
+        for (sid, ph, ver), (bfn, btime, _key, _rpd) in records.items():
             if (sid, ph, ver) in existing:
                 continue                   # immutable: never re-read
             if tick:
@@ -1240,9 +1385,10 @@ def ingest_file_history(con, verbose=False, on_total=None, tick=None):
             new_rows.append(_fh_row(sid, ph, ver, sha, ts, note))
             new_count += 1
 
-        # Fallback for on-disk files with no trackedFileBackups entry (transcript
-        # gone; 0 today). Uses mtime (UTC-normalized) since backupTime is unavailable.
-        for f in FILE_HISTORY_DIR.glob("*/*"):
+        # Full pass only: on-disk files no stored line names (transcript gone, a
+        # delta line stored before its payload was kept, or a file written just
+        # before its line). Uses mtime (UTC-normalized) since backupTime is unknown.
+        for f in (FILE_HISTORY_DIR.glob("*/*") if full else ()):
             m = _FH_NAME_RE.match(f.name)
             if not m:
                 continue
@@ -1264,29 +1410,28 @@ def ingest_file_history(con, verbose=False, on_total=None, tick=None):
             _insert_file_history(con, new_rows)
 
     # Promotion (deferred resolution) + emit. Runs regardless of the dir's presence
-    # (so pruned-dir rows still resolve), gated on new work or any unresolved row so
-    # an idle --watch sweep does nothing here. Count every path-less row, not just
-    # the ones with a blob: a binary-skipped row (sha NULL) still needs its path
-    # backfilled, and dropping the sha condition keeps the promotion pass alive until
-    # it is learned (the emit query below still filters sha IS NOT NULL).
-    unresolved = con.execute(
-        "SELECT count(*) FROM file_history WHERE path IS NULL").fetchone()[0]
-    resolved = 0
-    if new_rows or unresolved:
-        known = _known_paths(con)
-        # Augment the reverse index with self-describing absolute keys, so an
-        # absolute-key path that was never seen in an event still resolves.
-        for (sid, ph, ver), (bfn, btime, key) in records.items():
-            if ph not in known and isinstance(key, str) and os.path.isabs(key) \
-                    and _sha(key)[:16] == ph:
-                known[ph] = key
-        for (ph,) in con.execute(
-                "SELECT DISTINCT pathhash FROM file_history WHERE path IS NULL").fetchall():
-            p = known.get(ph)
-            if p is not None:
-                con.execute("UPDATE file_history SET path=? WHERE pathhash=? AND path IS NULL",
-                            [p, ph])
+    # (so pruned-dir rows still resolve). Every path-less row counts, not just the
+    # ones with a blob: a binary-skipped row (sha NULL) still needs its path
+    # backfilled (the emit query still filters sha IS NOT NULL). The full pass
+    # retries every one; the incremental pass only the pathhashes its records
+    # name, and pays for `_known_paths` only for a row it inserted itself, so a
+    # row nothing can resolve costs the 30s runs nothing and waits for the next
+    # full pass, which is also where a path revealed by a later event is found.
+    if full:
+        targets = {ph for (ph,) in con.execute(
+            "SELECT DISTINCT pathhash FROM file_history WHERE path IS NULL").fetchall()}
+        _resolve_fh_paths(con, records, targets)
         resolved = _emit_file_history_versions(con)
+    elif records:
+        targets = {ph for (ph,) in con.execute(
+            "SELECT DISTINCT pathhash FROM file_history "
+            "WHERE path IS NULL AND pathhash IN (SELECT unnest(?))",
+            [sorted({pk[1] for pk in records})]).fetchall()}
+        inserted = {r["pathhash"] for r in new_rows}
+        resolved_phs = _resolve_fh_paths(con, records, targets, scan_for=inserted)
+        resolved = _emit_file_history_versions(con, inserted | resolved_phs)
+    else:
+        resolved = 0
 
     # With a progress driver attached (cmd_ingest), stay silent here so this print
     # cannot corrupt the live bar; cmd_ingest reports the counts after it closes.
@@ -1350,20 +1495,21 @@ def prune_raw_events(con):
     """Clear the verbatim `raw` payload of every raw_events row the store never
     reads back, keeping the lightweight (uuid, type, ts, session) index row.
 
-    Only file-history-snapshot lines are read after ingest (`_snapshot_records`);
-    everything else duplicates the on-disk transcript and the `events` projection.
-    Malformed lines (type IS NULL) keep their raw too. The `type <> '...'` filter
-    is NULL-safe on purpose: `NULL <> 'x'` is NULL, so malformed rows are skipped
-    (raw retained). Returns (rows_cleared, bytes_cleared). The caller must compact
-    afterwards for the space to actually return to the OS (a DuckDB UPDATE only
-    frees blocks). Idempotent: a second run clears 0 rows."""
+    Only file-history snapshot and delta lines are read after ingest
+    (`_snapshot_records`); everything else duplicates the on-disk transcript and
+    the `events` projection. Malformed lines (type IS NULL) keep their raw too.
+    The `type NOT IN (...)` filter is NULL-safe on purpose: `NULL NOT IN (...)` is
+    NULL, so malformed rows are skipped (raw retained). Returns (rows_cleared,
+    bytes_cleared). The caller must compact afterwards for the space to actually
+    return to the OS (a DuckDB UPDATE only frees blocks). Idempotent: a second run
+    clears 0 rows."""
+    keep = "type NOT IN ('file-history-snapshot', 'file-history-delta')"
     rows, nbytes = con.execute(
         "SELECT count(*), coalesce(sum(octet_length(encode(raw))), 0) "
-        "FROM raw_events WHERE raw IS NOT NULL AND type <> 'file-history-snapshot'"
+        f"FROM raw_events WHERE raw IS NOT NULL AND {keep}"
     ).fetchone()
     if rows:
-        con.execute("UPDATE raw_events SET raw = NULL "
-                    "WHERE raw IS NOT NULL AND type <> 'file-history-snapshot'")
+        con.execute(f"UPDATE raw_events SET raw = NULL WHERE raw IS NOT NULL AND {keep}")
     return rows, nbytes
 
 
@@ -1629,10 +1775,23 @@ def cmd_ingest(argv):
     _log(f"ingest start: {STORE_PATH} (mode {mode})")
     sweep = 0
     stored_anything = False   # drives the end-of-run CHECKPOINT (see _checkpoint_due)
+    next_full_fh = 0.0        # --watch: when its next file-history full pass is due
     try:
         while True:
             sweep += 1
             t0 = time.monotonic()
+            # The file-history FULL pass (every stored snapshot/delta payload plus
+            # the orphan glob, see ingest_file_history) runs only where a second of
+            # CPU is affordable: --compact (hourly, from the wrapper) and
+            # --file-history-only, which also has no sweep to collect from. A
+            # --watch process holds the store, so no --compact run ever reaches
+            # it: it takes the full pass on its first sweep and then once per
+            # FILE_HISTORY_FULL_INTERVAL. Every other sweep is incremental: it
+            # parses only the snapshot/delta lines it just stored.
+            full_fh = fh_only or compact or (watch and t0 >= next_full_fh)
+            if full_fh and watch:
+                next_full_fh = t0 + FILE_HISTORY_FULL_INTERVAL
+            fh_records = None if full_fh else {}
             before = _table_counts(con)
             files = changed = lines = cwd_filled = 0
             t_tx = 0.0
@@ -1642,7 +1801,8 @@ def cmd_ingest(argv):
                     prog.start_transcripts(len(paths))
                     s = time.monotonic()
                     files, changed, lines = _sweep_transcripts(
-                        con, paths=paths, verbose=file_verbose, tick=prog.tick_transcript)
+                        con, paths=paths, verbose=file_verbose, tick=prog.tick_transcript,
+                        fh_records=fh_records)
                     # In-place backfill of sessions.cwd for rows ingested before it
                     # was written, and for rows whose sweep read started mid-file
                     # (which writes no cwd). Reuses the swept path list; only rows
@@ -1654,7 +1814,8 @@ def cmd_ingest(argv):
                 s = time.monotonic()
                 fh_new, fh_resolved = ingest_file_history(
                     con, verbose=file_verbose,
-                    on_total=prog.start_file_history, tick=prog.tick_file_history)
+                    on_total=prog.start_file_history, tick=prog.tick_file_history,
+                    records=fh_records)
                 t_fh = time.monotonic() - s
             after = _table_counts(con)
             delta = {k: after.get(k, 0) - before.get(k, 0) for k in after}
@@ -1669,7 +1830,8 @@ def cmd_ingest(argv):
                     _log(f"transcripts: {changed}/{files} changed, +{lines} lines")
                 if cwd_filled:   # silent on every later run: nothing is NULL any more
                     _log(f"sessions: {cwd_filled} cwd backfilled")
-                _log(f"file-history: {fh_new} new snapshots, {fh_resolved} resolved")
+                _log(f"file-history: {fh_new} new snapshots, {fh_resolved} resolved"
+                     + (" (full pass)" if full_fh else ""))
                 _log("stored: " + ", ".join(
                     f"+{delta.get(k, 0)} {k}" for k in _INGEST_COUNT_TABLES if k in after))
                 _log(f"sweep {sweep} done in {elapsed:.1f}s "
