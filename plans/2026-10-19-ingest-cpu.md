@@ -124,7 +124,12 @@ Evidence:
   - `ingest_transcript` already sees every `file-history-snapshot` line it inserts. Collect
     those payloads in the sweep and hand them to `ingest_file_history`, which parses only
     them and no longer calls `_snapshot_records` on every run.
-  - Resolve new rows from their own absolute key first. Run the full `_known_paths` scan
+  - Collect the `file-history-delta` lines the same way (decided 2026-10-19). They carry
+    their own `realParentDir`, and today they enter only through the orphan glob, so without
+    this about 8% of new snapshots would wait up to an hour for the full pass.
+  - Resolve new rows from their own absolute key first, then through `realParentDir`,
+    `sessions.cwd` plus the relative key, or an earlier row with the same pathhash. Phase 0
+    found these cover all 659 new rows of the last 7 days. Run the full `_known_paths` scan
     only when a row is still unresolved after that.
   - The full pass moves to the runs that can afford it: `--compact` (hourly) and
     `--file-history-only`. The full pass is every snapshot payload plus the orphan glob at
@@ -158,9 +163,22 @@ Evidence:
   - Tests: migration from a schema 2 store, `cat` and `diff` byte-identical before and
     after, and an idempotent re-ingest. 39 tests in `tests/test_store.py` mention blobs.
   - Expected:
-    - The 5-minute flush drops from 4.7 s CPU and 16 s wall to about 1 s.
+    - The 5-minute flush drops from 5.2 to about 1.8 s CPU and from 1,072 to 303 MB
+      written (phase 0). The rest is the `events` row-group rewrite, which phase 4b targets.
     - The hourly compaction drops from 18 to 20 s CPU and a 6 GB peak to a few seconds.
     - The store shrinks from 3.1 GB to about 2 GB, plus a blob file of about 0.2 GB.
+- [ ] 4b. Smaller row groups on the writer (decided 2026-10-19, runs after phase 4)
+  - Phase 0: an ordinary flush also rewrites the last row group of `events` (90k rows, about
+    237 MB). `ATTACH ... (ROW_GROUP_SIZE 2048)` cut a typical flush on the bench copy to
+    0.60 s CPU and 81 MB written. The setting is not stored in the file, so every writer
+    open (`connect_writer`, `compact_db`) must pass it.
+  - Pick the size by measurement on the bench copy (2048 and one or two larger values):
+    flush CPU and bytes written, plus the read latency of `prompt_turns`, `turn_actions`,
+    `search`, `tokens` and `stats` against today's layout. Keep the change only if no read
+    gets more than 20% slower; otherwise record the numbers here and drop the phase.
+  - Check what `--compact` does to the layout, and that read-only opens need nothing new.
+  - Tests: every writer open passes the setting, and a flush after one appended row rewrites
+    only the small last group (by bytes written or `pragma_storage_info`).
 - [ ] 5. Exit early when nothing changed (optional)
   - Before importing duckdb, scan `~/.claude/projects` with `os.scandir` (about 1k files,
     a few ms) and compare the newest transcript mtime with a run stamp. If nothing is newer
@@ -213,7 +231,8 @@ CLAUDE_TRAIL_DB=/mnt/fast/claude-trail/trail.duckdb flock -w 60 /mnt/fast/claude
 
 ## Open decisions
 
-1. Blob store format for phase 4: SQLite (recommended) or one file per blob.
+1. Decided 2026-10-19: blobs go to SQLite (phase 4), then smaller row groups (phase 4b).
+   Phase 3 also reads `file-history-delta` lines.
 2. Whether phase 5's early exit is worth a second code path, once phases 1 to 3 have
    brought an idle run down to about 0.5 s.
 3. Keep the 30s cadence. Phases 1 to 3 make a run cheap enough that a slower timer would
