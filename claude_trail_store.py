@@ -173,10 +173,11 @@ def _set_schema_version(con):
 # `raw_events` group and the only `api_requests` group: about 378 MB written and
 # 3 s CPU per flush on a copy of the real store (2026-10-20). At 8192 the same
 # flush writes about 87 MB in 0.6 s. Reads after repeated compactions: the
-# Prompts list 4x faster (finer zone maps), the others at most 12% slower
-# (`search`). 2048 flushed a little cheaper but failed that: from the second
-# compaction on, its small segments scatter over many blocks and `turn_actions`
-# read 43% slower. DuckDB 1.5 keeps the size per attached database, not in the
+# Prompts list 4x faster (finer zone maps), the other reads up to 15% slower,
+# except `prompt_for_command` on a subagent row at about 20% (4 ms); per-read
+# numbers in plans/2026-10-19-ingest-cpu.md, phase 4b. 2048 flushed a little
+# cheaper but failed on reads: from the second compaction on, its small segments
+# scatter over many blocks and `turn_actions` read 43% slower. DuckDB 1.5 keeps the size per attached database, not in the
 # file, and has no connect-time setting for it. A writer that opens the store
 # plainly appends into the last group until it holds 122,880 rows, and its
 # first CHECKPOINT that writes anything merges every table's small groups back

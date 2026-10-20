@@ -134,7 +134,9 @@ whole row group new rows land in. At DuckDB's default (122,880) every flush
 rewrote the last `events`, `raw_events` and `api_requests` groups: about 378 MB
 and 3 s CPU on a copy of the real store, against about 87 MB and 0.6 s at 8192
 (2026-10-20). Reads after repeated compactions: the Prompts list 4x faster, the
-rest at most 12% slower (`search`); 2048 was rejected because from the second
+other reads up to 15% slower, except `prompt_for_command` on a subagent row at
+about 20% (4 ms), so the whole command modal on such a row is 12 to 15% slower
+(phase 4b of `plans/2026-10-19-ingest-cpu.md`). 2048 was rejected: from the second
 compaction on its `turn_actions` read 43% slower. DuckDB 1.5 does not keep the
 size in the file and has no connect-time setting for it, so **every writer open
 must pass it**: `_open_writer` (used by `connect()` and the reopen after a blob

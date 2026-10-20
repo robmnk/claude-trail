@@ -1,7 +1,9 @@
+import contextlib
 import importlib
 import importlib.util
 import json
 import os
+import select
 import sqlite3
 import subprocess
 import sys
@@ -5431,6 +5433,33 @@ def test_no_store_open_bypasses_the_row_group_size():
     assert all("READ_ONLY" in ln or "ROW_GROUP_SIZE" in ln for ln in attaches), attaches
 
 
+@contextlib.contextmanager
+def _store_held_elsewhere(script, *args, env=None, timeout=30):
+    """Run `script` in another Python process and yield the first line it
+    prints, which it does once it holds the store; it lets go when its stdin
+    closes. Bounded both ways: a child that dies or stays silent fails the test
+    with its stderr instead of hanging it, and one that does not exit after
+    stdin closes is killed."""
+    with subprocess.Popen([sys.executable, "-c", script, *map(str, args)],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True, env=env) as proc:
+        try:
+            ready, _, _ = select.select([proc.stdout], [], [], timeout)
+            line = proc.stdout.readline() if ready else ""
+            if not line:
+                proc.kill()
+                _, err = proc.communicate(timeout=timeout)
+                pytest.fail(f"the holder never took the store:\n{err}")
+            yield line.rstrip("\n")
+        finally:
+            proc.stdin.close()
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+
 def test_connect_writer_skips_a_store_another_process_holds(tmp_path, monkeypatch):
     """The writer's ATTACH meets another process's lock with the same error as a
     direct open did, so connect_writer still skips (None) instead of raising."""
@@ -5440,12 +5469,31 @@ def test_connect_writer_skips_a_store_another_process_holds(tmp_path, monkeypatc
               "con = duckdb.connect(sys.argv[1], read_only=True)\n"
               "print('held', flush=True)\n"
               "sys.stdin.read()\n")
-    proc = subprocess.Popen([sys.executable, "-c", reader, str(store.STORE_PATH)],
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-    try:
-        assert proc.stdout.readline() == "held\n"
+    with _store_held_elsewhere(reader, store.STORE_PATH) as line:
+        assert line == "held"
         assert store.connect_writer(attempts=1, delay=0) is None
-    finally:
-        proc.stdin.close()
-        proc.wait(timeout=30)
     store.connect_writer(attempts=1).close()                  # free again once it exits
+
+
+def test_a_reader_meets_the_attached_writers_lock(tmp_path, monkeypatch, capsys):
+    """The reverse direction: another process holds the store through the real
+    writer path (`connect()`, so the ATTACH with ROW_GROUP_SIZE holds the lock).
+    A read-only open here fails with an error `is_lock_conflict` matches, and a
+    CLI read turns it into the `store busy` line instead of a traceback."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    writer = ("import sys\n"
+              "sys.path.insert(0, sys.argv[1])\n"
+              "import claude_trail_store as store\n"
+              "con = store.connect()\n"
+              "print(con.execute('SELECT current_database()').fetchone()[0], flush=True)\n"
+              "sys.stdin.read()\n")
+    env = {**os.environ, "CLAUDE_TRAIL_DB": str(store.STORE_PATH)}
+    repo = Path(store.__file__).resolve().parent
+    with _store_held_elsewhere(writer, repo, env=env) as catalog:
+        assert catalog == store._WRITER_CATALOG                 # the attached writer holds it
+        with pytest.raises(Exception) as exc:
+            store.connect(read_only=True)
+        assert store.is_lock_conflict(exc.value), exc.value
+        assert store.cli_main(["stats"]) == 1
+        assert "store busy" in capsys.readouterr().err
+    store.connect(read_only=True).close()                     # free again once it exits
