@@ -1,0 +1,37 @@
+# Phase 4b review: Smaller row groups on the writer
+
+Verdict: clean
+Diff: main...phase-4b-row-groups (49300a6), 3 files, +249/-5
+
+## Blockers
+
+none
+
+## Major
+
+none
+
+## Minor
+
+- `CLAUDE.md:137` (and the matching comment at `claude_trail_store.py:176`): "the rest at most 12% slower (`search`)" holds only for the five benchmarked reads in the interleaved run. Measured on bench copies (default layout vs 8192 compacted twice, interleaved warm medians, 15 to 24 rounds, `reads_missed.py` and `reads_modal.py`): `prompt_for_command` on a recent subagent row +17 to +20% (21.5 to 25.7 ms), `session_token_totals` +12%, `command_tokens_for` +10%; the implementer's own round 2 has `stats` at +15% and `turn_actions` at +12 to +14%. The whole command modal (one open, tokens plus prompt) is +12 to +15% on subagent rows and flat on main-thread rows, so the plan's 20% bar still holds for what a user sees. Fix: say "the benchmarked reads at most 12 to 15% slower; the command modal's subagent prompt lookup about 20% (4 ms)", and record the same numbers in the plan's phase 4b results.
+- `tests/test_store.py:5434` (`test_connect_writer_skips_a_store_another_process_holds`): only one lock direction is tested for real (reader holds, writer skips). The other direction (the attached writer holds, a reader in another process gets an error `is_lock_conflict` matches, so the TUI shows "store busy") is covered only by mocked exceptions. A probe confirms it works on DuckDB 1.5.6. Fix: add the reverse half: a subprocess holds `store.connect()`, then assert `store.connect(read_only=True)` raises and `store.is_lock_conflict(exc)` is True.
+
+## Nits / follow-ups
+
+- `tests/test_store.py:5427`: the source guard is line based, so it misses a plain writer on the same line as a read-only open (`duckdb.connect(p, read_only=True) if read_only else duckdb.connect(p)` passes; first mutation in Notes), `__import__("duckdb").connect(p)` (second mutation), and `ATTACH DATABASE '...'` / `ATTACH IF NOT EXISTS '...'`, which do not contain `ATTACH '`. The behaviour test kills both, so this is a backstop gap only. Optional fix: match `ATTACH\b` with a regex and require each `duckdb.connect(` call (not line) to be `()` or carry `read_only=True`, for example by scanning the AST.
+- `claude_trail_store.py:190` `_open_writer`: the docstring does not say that a second open of the same file in the same process (writer or read-only) now raises `BinderException: Unique file handle conflict`, not a lock error, where a second plain writer used to share DuckDB's instance cache. No current code path does that (all TUI opens are read-only and in another process; `_move_blobs`, `cmd_ingest --compact` and `prune-raw` close before `compact_db`), but a future helper or test would get a confusing error that `connect_writer` re-raises. Fix: one sentence in the docstring.
+- `claude_trail_store.py:1954` `compact_db` (pre-existing, not introduced here): its in-memory driver still spills to `.tmp` under the process cwd (the home dir under the systemd user unit), which is the very case `_open_writer` now fixes for the writer. Compaction is the biggest memory user (2.0 to 2.9 GB peak). Follow-up: `SET temp_directory = '<store>.tmp'` there too.
+- `tests/test_store.py:5306` `_assert_writes_small_groups`: it proves new groups stay at or below ROW_GROUP_SIZE, but not that full 8192-row groups are left alone on an all-8192 layout (the production steady state after `--compact`). DuckDB decides that, and the bench's 87 MB per flush shows it, so this is a gap in the test, not in the code.
+
+## Notes
+
+- Scope matches the phase 4b spec (`plans/2026-10-19-ingest-cpu.md:170`): size picked by measurement (2048, 8192, 16384, plus 2048 after repeated compactions), flush and the five named reads measured, `--compact` writes the new size, read-only opens unchanged, both spec tests present. No scope creep. The phase 4b results are not yet in the plan; record them there in a plan-only commit, as phase 0 did.
+- Every read-write open goes through the size: `connect()` writer (so `connect_writer`, `cmd_ingest` one-shot, `--watch`, the `--detach` worker, `--file-history-only`, `prune-raw`), the `_move_blobs` reopen, and `compact_db`'s destination (so `--compact`, `prune-raw` and the post-move compaction). `reset-db` opens nothing; `claude_trail.py` opens read-only only. The plain opens left in `tests/test_store.py` (3793, 3968, 4714, 5332, 5353) build fixtures for older releases on purpose.
+- Probes (scratch `/tmp/claude-1000/-home-naka-Projects-personal/71debd6f-0b0b-4f59-b72a-8ca28f60bd1e/scratchpad/review4b/`, store named `foo-store.duckdb` so the catalog differs from `trail`, cwd `/`): a plain `close()` folds the WAL; `PRAGMA disable_checkpoint_on_shutdown` leaves the WAL and the main file byte-identical (the existing throttle test `test_a_throttled_run_really_skips_the_flush` also passes on the branch); with the attached writer held, another process's read-only open raises `Could not set lock` (`is_lock_conflict` True) and its `connect_writer(attempts=1)` returns None; `duckdb_databases()` shows only `trail`, `PRAGMA database_size` returns one row; views created by the `trail` writer bind on a reader whose catalog is `foo-store`. No code uses `current_database()` or a catalog-qualified name.
+- Temp dir: a forced spill (64 MB limit) lands in `<store>.tmp`, not the cwd, and DuckDB removes the dir on close; nothing is created when nothing spills.
+- Plain-writer merge claim verified (`probe_plain_merge.py`): a plain open that writes nothing leaves 8192 groups alone; one that writes anything, even an UPDATE on an unrelated table, merges every table back into 122,880-row groups. CLAUDE.md says "at its first checkpoint"; the code comment's "first CHECKPOINT that writes anything" is the precise form.
+- Mutations (`mut4b.sh`, phase 4b tests only): `connect()` writer back to a plain open, `_move_blobs` reopen plain, `compact_db` dst without the size, no `temp_directory`, no `DETACH memory`, `_open_writer` without the size, and `ROW_GROUP_SIZE = 122880` are all killed. The source guard alone misses the first two; the behaviour tests catch them.
+- Bench credibility: the implementer's raw JSONL supports the summary. Flush at default: 361 to 379 MB and 2.4 to 3.4 s checkpoint CPU; at 8192: 70 to 88 MB and 0.47 to 1.0 s. Interleaved warm medians after 5 compactions at 8192 (`steady4b.jsonl`): prompt_turns 314 to 78 ms, search +12%, tokens +8%, stats +7%, turn_actions +4%. Compaction CPU is noisy (13.8 to 23.3 s on the same layout), so "13.8 to 14.7 s" is the typical value, not a bound; peak 2.9 to 2.04 GB holds on every run after the first at 8192. 8192 over 16384: same reads, about 17 MB less per flush. 8192 over 2048: 2048's turn_actions is 43 to 56% slower after two or more compactions.
+- Tests: 907 passed (`TMPDIR=$HOME/.cache/pytest-tmp .venv/bin/python -m pytest tests/ -q`, 45 s). The new tests fail on main's behaviour (mutations above), and the first one also needs `ROW_GROUP_SIZE`, which main lacks.
+- Deploy expectation: the first flushes after `uv tool install` append 8192-row groups after the existing 122,880-row ones and leave those alone (`test_a_flush_after_one_row_rewrites_only_the_small_last_group`); the first hourly `--compact` splits the whole store. A rollback to an older build costs one full rewrite at its first flush, then the old behaviour.
+- Bench copies made for this review (`rv4b-*` in `/mnt/fast/claude-trail-bench/`) are deleted; the base files are unchanged.
