@@ -179,6 +179,24 @@ Evidence:
   - Check what `--compact` does to the layout, and that read-only opens need nothing new.
   - Tests: every writer open passes the setting, and a flush after one appended row rewrites
     only the small last group (by bytes written or `pragma_storage_info`).
+  - Results (2026-10-20, bench copies of the store just after the phase 4 migration, layouts
+    after 3 to 5 hourly-style compactions at each size):
+
+    | Size | Flush CPU | Flush written | Compaction CPU | Compaction peak | Worst read |
+    |---|---|---|---|---|---|
+    | default 122,880 | 2.98 s | 378 MB | 13.8 s | 2.9 GB | baseline |
+    | 2048 | 0.52 s | 59 MB | 21.8 s | 2.7 GB | `turn_actions` +43%, `stats` +26% |
+    | 8192 (chosen) | 0.58 s | 87 MB | 14.7 s | 2.04 GB | `search` +12% |
+    | 16384 | 0.91 s | 105 MB | 15.4 to 18.0 s | 2.1 GB | `search` +11% |
+
+    - 2048 looked fine after one compaction and failed from the second on, as its small
+      segments spread over many more blocks.
+    - At 8192, `prompt_turns` is 75% faster (314 to 78 ms). The review measured reads the
+      bench missed: `prompt_for_command` on subagent rows +17 to +20% (about 4 ms),
+      `session_token_totals` +12%, `command_tokens_for` +10%, `stats` up to +15%; the whole
+      command modal +12 to +15%, so within the 20% rule.
+    - A plain read-write open that writes anything merges every table back to 122,880-row
+      groups (about one full rewrite); the next `--compact` splits them again.
 - [ ] 5. Exit early when nothing changed (optional)
   - Before importing duckdb, scan `~/.claude/projects` with `os.scandir` (about 1k files,
     a few ms) and compare the newest transcript mtime with a run stamp. If nothing is newer
