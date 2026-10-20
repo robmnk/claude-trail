@@ -66,7 +66,31 @@ Evidence:
 
 ## Phases
 
-- [ ] 0. Measure (no code)
+- [x] 0. Measure (no code)
+  - Results (2026-10-19, DuckDB 1.5.6, bench copy kept at
+    `/mnt/fast/claude-trail-bench/baseline.duckdb`):
+    - All 10,434 `blobs` rows sit in 1 row group (733 MiB, uncompressed). On the bench copy,
+      CHECKPOINT after one 7.5 KB blob writes 769 MB, against 38 MB after 100 `raw_events`
+      rows: 2.32 against 0.42 s CPU. A plain `con.close()` costs the same as the explicit
+      CHECKPOINT. In production, the 38 flushes whose window held a new blob took a median
+      12 s, and the 17 without one took 1 s. Phase 4 gate: passed.
+    - Blobs are not the only rewrite: an ordinary run's `events` append rewrites that table's
+      last row group (90k rows, about 237 MB). Phase 4 alone cuts a typical flush from 1,072
+      to 303 MB written and from 5.2 to 1.8 s CPU, not to near zero.
+    - `ATTACH ... (ROW_GROUP_SIZE 2048)` brought a typical flush to 0.60 s CPU and 81 MB
+      written, but the setting is not saved in the file, so every writer open must pass it.
+    - Over the last 7 days, 553 of 659 new `file_history` rows (84%) resolve from their own
+      absolute key. The other 106 need no `_known_paths` scan either: 54 through
+      `realParentDir`, 50 through `sessions.cwd` plus the relative key, 2 through an earlier
+      row with the same pathhash. 0 stay unresolved. Phase 3 gate: passed.
+    - `file-history-delta` lines carry their own `realParentDir`, but the store does not keep
+      their payload; they enter only through the orphan glob. If phase 3 moves the glob to
+      the hourly pass without reading these lines, about 8% of new snapshots wait up to 1 h.
+    - Journal baseline, 09:55 to 10:55 after the part 1 deploy: 113 runs, 2.83 s CPU per run
+      on average (median 2.02), 9.0% of one core. 104 skipped-flush runs averaged 2.03 s, 8
+      flushes 8.92 s, and the one compaction 36.8 s at a 6.45 GB peak.
+    - Open: production blob flushes take 12 s wall against 1.2 to 2.5 s on the bench with
+      the same CPU, so the extra time is waiting. CPU contention was not tested.
   - Copy the store to `/mnt/fast/claude-trail-bench/` (342 GB free). On the copy, time a
     `CHECKPOINT` after inserting (a) one blob, (b) 100 `raw_events` rows with no blob, and
     (c) both. Record wall time, CPU and the file growth.
@@ -74,7 +98,7 @@ Evidence:
     `_known_paths` scan. This decides whether phase 3 can skip the scan in the common case.
   - Record one hour of `Consumed` lines from the journal as the baseline (see Verify).
   - Gate: phase 4 goes ahead only if (a) costs far more than (b).
-- [ ] 1. One state query per sweep instead of one per transcript
+- [x] 1. One state query per sweep instead of one per transcript
   - `_sweep_transcripts` (`claude_trail_store.py:701`) loads `ingest_state` once into a
     `{path: offset}` dict and passes each transcript its offset. A transcript whose size
     equals its offset is skipped after its `stat`, with no query.
