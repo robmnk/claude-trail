@@ -109,7 +109,7 @@ Evidence:
       a wrapping connection).
     - Truncation and new-file behaviour are unchanged.
   - Expected saving: about 0.4 s per run.
-- [ ] 2. Stop DuckDB's pandas probe in the ingest process
+- [x] 2. Stop DuckDB's pandas probe in the ingest process
   - Before the first `import duckdb` in `cmd_ingest`: if
     `importlib.util.find_spec("pandas")` is None, set `sys.modules["pandas"] = None`. A
     blocked import then fails at once instead of searching `sys.path`. If pandas is
