@@ -141,7 +141,7 @@ Evidence:
     - The full pass still picks up an orphan file and a snapshot inserted by an earlier
       crashed run.
   - Expected saving: 0.4 to 0.6 s per run.
-- [ ] 4. Move blob content out of DuckDB (only if phase 0 confirms the cause)
+- [x] 4. Move blob content out of DuckDB (only if phase 0 confirms the cause)
   - Store content in SQLite (stdlib `sqlite3`) at `<store>.blobs.sqlite`: table
     `blobs(sha TEXT PRIMARY KEY, size INTEGER, content BLOB)`, zlib-compressed, WAL mode.
     An insert costs the size of that blob, and nothing gets rewritten at checkpoint.
