@@ -167,7 +167,7 @@ Evidence:
       written (phase 0). The rest is the `events` row-group rewrite, which phase 4b targets.
     - The hourly compaction drops from 18 to 20 s CPU and a 6 GB peak to a few seconds.
     - The store shrinks from 3.1 GB to about 2 GB, plus a blob file of about 0.2 GB.
-- [ ] 4b. Smaller row groups on the writer (decided 2026-10-19, runs after phase 4)
+- [x] 4b. Smaller row groups on the writer (decided 2026-10-19, runs after phase 4)
   - Phase 0: an ordinary flush also rewrites the last row group of `events` (90k rows, about
     237 MB). `ATTACH ... (ROW_GROUP_SIZE 2048)` cut a typical flush on the bench copy to
     0.60 s CPU and 81 MB written. The setting is not stored in the file, so every writer
