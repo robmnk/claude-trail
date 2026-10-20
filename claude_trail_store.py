@@ -577,14 +577,41 @@ def _table_counts(con):
 # skipped flush costs a slightly larger `.wal`, never data.
 CHECKPOINT_MIN_INTERVAL = 300.0  # seconds between ingest-driven flushes
 
-# How often a --watch process runs the file-history full pass (one-shot runs
-# leave it to --compact, which the wrapper adds hourly). See cmd_ingest.
+# How often an ingest run also takes the file-history FULL pass (every stored
+# snapshot/delta payload plus the orphan glob, see ingest_file_history). Time
+# based, so every setup gets it: the wrapper, plain cron, `--detach` and a
+# `--watch` process alike. See _fh_full_due.
 FILE_HISTORY_FULL_INTERVAL = 3600.0
 
 
 def _checkpoint_stamp():
     """Marker whose mtime is the last ingest-driven CHECKPOINT (per store)."""
     return Path(str(STORE_PATH) + ".checkpoint-stamp")
+
+
+def _fh_full_stamp():
+    """Marker whose mtime is the last file-history full pass that finished (per store)."""
+    return Path(str(STORE_PATH) + ".fh-full-stamp")
+
+
+def _fh_full_due(force=False):
+    """Whether this ingest run takes the file-history FULL pass.
+
+    `force` covers `--compact` and `--file-history-only`. Otherwise the pass is
+    due when no full pass is recorded, or the last one finished at least
+    FILE_HISTORY_FULL_INTERVAL ago, or the stamp lies in the future (a clock
+    moved back must not hold the safety net off). cmd_ingest touches the stamp
+    only after the pass returns, so a run that dies, raises or is skipped on a
+    lock leaves the pass due for the next run. A fresh stamp keeps the ordinary
+    30s runs incremental, which is the CPU the incremental pass exists to save.
+    """
+    if force:
+        return True
+    try:
+        age = time.time() - _fh_full_stamp().stat().st_mtime
+    except OSError:
+        return True
+    return not 0 <= age < FILE_HISTORY_FULL_INTERVAL
 
 
 def _wal_path():
@@ -1253,11 +1280,17 @@ def _emit_file_history_versions(con, pathhashes=None):
     highest PRESENT lower version in the same (session_id, pathhash) group (B1:
     never a naive v-1); patch is a difflib unified diff when a predecessor exists.
     Idempotent via the _insert_file_versions anti-join on the synthetic 'fh:'
-    event_id; already-emitted rows are skipped so a re-run does no difflib work.
+    event_id; an already-emitted row whose stored pre_sha still matches the walk
+    is skipped, so a re-run does no difflib work. One whose pre_sha no longer
+    matches is deleted and emitted again: a lower version stored after it was
+    emitted (a run that died between storing a line and parsing it, an orphan
+    the glob found late, a line naming v1 after v3) is its new predecessor, and
+    without this it would keep pre_sha NULL or the wrong patch for good. The
+    rows are derived from file_history, so rewriting them loses nothing.
     `pathhashes` limits the walk to those files (the incremental pass: what it
     inserted or resolved); a group never spans two pathhashes, so each chain is
     still walked whole. None walks every resolved row (the full pass).
-    Returns the number of NEW file_versions rows."""
+    Returns the number of NEW file_versions rows (a re-emitted one is not new)."""
     scope, params = "", []
     if pathhashes is not None:
         if not pathhashes:
@@ -1271,21 +1304,24 @@ def _emit_file_history_versions(con, pathhashes=None):
         " ORDER BY session_id, pathhash, version", params).fetchall()
     if not rows:
         return 0
+    # done[event_id] = the pre_sha it was emitted with
     if pathhashes is None:
-        done = {r[0] for r in con.execute(
-            "SELECT event_id FROM file_versions WHERE source='file-history'").fetchall()}
+        done = dict(con.execute(
+            "SELECT event_id, pre_sha FROM file_versions WHERE source='file-history'").fetchall())
     else:
-        done = {r[0] for r in con.execute(
-            "SELECT event_id FROM file_versions WHERE event_id IN (SELECT unnest(?))",
-            [[f"fh:{sid}:{ph}@v{ver}" for sid, ph, ver, *_ in rows]]).fetchall()}
-    fvs, prev = [], {}     # prev[(session_id, pathhash)] = highest present lower version's sha
+        done = dict(con.execute(
+            "SELECT event_id, pre_sha FROM file_versions WHERE event_id IN (SELECT unnest(?))",
+            [[f"fh:{sid}:{ph}@v{ver}" for sid, ph, ver, *_ in rows]]).fetchall())
+    fvs, prev, stale = [], {}, []   # prev[(session_id, pathhash)] = highest present lower version's sha
     for sid, ph, ver, path, sha, ms in rows:
         gk = (sid, ph)
         pre_sha = prev.get(gk)
         prev[gk] = sha                     # advance for the next present version, even if skipped
         eid = f"fh:{sid}:{ph}@v{ver}"
-        if eid in done:                    # already emitted; skip the difflib recompute
-            continue
+        if eid in done:
+            if done[eid] == pre_sha:       # emitted and still chained right: no difflib recompute
+                continue
+            stale.append(eid)              # a lower version arrived after it was emitted
         patch = None
         if pre_sha is not None and pre_sha != sha:
             pre = con.execute("SELECT content FROM blobs WHERE sha=?", [pre_sha]).fetchone()
@@ -1304,6 +1340,9 @@ def _emit_file_history_versions(con, pathhashes=None):
         return 0
     before = con.execute(
         "SELECT count(*) FROM file_versions WHERE source='file-history'").fetchone()[0]
+    if stale:   # file_versions has no unique key, so the re-emit needs the old row gone
+        con.execute("DELETE FROM file_versions WHERE source='file-history' "
+                    "AND event_id IN (SELECT unnest(?))", [stale])
     _insert_file_versions(con, fvs)
     after = con.execute(
         "SELECT count(*) FROM file_versions WHERE source='file-history'").fetchone()[0]
@@ -1316,20 +1355,29 @@ def ingest_file_history(con, verbose=False, on_total=None, tick=None, records=No
     reconstruct the ~61% of edits that are patch-only in transcripts. Returns
     (new_snapshots, resolved). Never raises on a bad file: skip and continue.
 
-    Two modes, the same rows either way:
+    Two modes:
       * FULL (`records=None`): every snapshot and delta payload in raw_events
         (`_snapshot_records`), the orphan glob over FILE_HISTORY_DIR, a retry of
         every path-less row, and an emit walk over every resolved row. The safety
         net: it catches what the incremental pass cannot see (an orphan file, a
         line stored by a run that died before its parse, a deferred row whose path
-        a later event revealed). Run by `ingest_all`, `--compact` (hourly from the
-        wrapper), `--file-history-only`, and hourly inside a `--watch` process.
+        a later event revealed). Run by `ingest_all`, `--compact`,
+        `--file-history-only`, and by any `cmd_ingest` run once the last one is
+        FILE_HISTORY_FULL_INTERVAL old (`_fh_full_due`).
       * INCREMENTAL (`records` = what this sweep's transcript reads collected, see
         `ingest_transcript`): only those records, no payload read and no glob, and
         only their pathhashes are resolved and emitted. An idle sweep passes an
         empty dict and runs no query at all. Profiled 2026-10-19, the full pass
         cost every run about 0.7 s (6,609 payloads, 32 MB, 110k records) plus
         0.23 s for `_known_paths` whenever one snapshot was new.
+    Once a full pass has run, the rows are the ones a single full pass over the
+    same transcripts and files would leave, including a version stored after a
+    higher one was emitted (the emit walk re-chains it, see
+    `_emit_file_history_versions`). Two differences come from WHEN a file is
+    read, not from the pass: a `<pathhash>@vN` Claude Code rewrote in between
+    (it reuses version numbers after a resume) keeps the bytes and time stored
+    first, and a file the orphan glob stored before its line arrived keeps its
+    mtime as `snapshot_ts` instead of the line's backupTime.
     Snapshots are immutable, so in both modes an already-present PK is skipped
     BEFORE any byte is read/hashed.
     """
@@ -1775,22 +1823,19 @@ def cmd_ingest(argv):
     _log(f"ingest start: {STORE_PATH} (mode {mode})")
     sweep = 0
     stored_anything = False   # drives the end-of-run CHECKPOINT (see _checkpoint_due)
-    next_full_fh = 0.0        # --watch: when its next file-history full pass is due
     try:
         while True:
             sweep += 1
             t0 = time.monotonic()
             # The file-history FULL pass (every stored snapshot/delta payload plus
-            # the orphan glob, see ingest_file_history) runs only where a second of
-            # CPU is affordable: --compact (hourly, from the wrapper) and
-            # --file-history-only, which also has no sweep to collect from. A
-            # --watch process holds the store, so no --compact run ever reaches
-            # it: it takes the full pass on its first sweep and then once per
-            # FILE_HISTORY_FULL_INTERVAL. Every other sweep is incremental: it
-            # parses only the snapshot/delta lines it just stored.
-            full_fh = fh_only or compact or (watch and t0 >= next_full_fh)
-            if full_fh and watch:
-                next_full_fh = t0 + FILE_HISTORY_FULL_INTERVAL
+            # the orphan glob, see ingest_file_history) costs about a second of
+            # CPU, so it runs at most once per FILE_HISTORY_FULL_INTERVAL in
+            # whichever run (or --watch sweep) finds `<store>.fh-full-stamp` due,
+            # and always under --compact and --file-history-only (which has no
+            # sweep to collect from). One rule for every setup: the wrapper, cron,
+            # --detach and --watch. Every other sweep is incremental: it parses
+            # only the snapshot/delta lines it just stored.
+            full_fh = _fh_full_due(force=fh_only or compact)
             fh_records = None if full_fh else {}
             before = _table_counts(con)
             files = changed = lines = cwd_filled = 0
@@ -1817,6 +1862,11 @@ def cmd_ingest(argv):
                     on_total=prog.start_file_history, tick=prog.tick_file_history,
                     records=fh_records)
                 t_fh = time.monotonic() - s
+            if full_fh:   # only once the pass has returned; see _fh_full_due
+                try:
+                    _fh_full_stamp().touch()
+                except OSError:
+                    pass   # a stamp we cannot write just means the next run repeats it
             after = _table_counts(con)
             delta = {k: after.get(k, 0) - before.get(k, 0) for k in after}
             # A backfilled cwd is an UPDATE, so it moves no row count: name it
