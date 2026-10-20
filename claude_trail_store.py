@@ -12,14 +12,17 @@ import os
 import re
 import sys
 import time
+import weakref
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
 STORE_PATH = Path(os.environ.get("CLAUDE_TRAIL_DB", Path.home() / ".claude" / "trail.duckdb"))
-SCHEMA_VERSION = "2"   # 1 -> 2: file_versions.source column + file_history table (Phase 8)
+SCHEMA_VERSION = "3"   # 1 -> 2: file_versions.source column + file_history table (Phase 8)
+                       # 2 -> 3: blob content moved to <store>.blobs.sqlite (_migrate_blobs)
 
 SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value TEXT);  -- {'version':'2'}
+CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value TEXT);  -- {'version':'3'}
 
 -- Lossless source of truth: one row per transcript line, every event type, verbatim.
 -- events / file_versions / sessions below are all derived projections of this.
@@ -93,16 +96,13 @@ CREATE TABLE IF NOT EXISTS file_versions(
 );
 CREATE INDEX IF NOT EXISTS fv_path ON file_versions(path, ts);
 
-CREATE TABLE IF NOT EXISTS blobs(
-  sha     TEXT PRIMARY KEY,     -- sha256 hex of content
-  size    BIGINT,
-  content TEXT                  -- full file content; DuckDB compresses on disk
-);
+-- File contents (the blobs that file_versions.pre_sha/post_sha and file_history.sha
+-- name) live in the SQLite file `<store>.blobs.sqlite`, not here: see _put_blob.
 
 -- One row per ~/.claude/file-history/<session_id>/<pathhash>@vN snapshot (Phase 8).
 -- The bytes are the store's one irreversible-loss input (unlike every raw_events
 -- projection, file-history is cache-like and may be pruned), so they are preserved
--- as blobs here even when `path` is not yet resolvable; resolved rows also surface
+-- as blobs even when `path` is not yet resolvable; resolved rows also surface
 -- through cat via synthetic source='file-history' file_versions rows.
 CREATE TABLE IF NOT EXISTS file_history(
   session_id  TEXT,
@@ -157,7 +157,20 @@ FROM api_requests;
 """
 
 
+def _set_schema_version(con):
+    # DO UPDATE, not DO NOTHING: an existing ('version','1') row would otherwise
+    # pin the DB at '1' forever.
+    con.execute(
+        "INSERT INTO schema_meta VALUES ('version', ?) "
+        "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        [SCHEMA_VERSION],
+    )
+
+
 def connect(read_only: bool = False):
+    """Open the store. A writer (the default) also gets the schema, any pending
+    migration, and its blob file (`_blob_path`), which lives as long as `con`.
+    A reader opens the blob file only when it first reads a blob (`_blob_db`)."""
     import duckdb  # lazy: keeps the TUI/hook free of the duckdb import
     STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(str(STORE_PATH), read_only=read_only)
@@ -167,15 +180,25 @@ def connect(read_only: bool = False):
         # EXISTS above adds file_history, but leaves a pre-existing file_versions
         # untouched, so the new `source` column is added by ADD COLUMN IF NOT
         # EXISTS (idempotent; backfills every existing row with the DEFAULT,
-        # correctly labelling all pre-phase-8 rows 'transcript'). The version seed
-        # must DO UPDATE, not DO NOTHING: an existing ('version','1') row would
-        # otherwise pin the DB at '1' forever.
+        # correctly labelling all pre-phase-8 rows 'transcript').
         con.execute("ALTER TABLE file_versions ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'transcript'")
-        con.execute(
-            "INSERT INTO schema_meta VALUES ('version', ?) "
-            "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-            [SCHEMA_VERSION],
-        )
+        if _duck_has_blobs(con):
+            # Schema 2 -> 3. Records the version itself, in the transaction that
+            # drops the table. The drop frees about as much as the table held,
+            # and only a rewrite gives it back, so compact before the run goes on.
+            try:
+                _migrate_blobs(con)
+            finally:
+                con.close()
+            try:
+                old, new = compact_db()
+                _log(f"blobs: compacted {_fmt_bytes(old)} -> {_fmt_bytes(new)}")
+            except Exception as e:   # the move is done; the hourly --compact retries this
+                _log(f"blobs: compaction after the move failed ({e}); the next --compact reclaims it")
+            con = duckdb.connect(str(STORE_PATH))
+        else:
+            _set_schema_version(con)
+        _attach_blob_writer(con)
     return con
 
 
@@ -559,12 +582,16 @@ _INGEST_COUNT_TABLES = ["raw_events", "events", "api_requests",
 
 
 def _table_counts(con):
-    """Row counts for the ingest-touched tables that currently exist."""
+    """Row counts for the ingest-touched tables that currently exist. `blobs` is
+    the blob file's count once DuckDB no longer has the table (schema 3)."""
     present = {r[0] for r in con.execute(
         "SELECT table_name FROM information_schema.tables "
         "WHERE table_schema='main'").fetchall()}
-    return {t: con.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
-            for t in _INGEST_COUNT_TABLES if t in present}
+    counts = {t: con.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+              for t in _INGEST_COUNT_TABLES if t in present}
+    if "blobs" not in present:
+        counts["blobs"] = blob_count(con)
+    return counts
 
 
 # A CHECKPOINT on a multi-GB store takes seconds (~3.5s at 1 GB) and runs while
@@ -642,9 +669,11 @@ def _checkpoint_due(stored_anything, force=False):
 
 
 def _store_size():
-    """On-disk size of the store file plus its WAL (0 for parts not present)."""
+    """On-disk size of the store: the DuckDB file and its WAL plus the blob file
+    and its WAL (0 for parts not present)."""
     total = 0
-    for p in (STORE_PATH, _wal_path()):
+    blobs = _blob_path()
+    for p in (STORE_PATH, _wal_path(), blobs, Path(str(blobs) + "-wal")):
         try:
             total += p.stat().st_size
         except OSError:
@@ -854,15 +883,288 @@ def ingest_all(con, verbose=False):
 #   toolUseResult alone (files Claude edited, at the ~39% content coverage above).
 
 
+# --- Blob content: a SQLite file next to the store (schema 3) -----------------
+#
+# File contents live in `<store>.blobs.sqlite` (stdlib sqlite3, WAL mode), table
+# blobs(sha TEXT PRIMARY KEY, size INTEGER, content BLOB): content is the
+# zlib-compressed UTF-8 text, sha the same sha256 as before, size the
+# uncompressed byte count. DuckDB keeps only the sha references
+# (file_versions.pre_sha/post_sha, file_history.sha). Until schema 3 they sat in
+# a DuckDB table, all in one row group, and a CHECKPOINT rewrites the whole row
+# group a new row lands in: one 7.5 KB blob made the next flush write 769 MB
+# (measured 2026-10-19). A SQLite insert writes about the size of the row.
+#
+# Write order is the safety property, since file-history backups are deleted by
+# Claude Code later and their blobs cannot be rebuilt: a blob is committed to
+# SQLite BEFORE any DuckDB row names its sha. `_insert_file_versions` and
+# `_insert_file_history`, the only writers of those columns, call
+# `_commit_blobs` first, and synchronous=FULL makes that commit as durable as
+# DuckDB's own. A crash can leave an unreferenced blob (harmless), never a
+# reference without content.
+
+BLOB_ZLIB_LEVEL = 6         # on the real blobs: 729 -> 283 MiB; level 1 gave 15% more at 3x the speed
+_BLOB_MIGRATE_BATCH = 256   # DuckDB rowids per migration batch (a blob averages ~70 KB)
+_BLOB_QUERY_CHUNK = 500     # shas per `IN (...)` lookup
+_DUCK_BLOBS = object()      # _BLOB_DBS value: read the DuckDB `blobs` table (a schema 2 store)
+_BLOB_DBS = weakref.WeakKeyDictionary()   # DuckDB connection -> its blob source
+
+
+class BlobFileMissing(Exception):
+    """The store has no DuckDB `blobs` table (schema 3), and the blob file is gone."""
+
+
+def _blob_path():
+    """The SQLite file holding the blob content of STORE_PATH."""
+    return Path(str(STORE_PATH) + ".blobs.sqlite")
+
+
+def _open_blob_db(read_only=False):
+    """Open the blob file. A writer creates it; a reader opens it read-only
+    (`mode=ro`), which in WAL mode reads the last commit while the writer inserts.
+    Raises BlobFileMissing when a reader finds no file."""
+    import sqlite3  # lazy, like duckdb: the TUI imports this module for its labels
+    path = _blob_path()
+    if read_only:
+        try:
+            return sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        except sqlite3.OperationalError:
+            if path.exists():
+                raise
+            raise BlobFileMissing(
+                f"blob file missing: {path} (the store keeps file contents there)") from None
+    db = sqlite3.connect(path)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=FULL")
+    db.execute("CREATE TABLE IF NOT EXISTS blobs("
+               "sha TEXT PRIMARY KEY, size INTEGER, content BLOB)")
+    return db
+
+
+def _attach_blob_writer(con):
+    """Open the blob file for the writer `con` (see connect). A missing file on a
+    store that already names blobs means their content is gone: say so in the
+    log rather than start an empty file silently."""
+    existed = _blob_path().exists()
+    _register_blob_db(con, _open_blob_db())
+    if not existed and con.execute(
+            "SELECT EXISTS (SELECT 1 FROM file_versions "
+            "               WHERE pre_sha IS NOT NULL OR post_sha IS NOT NULL) "
+            "    OR EXISTS (SELECT 1 FROM file_history WHERE sha IS NOT NULL)").fetchone()[0]:
+        _log(f"warning: blob file {_blob_path()} was missing and has been recreated empty; "
+             f"`cat` cannot print the versions stored before")
+
+
+def _duck_has_blobs(con):
+    """True while the DuckDB store still has its schema 2 `blobs` table."""
+    return con.execute(
+        "SELECT count(*) FROM information_schema.tables "
+        "WHERE table_schema='main' AND table_name='blobs'").fetchone()[0] > 0
+
+
+def _register_blob_db(con, src):
+    """Tie the blob source `src` to the DuckDB connection `con`. A sqlite3
+    connection sits in a reference cycle with its own statement cache, so only
+    the cycle collector would free it; the finalizer closes it as soon as `con`
+    is collected instead (an open writer would also keep its WAL un-checkpointed)."""
+    _BLOB_DBS[con] = src
+    if src is not _DUCK_BLOBS:
+        weakref.finalize(con, src.close)
+
+
+def _blob_db(con):
+    """The blob source for `con`: the writer's SQLite connection (connect()
+    registers it), else, for a reader, the DuckDB `blobs` table while the store
+    is not migrated yet, else the blob file opened read-only. Cached per
+    connection, and closed when `con` is collected or by `_close_blobs`."""
+    src = _BLOB_DBS.get(con)
+    if src is None:
+        src = _DUCK_BLOBS if _duck_has_blobs(con) else _open_blob_db(read_only=True)
+        _register_blob_db(con, src)
+    return src
+
+
+def _close_blobs(con):
+    """Close `con`'s blob connection now rather than when `con` is collected. A
+    writer's uncommitted puts roll back, which loses nothing: no DuckDB row can
+    name them yet."""
+    db = _BLOB_DBS.pop(con, None)
+    if db is not None and db is not _DUCK_BLOBS:
+        db.close()   # the finalizer's later close() is a no-op
+
+
+def _pack_blob(text):
+    """(size, stored bytes) for a blob's text. surrogatepass keeps a lone
+    surrogate (only a malformed JSON escape makes one) instead of raising."""
+    data = text.encode("utf-8", "surrogatepass")
+    return len(data), zlib.compress(data, BLOB_ZLIB_LEVEL)
+
+
+def _unpack_blob(stored):
+    return zlib.decompress(stored).decode("utf-8", "surrogatepass")
+
+
 def _put_blob(con, text):
-    """Content-address `text` into `blobs` (dedup by sha256); return its sha, or
-    None for None input. Empty string is a real blob (sha of "")."""
+    """Content-address `text` into the blob file (dedup by sha256); return its sha,
+    or None for None input. Empty string is a real blob (sha of ""). The row
+    stays uncommitted until `_commit_blobs`, which runs before any DuckDB row can
+    name the sha. Needs the writer connection from connect()."""
     if text is None:
         return None
+    db = _BLOB_DBS.get(con)
+    if db is None or db is _DUCK_BLOBS:
+        raise RuntimeError("blob writes need the writer connection from connect()")
     sha = _sha(text)
-    con.execute("INSERT INTO blobs VALUES (?,?,?) ON CONFLICT (sha) DO NOTHING",
-                [sha, len(text.encode("utf-8", "replace")), text])
+    # Check first so a repeated content (an unchanged file across versions) is
+    # not compressed again; OR IGNORE keeps the insert idempotent regardless.
+    if db.execute("SELECT 1 FROM blobs WHERE sha=?", [sha]).fetchone() is None:
+        db.execute("INSERT OR IGNORE INTO blobs VALUES (?,?,?)", [sha, *_pack_blob(text)])
     return sha
+
+
+def _commit_blobs(con):
+    """Commit the blobs put since the last commit. Called by every insert that
+    writes a sha reference into DuckDB, before it does (see the section note)."""
+    db = _BLOB_DBS.get(con)
+    if db is not None and db is not _DUCK_BLOBS and db.in_transaction:
+        db.commit()
+
+
+def _chunks(items, n=_BLOB_QUERY_CHUNK):
+    items = list(items)
+    for i in range(0, len(items), n):
+        yield items[i:i + n]
+
+
+def blob_texts(con, shas):
+    """{sha: text} for those of `shas` the store holds (a missing one is absent).
+    The result holds every text at once, so callers pass a few shas at a time.
+    Raises BlobFileMissing on a migrated store whose blob file is gone."""
+    src = _blob_db(con)
+    out = {}
+    for chunk in _chunks(sorted({s for s in shas if s})):
+        if src is _DUCK_BLOBS:
+            out.update(con.execute("SELECT sha, content FROM blobs WHERE sha IN (SELECT unnest(?))",
+                                   [chunk]).fetchall())
+        else:
+            out.update((sha, _unpack_blob(c)) for sha, c in src.execute(
+                f"SELECT sha, content FROM blobs WHERE sha IN ({','.join('?' * len(chunk))})",
+                chunk))
+    return out
+
+
+def blob_sizes(con, shas):
+    """{sha: uncompressed size} for those of `shas` the store holds."""
+    src = _blob_db(con)
+    out = {}
+    for chunk in _chunks(sorted({s for s in shas if s})):
+        if src is _DUCK_BLOBS:
+            out.update(con.execute("SELECT sha, size FROM blobs WHERE sha IN (SELECT unnest(?))",
+                                   [chunk]).fetchall())
+        else:
+            out.update(src.execute(
+                f"SELECT sha, size FROM blobs WHERE sha IN ({','.join('?' * len(chunk))})",
+                chunk).fetchall())
+    return out
+
+
+def blob_count(con):
+    """Number of stored blobs (the `stored:` line of an ingest run counts them)."""
+    src = _blob_db(con)
+    sql = "SELECT count(*) FROM blobs"
+    return (con if src is _DUCK_BLOBS else src).execute(sql).fetchone()[0]
+
+
+def blob_totals(con):
+    """(blob count, uncompressed bytes), what `stats` prints for `blobs / bytes`."""
+    src = _blob_db(con)
+    sql = "SELECT count(*), coalesce(sum(size), 0) FROM blobs"
+    return tuple((con if src is _DUCK_BLOBS else src).execute(sql).fetchone())
+
+
+def _duck_blob_batches(con, shas=None):
+    """The DuckDB `blobs` rows as lists of (sha, size, content): by rowid range,
+    so no query materialises the whole table (733 MiB on the real store), or only
+    `shas`. Memory stays at one batch on the Python side."""
+    if shas is not None:
+        for chunk in _chunks(sorted(shas), _BLOB_MIGRATE_BATCH):
+            yield con.execute("SELECT sha, size, content FROM blobs "
+                              "WHERE sha IN (SELECT unnest(?))", [chunk]).fetchall()
+        return
+    hi = con.execute("SELECT max(rowid) FROM blobs").fetchone()[0]
+    for lo in range(0, -1 if hi is None else hi + 1, _BLOB_MIGRATE_BATCH):
+        yield con.execute("SELECT sha, size, content FROM blobs WHERE rowid >= ? AND rowid < ?",
+                          [lo, lo + _BLOB_MIGRATE_BATCH]).fetchall()
+
+
+def _blob_copy_mismatches(con, db, shas=None):
+    """The shas of DuckDB `blobs` rows the blob file does not hold exactly: the
+    row is missing, its size differs, or its stored bytes do not decompress to the
+    DuckDB content byte for byte. Empty means the file holds every row."""
+    bad = set()
+    for rows in _duck_blob_batches(con, shas):
+        for sha, size, content in rows:
+            got = db.execute("SELECT size, content FROM blobs WHERE sha=?", [sha]).fetchone()
+            if (got is None or got[0] != size
+                    or zlib.decompress(got[1]) != content.encode("utf-8", "surrogatepass")):
+                bad.add(sha)
+    return bad
+
+
+def _migrate_blobs(con):
+    """Schema 2 -> 3: move the DuckDB `blobs` table into the blob file, then drop it.
+
+    Crash-safe and resumable: whatever kills the run (`timeout 300` included),
+    the next writer connect finishes the job and nothing is lost.
+      1. Copy in rowid batches, committing each; a row an earlier, killed run
+         already copied is skipped, so a rerun resumes.
+      2. Verify every DuckDB row against the file (`_blob_copy_mismatches`). A
+         wrong or missing row is rewritten from DuckDB once and checked again; if
+         any still differs this raises and the DuckDB table stays.
+      3. Only then drop the table and record the version, in one DuckDB
+         transaction: the table is either there and complete, or gone with every
+         row verified in the file.
+    connect() compacts afterwards. Readers keep working at every step: until the
+    drop commits they read the DuckDB table (`_blob_db`)."""
+    t0 = time.monotonic()
+    total, nbytes = con.execute("SELECT count(*), coalesce(sum(size), 0) FROM blobs").fetchone()
+    _log(f"blobs: moving {total:,} rows ({_fmt_bytes(nbytes)}) to {_blob_path()}")
+    db = _open_blob_db()
+    try:
+        have = {sha for (sha,) in db.execute("SELECT sha FROM blobs")}
+        copied = 0
+        for rows in _duck_blob_batches(con):
+            fresh = [(sha, size, _pack_blob(content)[1])
+                     for sha, size, content in rows if sha not in have]
+            db.executemany("INSERT OR IGNORE INTO blobs VALUES (?,?,?)", fresh)
+            db.commit()
+            copied += len(fresh)
+        bad = _blob_copy_mismatches(con, db)
+        if bad:
+            _log(f"blobs: {len(bad)} rows differ from DuckDB; copying them again")
+            for rows in _duck_blob_batches(con, bad):
+                db.executemany("INSERT OR REPLACE INTO blobs VALUES (?,?,?)",
+                               [(sha, size, _pack_blob(content)[1]) for sha, size, content in rows])
+                db.commit()
+            bad = _blob_copy_mismatches(con, db, bad)
+        if bad:
+            raise RuntimeError(f"blobs: {len(bad)} rows do not verify in {_blob_path()}; "
+                               f"the DuckDB table is kept, nothing was dropped")
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")   # fold the copy into the main file
+    finally:
+        db.close()
+    con.execute("BEGIN TRANSACTION")
+    try:
+        con.execute("DROP TABLE blobs")
+        _set_schema_version(con)
+        con.execute("COMMIT")
+    except BaseException:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass        # a failed COMMIT already ended the transaction
+        raise
+    _log(f"blobs: moved {total:,} rows ({copied:,} copied this run), all verified, "
+         f"DuckDB table dropped in {time.monotonic() - t0:.1f}s")
 
 
 def _post_content(tur, pre):
@@ -1006,6 +1308,7 @@ def _insert_file_versions(con, rows):
     # null/empty event_id, which essentially never occurs since a user tool_result
     # carries a uuid, is kept as-is and never matches the anti-join, so it still
     # inserts). Blobs dedup separately on sha.
+    _commit_blobs(con)   # write order: the shas these rows name are durable first
     keyed, unkeyed = {}, []
     for r in rows:
         if r["event_id"]:
@@ -1218,6 +1521,7 @@ _FH_COLS = ["session_id", "pathhash", "version", "path", "sha", "snapshot_ts", "
 def _insert_file_history(con, rows):
     """Upsert file_history rows, idempotent on (session_id, pathhash, version).
     Snapshots are immutable, so an existing PK is left untouched (DO NOTHING)."""
+    _commit_blobs(con)   # write order: the shas these rows name are durable first
     con.execute("CREATE TEMP TABLE IF NOT EXISTS _fh_stage AS SELECT * FROM file_history WHERE 0=1")
     con.execute("DELETE FROM _fh_stage")
     con.executemany(
@@ -1324,11 +1628,11 @@ def _emit_file_history_versions(con, pathhashes=None):
             stale.append(eid)              # a lower version arrived after it was emitted
         patch = None
         if pre_sha is not None and pre_sha != sha:
-            pre = con.execute("SELECT content FROM blobs WHERE sha=?", [pre_sha]).fetchone()
-            post = con.execute("SELECT content FROM blobs WHERE sha=?", [sha]).fetchone()
-            if pre and post and pre[0] is not None and post[0] is not None:
+            texts = blob_texts(con, (pre_sha, sha))
+            pre, post = texts.get(pre_sha), texts.get(sha)
+            if pre is not None and post is not None:
                 patch = "".join(difflib.unified_diff(
-                    pre[0].splitlines(True), post[0].splitlines(True),
+                    pre.splitlines(True), post.splitlines(True),
                     fromfile=path, tofile=path)) or None
         fvs.append({
             "event_id": eid, "session_id": sid,
@@ -1502,7 +1806,9 @@ def compact_db(store_path=None):
     on any failure, so a crash mid-compaction can never corrupt or drop the store.
 
     The store's read-write connection MUST already be closed (the file has to be
-    unlocked). Returns (0, 0) if the store does not exist yet.
+    unlocked). Returns (0, 0) if the store does not exist yet. The blob file
+    (`_blob_path`) is not touched: SQLite only appends to it, so it has no free
+    blocks to give back, and the shas DuckDB keeps survive the rewrite as they are.
     """
     import duckdb  # lazy, same as connect()
     path = Path(store_path) if store_path is not None else STORE_PATH
@@ -1913,6 +2219,7 @@ def cmd_ingest(argv):
             con.execute("PRAGMA disable_checkpoint_on_shutdown")
             _log(f"checkpoint: skipped ({why})")
         con.close()
+        _close_blobs(con)
     if compact:  # after con.close(), so the store file is unlocked for the rewrite
         old, new = compact_db()
         _log(f"compacted {_fmt_bytes(old)} -> {_fmt_bytes(new)}")
@@ -1921,16 +2228,21 @@ def cmd_ingest(argv):
 
 
 def cmd_reset_db(argv):
-    """Delete the DuckDB store file (and its WAL) so the next `ingest` rebuilds it
-    from the transcripts. Prompts for confirmation unless -y/--yes is given.
+    """Delete the DuckDB store file (and its WAL) and the blob file (and its WAL
+    and shared-memory file) so the next `ingest` rebuilds them from the
+    transcripts. Prompts for confirmation unless -y/--yes is given.
 
     The store is a derived cache: every table rebuilds from the transcripts under
     ~/.claude/projects, and file-history snapshot blobs re-ingest from
     ~/.claude/file-history while it exists, so a reset loses nothing a later
-    `ingest` cannot rebuild (barring file-history already pruned).
+    `ingest` cannot rebuild (barring file-history already pruned). The blob
+    files go last, so a reset that stops half way never leaves DuckDB naming
+    blobs whose file is gone.
     """
     assume_yes = "-y" in argv or "--yes" in argv
-    targets = [STORE_PATH, Path(str(STORE_PATH) + ".wal")]
+    blobs = _blob_path()
+    targets = [STORE_PATH, Path(str(STORE_PATH) + ".wal"),
+               blobs, Path(str(blobs) + "-wal"), Path(str(blobs) + "-shm")]
     existing = [p for p in targets if p.exists()]
     if not existing:
         print(f"no store at {STORE_PATH}; nothing to reset")
@@ -2003,6 +2315,7 @@ def cmd_prune_raw(argv):
     print(f"cleared {cleared:,} rows (~{_fmt_bytes(nbytes)})")
     con.execute("CHECKPOINT")
     con.close()
+    _close_blobs(con)
     if do_compact:
         old, new = compact_db()
         print(f"compacted {_fmt_bytes(old)} -> {_fmt_bytes(new)}")
@@ -3272,6 +3585,21 @@ def db_info(con):
     walp = Path(str(STORE_PATH) + ".wal")
     if walp.exists():
         out.append(("wal size", _fmt_bytes(walp.stat().st_size)))
+    # The blob file (schema 3). A schema 2 store still holds them in DuckDB, and
+    # its `rows blobs` below comes from that table.
+    try:
+        in_duck = _duck_has_blobs(con)
+    except Exception:
+        in_duck = True   # cannot tell: show nothing rather than a false "missing"
+    if not in_duck:
+        bp = _blob_path()
+        try:
+            size = bp.stat().st_size
+            walb = Path(str(bp) + "-wal")
+            size += walb.stat().st_size if walb.exists() else 0
+            out.append(("blob file", f"{bp} ({_fmt_bytes(size)})"))
+        except OSError:
+            out.append(("blob file", f"missing: {bp}"))
     # On-disk block accounting; PRAGMA columns vary by version, so map by name.
     try:
         row = con.execute("PRAGMA database_size").fetchone()
@@ -3295,6 +3623,12 @@ def db_info(con):
             if t in present:
                 out.append((f"rows {t}",
                             f"{con.execute(f'SELECT count(*) FROM {t}').fetchone()[0]:,}"))
+            elif t == "blobs" and not in_duck:
+                try:
+                    n, nbytes = blob_totals(con)
+                    out.append(("rows blobs", f"{n:,} ({_fmt_bytes(nbytes)} uncompressed)"))
+                except Exception:
+                    pass   # a missing file is already named on the `blob file` row
     except Exception:
         pass
     return out
@@ -3321,11 +3655,15 @@ def cmd_stats(argv):
             ("events",   "SELECT count(*) FROM events"),
             ("by tool",  "SELECT tool_name, count(*) c FROM events WHERE tool_name IS NOT NULL GROUP BY 1 ORDER BY c DESC LIMIT 10"),
             ("file versions", "SELECT count(*) FROM file_versions"),
-            ("blobs / bytes", "SELECT count(*), coalesce(sum(size),0) FROM blobs"),
+            ("blobs / bytes", lambda: [blob_totals(con)]),   # the blob file, or a schema 2 table
             ("api requests / output tokens", "SELECT count(*), coalesce(sum(output_tokens),0) FROM api_requests"),
         ]:
             print(f"== {label} ==")
-            for r in con.execute(q).fetchall():
+            try:
+                rows = q() if callable(q) else con.execute(q).fetchall()
+            except BlobFileMissing as e:
+                rows = [(str(e),)]
+            for r in rows:
                 print("  ", *r)
         # Reconstruction coverage (Phase 8). Guarded via information_schema so a
         # not-yet-migrated 0.6.0 DB opened read-only (no `source` column / no
@@ -3354,9 +3692,15 @@ def cmd_stats(argv):
                 "SELECT count(*), count(DISTINCT pathhash), "
                 "count(*) FILTER (WHERE path IS NOT NULL), "
                 "count(*) FILTER (WHERE path IS NULL) FROM file_history").fetchone()
-            fh_bytes = con.execute(
-                "SELECT coalesce(sum(b.size),0) FROM file_history fh "
-                "JOIN blobs b ON b.sha=fh.sha").fetchone()[0]
+            # Each row counts its blob's size, as the old JOIN on `blobs` did (a
+            # sha several rows share counts once per row).
+            per_sha = con.execute("SELECT sha, count(*) FROM file_history "
+                                  "WHERE sha IS NOT NULL GROUP BY sha").fetchall()
+            try:
+                sizes = blob_sizes(con, (sha for sha, _n in per_sha))
+                fh_bytes = sum(sizes.get(sha, 0) * n for sha, n in per_sha)
+            except BlobFileMissing:
+                fh_bytes = "? (blob file missing)"
             print("   snapshots / distinct paths ", rows, "/", hashes)
             print("   resolved / unresolved rows ", resolved, "/", unresolved)
             print("   snapshot bytes ", fh_bytes)
@@ -3370,9 +3714,10 @@ def cmd_stats(argv):
 
 def cmd_cat(argv):
     # usage: cat <path> [--session S] [--at ISO]  -> latest content at/before --at.
-    # Two steps. (1) The newest version with reconstructable bytes: the JOIN on
-    # post_sha skips patch-only versions (null post_sha). (2) Any NEWER patch-only
-    # edits are rolled forward on top via strict structuredPatch application --
+    # Two steps. (1) The newest version with reconstructable bytes: a non-null
+    # post_sha whose blob the store holds (patch-only versions have a null one).
+    # (2) Any NEWER patch-only edits are rolled forward on top via strict
+    # structuredPatch application --
     # file-history snapshots checkpoint the PRE-turn state, so a file last edited
     # in a session's final turn had no snapshot of its final bytes and `cat` used
     # to be one turn stale here. A patch that no longer applies cleanly (file
@@ -3388,16 +3733,31 @@ def cmd_cat(argv):
     # epoch_ms + rowid anchor the tail strictly after the base row (rowid breaks
     # same-millisecond ties in insertion = transcript order); the raw TIMESTAMPTZ
     # is never fetched because materializing it needs the optional pytz package.
-    sql = (f"SELECT b.content, epoch_ms(fv.ts), fv.rowid "
-           f"FROM file_versions fv JOIN blobs b ON b.sha = fv.post_sha "
-           f"WHERE {' AND '.join(where)} ORDER BY fv.ts DESC, fv.rowid DESC LIMIT 1")
+    sql = (f"SELECT fv.post_sha, epoch_ms(fv.ts), fv.rowid FROM file_versions fv "
+           f"WHERE {' AND '.join(where)} AND fv.post_sha IS NOT NULL "
+           f"ORDER BY fv.ts DESC, fv.rowid DESC")
     con = connect(read_only=True)
     try:
-        row = con.execute(sql, params).fetchone()
-        if not row:
+        # The content is a lookup by sha in the blob file (`blob_texts`); it used
+        # to be a JOIN on the DuckDB `blobs` table, which skipped a version whose
+        # blob is absent. Walking the candidates newest first keeps that rule.
+        content = None
+        skipped = 0
+        try:
+            for sha, base_ms, base_rowid in con.execute(sql, params).fetchall():
+                content = blob_texts(con, [sha]).get(sha)
+                if content is not None:
+                    break
+                skipped += 1
+        except BlobFileMissing as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        if skipped:   # a reference without content: the write order rules it out
+            print(f"warning: skipped {skipped} version(s) whose content the blob file "
+                  f"does not hold", file=sys.stderr)
+        if content is None:
             print("no stored version for that path/time")
             return 1
-        content, base_ms, base_rowid = row
         # The patch-only tail: same filters, strictly after the base row, oldest
         # first. Every row here has a null post_sha by construction (a later row
         # WITH bytes would itself have been picked as the base above).

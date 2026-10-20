@@ -2,8 +2,12 @@ import importlib
 import importlib.util
 import json
 import os
+import sqlite3
+import subprocess
 import sys
+import textwrap
 import time
+import zlib
 from dataclasses import fields
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -13,13 +17,12 @@ import pytest
 import claude_trail as feed          # for the records the turn queries map onto
 import claude_trail_store as store
 
-# The 13 objects the schema bootstrap must create: 9 tables + 4 views. Both show
-# up in information_schema.tables (views included), so one membership check
-# covers the whole schema.
+# The 12 objects the schema bootstrap must create in DuckDB: 8 tables + 4 views.
+# Both show up in information_schema.tables (views included), so one membership
+# check covers the whole schema. Blob content lives in the SQLite blob file.
 EXPECTED_OBJECTS = {
     "actions",
     "api_requests",
-    "blobs",
     "command_tokens",
     "events",
     "file_history",
@@ -70,9 +73,17 @@ def test_schema_bootstraps_and_reopens_read_only(tmp_path, monkeypatch):
     finally:
         con.close()
     assert EXPECTED_OBJECTS <= names
+    assert "blobs" not in names                       # content is in the blob file
+    blob_tables = sqlite3.connect(store._blob_path()).execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    assert blob_tables == [("blobs",)]
 
     con_ro = store.connect(read_only=True)
-    con_ro.close()
+    try:
+        assert con_ro.execute("SELECT value FROM schema_meta WHERE key='version'"
+                              ).fetchone()[0] == store.SCHEMA_VERSION == "3"
+    finally:
+        con_ro.close()
 
 
 # --- Transcript parser (Task 2) -----------------------------------------------
@@ -3056,6 +3067,11 @@ def _write_create_event(sid="sess-fv-0001", uuid="fv-write-1",
     }
 
 
+def _blob_shas(con):
+    """Every sha in the blob file, sorted, through the writer's own connection."""
+    return store._blob_db(con).execute("SELECT sha FROM blobs ORDER BY 1").fetchall()
+
+
 def test_put_blob_dedups_identical_content(tmp_path, monkeypatch):
     """Two identical contents content-address to one blob row (sha dedup); None
     stores nothing; a distinct content adds exactly one more."""
@@ -3065,11 +3081,11 @@ def test_put_blob_dedups_identical_content(tmp_path, monkeypatch):
         a = store._put_blob(con, "same bytes")
         b = store._put_blob(con, "same bytes")
         assert a == b
-        assert con.execute("SELECT count(*) FROM blobs").fetchone()[0] == 1
+        assert store.blob_count(con) == 1
         assert store._put_blob(con, None) is None      # None -> no row, no sha
-        assert con.execute("SELECT count(*) FROM blobs").fetchone()[0] == 1
+        assert store.blob_count(con) == 1
         store._put_blob(con, "other bytes")
-        assert con.execute("SELECT count(*) FROM blobs").fetchone()[0] == 2
+        assert store.blob_count(con) == 2
     finally:
         con.close()
 
@@ -3120,11 +3136,9 @@ def test_file_version_from_event_edit_row_and_blob_roundtrip(tmp_path, monkeypat
         assert fv["path"] == "/tmp/demo.py"
         assert fv["pre_sha"] is not None and fv["post_sha"] is not None
         # the reconstructed post is stored and reads back byte-for-byte
-        post = con.execute("SELECT content FROM blobs WHERE sha=?",
-                           [fv["post_sha"]]).fetchone()[0]
+        post = store.blob_texts(con, [fv["post_sha"]])[fv["post_sha"]]
         assert post == expected_post
-        pre = con.execute("SELECT content FROM blobs WHERE sha=?",
-                          [fv["pre_sha"]]).fetchone()[0]
+        pre = store.blob_texts(con, [fv["pre_sha"]])[fv["pre_sha"]]
         assert pre == tur["originalFile"]
         # patch is the JSON-encoded structuredPatch, not a difflib diff
         assert json.loads(fv["patch"])[0]["newStart"] == 2
@@ -3156,14 +3170,13 @@ def test_ingest_all_captures_file_versions_and_blobs(tmp_path, monkeypatch):
 
         store.ingest_all(con)
         assert count("SELECT count(*) FROM file_versions") == 2      # write + edit
-        assert count("SELECT count(*) FROM blobs") > 0               # real bytes stored
+        assert store.blob_count(con) > 0               # real bytes stored
         # the edit path is present with a non-null post_sha that round-trips
         post_sha = con.execute(
             "SELECT post_sha FROM file_versions WHERE path=? AND pre_sha IS NOT NULL",
             [path]).fetchone()[0]
         assert post_sha is not None
-        content = con.execute("SELECT content FROM blobs WHERE sha=?",
-                             [post_sha]).fetchone()[0]
+        content = store.blob_texts(con, [post_sha])[post_sha]
         assert content == "line one\nline two CHANGED\nline two-b\nline three\n"
 
         # idempotent re-ingest: offset tracking means no line is reprocessed, so
@@ -3214,7 +3227,7 @@ def test_file_version_from_event_edit_null_original_file(tmp_path, monkeypatch):
         assert fv["patch"] is not None                       # structuredPatch kept
         assert json.loads(fv["patch"])[0]["newStart"] == 2
         # nothing was content-addressed (no pre, no reconstructable post)
-        assert con.execute("SELECT count(*) FROM blobs").fetchone()[0] == 0
+        assert store.blob_count(con) == 0
     finally:
         con.close()
 
@@ -3600,7 +3613,7 @@ def test_file_history_core_lift(tmp_path, monkeypatch, capsys):
         def count(sql):
             return con.execute(sql).fetchone()[0]
         assert count("SELECT count(*) FROM file_history") == 2
-        assert count("SELECT count(*) FROM blobs") == 2                 # v1 + v2 preserved
+        assert store.blob_count(con) == 2                 # v1 + v2 preserved
         assert count("SELECT count(*) FROM file_versions "
                      "WHERE source='file-history' AND post_sha IS NOT NULL") == 2
         # the transcript Edit is still there, patch-only (null post_sha), source stamped
@@ -3720,7 +3733,7 @@ def test_file_history_deferred_resolution(tmp_path, monkeypatch):
     con = store.connect()
     try:
         store.ingest_all(con)
-        assert con.execute("SELECT count(*) FROM blobs").fetchone()[0] == 1              # preserved
+        assert store.blob_count(con) == 1              # preserved
         assert con.execute("SELECT path FROM file_history WHERE pathhash=?", [ph]).fetchone()[0] is None
         assert con.execute("SELECT count(*) FROM file_versions "
                            "WHERE source='file-history'").fetchone()[0] == 0
@@ -3758,7 +3771,7 @@ def test_file_history_idempotent(tmp_path, monkeypatch):
         def snap():
             return (con.execute("SELECT count(*) FROM file_history").fetchone()[0],
                     con.execute("SELECT count(*) FROM file_versions").fetchone()[0],
-                    con.execute("SELECT count(*) FROM blobs").fetchone()[0])
+                    store.blob_count(con))
         first = snap()
         assert first[0] == 2 and first[2] == 2
         store.ingest_all(con)
@@ -3772,7 +3785,8 @@ def test_file_history_idempotent(tmp_path, monkeypatch):
 def test_file_history_schema1_migration(tmp_path, monkeypatch):
     """A schema-1 (0.6.0) DB upgrades in place on reopen: the source column is added
     and backfills existing rows with 'transcript', file_history exists, and the
-    stored schema version becomes '2' (the ON CONFLICT DO UPDATE fix)."""
+    stored schema version becomes the current one, '3' (the ON CONFLICT DO UPDATE
+    fix; a 0.6.0 store with no DuckDB `blobs` table has nothing to move)."""
     import duckdb
     db = tmp_path / "trail.duckdb"
     monkeypatch.setattr(store, "STORE_PATH", db)
@@ -3787,7 +3801,7 @@ def test_file_history_schema1_migration(tmp_path, monkeypatch):
     con = store.connect()                                               # runs the migration
     try:
         assert con.execute("SELECT source FROM file_versions WHERE event_id='e1'").fetchone()[0] == "transcript"
-        assert con.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()[0] == "2"
+        assert con.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()[0] == "3"
         assert con.execute("SELECT count(*) FROM information_schema.tables "
                            "WHERE table_name='file_history'").fetchone()[0] == 1
     finally:
@@ -3839,7 +3853,7 @@ def test_file_history_empty_snapshot_and_null_backupfilename(tmp_path, monkeypat
     try:
         store.ingest_all(con)
         empty_sha = store._sha("")
-        assert con.execute("SELECT count(*) FROM blobs WHERE sha=?", [empty_sha]).fetchone()[0] == 1
+        assert store.blob_texts(con, [empty_sha]) == {empty_sha: ""}
         assert con.execute("SELECT sha FROM file_history WHERE pathhash=?", [phe]).fetchone()[0] == empty_sha
         assert con.execute("SELECT count(*) FROM file_history WHERE pathhash=?",
                            [_pathhash(null_path)]).fetchone()[0] == 0    # null backupFileName skipped
@@ -3865,7 +3879,7 @@ def test_file_history_binary_snapshot_skipped(tmp_path, monkeypatch):
         store.ingest_all(con)
         assert con.execute("SELECT sha, note FROM file_history WHERE pathhash=?",
                            [ph]).fetchone() == (None, "binary-skipped")
-        assert con.execute("SELECT count(*) FROM blobs").fetchone()[0] == 0
+        assert store.blob_count(con) == 0
         assert con.execute("SELECT count(*) FROM file_versions "
                            "WHERE source='file-history'").fetchone()[0] == 0
     finally:
@@ -3928,7 +3942,7 @@ def test_file_history_bad_backup_time_does_not_poison(tmp_path, monkeypatch):
     try:
         store.ingest_all(con)                                            # must NOT raise
         assert con.execute("SELECT count(*) FROM file_history").fetchone()[0] == 2
-        assert con.execute("SELECT count(*) FROM blobs").fetchone()[0] == 2   # bytes preserved
+        assert store.blob_count(con) == 2   # bytes preserved
         # snapshot_ts fell back to the on-disk mtime (non-null), and both rows emit a
         # file-history file_versions row (the ts flowed through epoch_ms cleanly).
         assert con.execute("SELECT count(*) FROM file_history "
@@ -4017,7 +4031,7 @@ def test_file_history_promotes_after_dir_pruned(tmp_path, monkeypatch):
     con = store.connect()
     try:
         store.ingest_all(con)
-        assert con.execute("SELECT count(*) FROM blobs").fetchone()[0] == 1             # preserved
+        assert store.blob_count(con) == 1             # preserved
         assert con.execute("SELECT path FROM file_history WHERE pathhash=?",
                            [ph]).fetchone()[0] is None
 
@@ -4073,7 +4087,7 @@ def _fh_rows(con):
             con.execute("SELECT event_id, session_id, epoch_ms(ts), path, pre_sha, "
                         "post_sha, patch FROM file_versions WHERE source='file-history' "
                         "ORDER BY 1").fetchall(),
-            con.execute("SELECT sha FROM blobs ORDER BY 1").fetchall())
+            _blob_shas(con))
 
 
 def _forbid(monkeypatch, *names):
@@ -4228,7 +4242,7 @@ def test_full_pass_picks_up_an_orphan_and_a_crashed_runs_lines(
             h_snap: p_snap, h_delta: p_delta, h_orphan: None}  # orphan path never seen
         assert con.execute("SELECT epoch_ms(snapshot_ts) FROM file_history WHERE pathhash=?",
                            [h_delta]).fetchone()[0] == 1782997202000
-        assert con.execute("SELECT count(*) FROM blobs").fetchone()[0] == 3
+        assert store.blob_count(con) == 3
     finally:
         con.close()
     before = _fh_rows(store.connect(read_only=True))
@@ -4612,6 +4626,456 @@ def test_ordinary_run_emits_a_row_it_resolves_for_an_earlier_run(
     assert store.cmd_ingest(["ingest"]) == 0
     assert "file-history: 0 new snapshots, 1 resolved" in capsys.readouterr().out
     assert path_and_emits() == (path, 1)
+
+
+# --- Blob file: content in <store>.blobs.sqlite (ingest CPU plan, phase 4) ------
+#
+# Schema 3 keeps file contents in a SQLite file next to the DuckDB store, so a
+# new blob no longer makes the next CHECKPOINT rewrite every blob. These tests
+# pin the parts that cannot be repaired later: the write order (no DuckDB row
+# names an uncommitted blob), the schema 2 -> 3 move (resumable, verified before
+# the drop, readers byte-identical before and after), and readers that meet a
+# not-yet-migrated store or a missing blob file.
+
+BLOBMIG_FH_PATH = "/home/naka/proj/mig.py"
+BLOBMIG_EDIT_PATH = "/tmp/demo_mig.py"
+
+
+def _build_blob_store(tmp_path, monkeypatch):
+    """A closed store whose blobs come from both sources: a Write of CATDIFF_PATH
+    plus a patch-only Edit of it (cat rolls that tail forward), an Edit of
+    BLOBMIG_EDIT_PATH (pre + post blobs), and two file-history snapshots of
+    BLOBMIG_FH_PATH (the emit walk diffs v1 -> v2 from their blobs)."""
+    projects, fh_dir = _setup_fh(tmp_path, monkeypatch)
+    sid = "sess-blob-0001"
+    ph = _pathhash(BLOBMIG_FH_PATH)
+    _write_fh_files(fh_dir, sid, {f"{ph}@v1": "mig v1\n", f"{ph}@v2": "mig v1\nmig v2\n"})
+    _write_jsonl(projects / "-proj" / f"{sid}.jsonl", [
+        _write_create_event(sid, "bm-w", CATDIFF_PATH, "alpha\nbeta\n"),
+        _patch_only_edit_event(sid, "bm-p", CATDIFF_PATH, "2026-06-30T04:00:02.000Z",
+                               [{"oldStart": 2, "oldLines": 1, "newStart": 2, "newLines": 1,
+                                 "lines": ["-beta", "+BETA"]}]),
+        _edit_result_event(sid, "bm-e", BLOBMIG_EDIT_PATH),
+        _fh_snapshot_event("bm1", {BLOBMIG_FH_PATH: {"backupFileName": f"{ph}@v1", "version": 1,
+                                                     "backupTime": "2026-07-01T10:00:01.000Z"}}),
+        _fh_snapshot_event("bm2", {BLOBMIG_FH_PATH: {"backupFileName": f"{ph}@v2", "version": 2,
+                                                     "backupTime": "2026-07-01T10:00:02.000Z"}}),
+    ])
+    con = store.connect()
+    try:
+        store.ingest_all(con)
+    finally:
+        con.close()
+
+
+def _reader_outputs(capsys):
+    """(exit code, stdout, stderr) of every blob-reading CLI path, plus the
+    stats lines that sum blob sizes, keyed by name."""
+    capsys.readouterr()
+    out = {}
+    for name, argv in [
+            ("cat", ["cat", CATDIFF_PATH]),
+            ("cat --at", ["cat", CATDIFF_PATH, "--at", "2026-06-30T04:00:01.000Z"]),
+            ("cat edit", ["cat", BLOBMIG_EDIT_PATH]),
+            ("cat fh", ["cat", BLOBMIG_FH_PATH]),
+            ("cat fh --at", ["cat", BLOBMIG_FH_PATH, "--at", "2026-07-01T10:00:01.500Z"]),
+            ("diff", ["diff", CATDIFF_PATH]),
+            ("diff fh", ["diff", BLOBMIG_FH_PATH, "--all-sources"])]:
+        rc = (store.cmd_cat if argv[0] == "cat" else store.cmd_diff)(argv)
+        got = capsys.readouterr()
+        out[name] = (rc, got.out, got.err)
+    assert store.cmd_stats(["stats"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    i = lines.index("== blobs / bytes ==")
+    out["stats blobs"] = lines[i + 1]
+    out["stats snapshot bytes"] = next(ln for ln in lines if "snapshot bytes" in ln)
+    return out
+
+
+def _blob_file_rows():
+    """{sha: (size, text)} straight from the blob file, by a connection of its own."""
+    db = sqlite3.connect(store._blob_path())
+    try:
+        return {sha: (size, zlib.decompress(c).decode("utf-8"))
+                for sha, size, c in db.execute("SELECT sha, size, content FROM blobs")}
+    finally:
+        db.close()
+
+
+def _demote_to_schema2():
+    """Turn the closed schema 3 store into what a schema 2 release left: the blobs
+    in a DuckDB table with the old DDL, no blob file, version '2'. Returns the
+    rows as {sha: (size, text)}."""
+    import duckdb
+    rows = _blob_file_rows()
+    bp = store._blob_path()
+    for p in (bp, Path(str(bp) + "-wal"), Path(str(bp) + "-shm")):
+        p.unlink(missing_ok=True)
+    raw = duckdb.connect(str(store.STORE_PATH))
+    try:
+        raw.execute("CREATE TABLE blobs(sha TEXT PRIMARY KEY, size BIGINT, content TEXT)")
+        raw.executemany("INSERT INTO blobs VALUES (?,?,?)",
+                        [(sha, size, text) for sha, (size, text) in rows.items()])
+        raw.execute("UPDATE schema_meta SET value='2' WHERE key='version'")
+    finally:
+        raw.close()
+    return rows
+
+
+def _duck_state():
+    """(DuckDB still has `blobs`, its row count or None, schema version), read-only."""
+    con = store.connect(read_only=True)
+    try:
+        has = store._duck_has_blobs(con)
+        n = con.execute("SELECT count(*) FROM blobs").fetchone()[0] if has else None
+        version = con.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()[0]
+        return has, n, version
+    finally:
+        con.close()
+
+
+def test_migration_from_schema2_moves_blobs_and_keeps_readers_byte_identical(
+        tmp_path, monkeypatch, capsys):
+    """The first writer connect on a schema 2 store copies every DuckDB blob into
+    the blob file, drops the table, records '3' and compacts. cat (latest,
+    --at, the roll-forward, file-history snapshots), diff and the stats sums are
+    byte-identical on the original store, on the schema 2 store (whose reader
+    reads the DuckDB table and creates no blob file), and after the move. A
+    full re-ingest afterwards adds nothing."""
+    _build_blob_store(tmp_path, monkeypatch)
+    want = _reader_outputs(capsys)
+    assert want["cat"] == (0, "alpha\nBETA\n", "")             # the fixture exercises the roll-forward
+    assert want["cat fh"][1] == "mig v1\nmig v2\n"
+    assert "+mig v2" in want["diff fh"][1]                     # diffed from the two blobs
+
+    rows = _demote_to_schema2()
+    assert len(rows) == 5
+    assert _duck_state() == (True, 5, "2")
+    assert _reader_outputs(capsys) == want
+    assert not store._blob_path().exists()                     # a reader never creates it
+
+    con = store.connect()                                      # migrates
+    try:
+        assert not store._duck_has_blobs(con)
+        assert con.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()[0] == "3"
+        free_blocks = con.execute("PRAGMA database_size").fetchone()[5]
+    finally:
+        con.close()
+    log = capsys.readouterr().out
+    assert "blobs: moving 5 rows" in log and "(5 copied this run), all verified" in log
+    assert "blobs: compacted" in log
+    assert free_blocks == 0                                    # the drop was compacted away
+    assert _blob_file_rows() == rows
+    assert _reader_outputs(capsys) == want
+
+    con = store.connect()                                      # nothing left to move
+    try:
+        def counts():
+            return (store.blob_count(con),
+                    con.execute("SELECT count(*) FROM file_versions").fetchone()[0],
+                    con.execute("SELECT count(*) FROM file_history").fetchone()[0])
+        before = counts()
+        con.execute("DELETE FROM ingest_state")                # re-read every transcript line
+        store.ingest_all(con)
+        assert counts() == before
+    finally:
+        con.close()
+    assert "blobs: moving" not in capsys.readouterr().out
+    assert _blob_file_rows() == rows
+    assert _reader_outputs(capsys) == want
+
+
+def test_migration_killed_mid_copy_resumes_and_readers_keep_the_duckdb_table(
+        tmp_path, monkeypatch, capsys):
+    """A run killed during the copy leaves the DuckDB table whole and version '2';
+    the batches it committed stay in the blob file. Readers keep reading the
+    DuckDB table (the partial file is not theirs yet), and the next writer
+    connect copies only what is missing, verifies all of it and finishes."""
+    _build_blob_store(tmp_path, monkeypatch)
+    want = _reader_outputs(capsys)
+    rows = _demote_to_schema2()
+    monkeypatch.setattr(store, "_BLOB_MIGRATE_BATCH", 1)       # one commit per row
+    real_pack = store._pack_blob
+    packed = []
+
+    def killed_after_two(text):
+        if len(packed) == 2:
+            raise KeyboardInterrupt("timeout 300 killed the run")
+        packed.append(text)
+        return real_pack(text)
+
+    monkeypatch.setattr(store, "_pack_blob", killed_after_two)
+    with pytest.raises(KeyboardInterrupt):
+        store.connect()
+    assert _duck_state() == (True, 5, "2")
+    assert len(_blob_file_rows()) == 2                         # two committed batches survive
+    assert _reader_outputs(capsys) == want
+
+    monkeypatch.setattr(store, "_pack_blob", real_pack)
+    store.connect().close()
+    assert "(3 copied this run), all verified" in capsys.readouterr().out
+    assert _duck_state() == (False, None, "3")
+    assert _blob_file_rows() == rows
+    assert _reader_outputs(capsys) == want
+
+
+def test_migration_killed_before_the_drop_recopies_a_bad_row_then_drops(
+        tmp_path, monkeypatch, capsys):
+    """A run that dies after the copy but before the drop leaves everything in
+    both places. If a copied row is then wrong (here: overwritten with other
+    bytes), the next connect's verify finds it, copies it again from DuckDB and
+    only then drops the table."""
+    _build_blob_store(tmp_path, monkeypatch)
+    want = _reader_outputs(capsys)
+    rows = _demote_to_schema2()
+    real_verify = store._blob_copy_mismatches
+
+    def killed(*a, **k):
+        raise KeyboardInterrupt("killed between copy and verify")
+
+    monkeypatch.setattr(store, "_blob_copy_mismatches", killed)
+    with pytest.raises(KeyboardInterrupt):
+        store.connect()
+    assert _duck_state() == (True, 5, "2")
+    assert _blob_file_rows() == rows                           # fully copied, nothing dropped
+
+    victim = sorted(rows)[0]
+    db = sqlite3.connect(store._blob_path())
+    db.execute("UPDATE blobs SET content=? WHERE sha=?", [zlib.compress(b"torn"), victim])
+    db.commit()
+    db.close()
+    monkeypatch.setattr(store, "_blob_copy_mismatches", real_verify)
+    capsys.readouterr()
+    store.connect().close()
+    log = capsys.readouterr().out
+    assert "blobs: 1 rows differ from DuckDB; copying them again" in log
+    assert "(0 copied this run), all verified" in log
+    assert _duck_state() == (False, None, "3")
+    assert _blob_file_rows() == rows
+    assert _reader_outputs(capsys) == want
+
+
+def test_migration_refuses_to_drop_when_a_row_does_not_verify(tmp_path, monkeypatch, capsys):
+    """When a row still differs after the second copy, the move raises, the
+    DuckDB table and version stay, and readers keep working from DuckDB."""
+    _build_blob_store(tmp_path, monkeypatch)
+    want = _reader_outputs(capsys)
+    _demote_to_schema2()
+    monkeypatch.setattr(store, "_blob_copy_mismatches", lambda con, db, shas=None: {"f" * 64})
+    with pytest.raises(RuntimeError, match="do not verify"):
+        store.connect()
+    assert _duck_state() == (True, 5, "2")
+    assert _reader_outputs(capsys) == want
+
+
+def test_readers_name_a_missing_blob_file_instead_of_raising(tmp_path, monkeypatch, capsys):
+    """On a migrated store whose blob file is gone, cat exits 1 with a message
+    naming the file, stats and db_info say so, and no reader recreates it. The
+    next writer recreates it empty and says in the log that content is lost."""
+    _build_blob_store(tmp_path, monkeypatch)
+    bp = store._blob_path()
+    for p in (bp, Path(str(bp) + "-wal"), Path(str(bp) + "-shm")):
+        p.unlink(missing_ok=True)
+    capsys.readouterr()
+
+    assert store.cmd_cat(["cat", CATDIFF_PATH]) == 1
+    got = capsys.readouterr()
+    assert got.out == "" and got.err == f"error: blob file missing: {bp} (the store keeps file contents there)\n"
+    assert store.cmd_stats(["stats"]) == 0
+    out = capsys.readouterr().out
+    assert f"blob file missing: {bp}" in out
+    assert "snapshot bytes  ? (blob file missing)" in out
+    con = store.connect(read_only=True)
+    try:
+        info = dict(store.db_info(con))
+    finally:
+        con.close()
+    assert info["blob file"] == f"missing: {bp}"
+    assert "rows blobs" not in info
+    assert not bp.exists()
+
+    store.connect().close()
+    assert "warning: blob file" in capsys.readouterr().out
+    assert bp.exists()
+    assert store.cmd_cat(["cat", CATDIFF_PATH]) == 1
+    got = capsys.readouterr()
+    assert got.out == "no stored version for that path/time\n"
+    assert "skipped 1 version(s) whose content the blob file does not hold" in got.err
+
+
+def test_reader_reads_the_blob_file_while_a_writer_is_inserting(tmp_path, monkeypatch, capsys):
+    """A writer in another process holds an open write transaction on the blob
+    file (an insert not yet committed). A reader opens it read-only and reads
+    the committed rows, not the pending one."""
+    _build_blob_store(tmp_path, monkeypatch)
+    want = _reader_outputs(capsys)["cat"]
+    writer = textwrap.dedent("""
+        import sqlite3, sys
+        db = sqlite3.connect(sys.argv[1])
+        db.execute("INSERT INTO blobs VALUES ('pending', 1, x'00')")
+        print("in transaction" if db.in_transaction else "no transaction", flush=True)
+        sys.stdin.readline()
+        db.rollback()
+        db.close()
+    """)
+    proc = subprocess.Popen([sys.executable, "-I", "-c", writer, str(store._blob_path())],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout.readline().strip() == "in transaction"
+        assert store.cmd_cat(["cat", CATDIFF_PATH]) == want[0]
+        got = capsys.readouterr()
+        assert (got.out, got.err) == want[1:]
+        con = store.connect(read_only=True)
+        try:
+            assert store.blob_texts(con, ["pending"]) == {}
+            assert store.blob_count(con) == 5
+        finally:
+            con.close()
+    finally:
+        proc.stdin.write("\n")
+        proc.stdin.flush()
+        assert proc.wait(timeout=10) == 0
+
+
+class _OrderCheckingCon(_CountingCon):
+    """At each DuckDB insert that writes sha references, asserts that every sha it
+    is about to write is already COMMITTED to the blob file, read by a separate
+    read-only connection (which cannot see an open transaction's rows)."""
+
+    _STAGED = {"INSERT INTO file_versions": "SELECT pre_sha, post_sha FROM _fv_stage",
+               "INSERT INTO file_history": "SELECT sha FROM _fh_stage"}
+
+    def __init__(self, con):
+        super().__init__(con)
+        self.checked = set()
+
+    def execute(self, sql, *args, **kwargs):
+        for prefix, staged in self._STAGED.items():
+            if sql.startswith(prefix):
+                shas = {s for row in self._con.execute(staged).fetchall() for s in row if s}
+                ro = sqlite3.connect(store._blob_path().resolve().as_uri() + "?mode=ro", uri=True)
+                try:
+                    committed = {sha for (sha,) in ro.execute("SELECT sha FROM blobs")}
+                finally:
+                    ro.close()
+                assert shas <= committed, f"{prefix} names uncommitted blobs"
+                self.checked |= shas
+        return super().execute(sql, *args, **kwargs)
+
+
+def _ingest_through_order_check(tmp_path, monkeypatch):
+    """ingest_all of the _build_blob_store inputs through an _OrderCheckingCon."""
+    real_connect = store.connect
+    checking = []
+
+    def connect_checked(read_only=False):
+        con = real_connect(read_only)
+        if read_only:
+            return con
+        wrapped = _OrderCheckingCon(con)
+        store._BLOB_DBS[wrapped] = store._BLOB_DBS[con]   # the writer's blob file, seen through the wrapper
+        checking.append((wrapped, con))
+        return wrapped
+
+    monkeypatch.setattr(store, "connect", connect_checked)
+    _build_blob_store(tmp_path, monkeypatch)
+    return checking[0][0]
+
+
+def test_blobs_are_committed_before_any_duckdb_row_names_them(tmp_path, monkeypatch):
+    """The write order that makes a crash harmless: by the time file_versions or
+    file_history rows reach DuckDB, every blob they name is committed."""
+    checking = _ingest_through_order_check(tmp_path, monkeypatch)
+    assert len(checking.checked) == 5          # every blob of the fixture was checked
+
+
+def test_order_check_catches_a_reference_to_an_uncommitted_blob(tmp_path, monkeypatch):
+    """The control for the test above: with the commit skipped, the first
+    insert of a sha reference trips the check."""
+    monkeypatch.setattr(store, "_commit_blobs", lambda con: None)
+    with pytest.raises(AssertionError, match="names uncommitted blobs"):
+        _ingest_through_order_check(tmp_path, monkeypatch)
+
+
+def test_cmd_reset_db_deletes_the_blob_file_and_its_wal_and_shm_last(
+        tmp_path, monkeypatch, capsys):
+    """reset-db removes the blob file with its -wal and -shm (as a killed writer
+    leaves them), after the DuckDB files, so a reset that stops half way never
+    leaves DuckDB naming blobs whose file is gone."""
+    _build_cli_store(tmp_path, monkeypatch)
+    bp = store._blob_path()
+    side = [Path(str(bp) + "-wal"), Path(str(bp) + "-shm")]
+    for p in side:
+        p.write_bytes(b"")
+    assert bp.exists()
+    assert store.cmd_reset_db(["reset-db", "--yes"]) == 0
+    assert not any(p.exists() for p in [store.STORE_PATH, bp, *side])
+    deleted = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("deleted ")]
+    assert deleted == [f"deleted {p}" for p in [store.STORE_PATH, bp, *side]]
+
+
+def test_compact_db_leaves_the_blob_file_alone(tmp_path, monkeypatch, capsys):
+    """The os.replace rewrite touches only the DuckDB file: the blob file keeps
+    its bytes and mtime, and cat still prints the same content."""
+    _build_blob_store(tmp_path, monkeypatch)
+    want = _reader_outputs(capsys)
+    bp = store._blob_path()
+    before = (bp.read_bytes(), bp.stat().st_mtime_ns)
+    store.compact_db()
+    assert (bp.read_bytes(), bp.stat().st_mtime_ns) == before
+    assert _reader_outputs(capsys) == want
+
+
+def test_db_info_stats_and_store_size_count_the_blob_file(tmp_path, monkeypatch, capsys):
+    """db_info names the blob file with its size and the blob rows; stats prints
+    their count and bytes; the store size the ingest log reports includes it."""
+    _build_blob_store(tmp_path, monkeypatch)
+    rows = _blob_file_rows()
+    nbytes = sum(size for size, _text in rows.values())
+    bp = store._blob_path()
+    con = store.connect(read_only=True)
+    try:
+        info = dict(store.db_info(con))
+        assert store.blob_totals(con) == (5, nbytes)
+    finally:
+        con.close()
+    assert info["blob file"] == f"{bp} ({store._fmt_bytes(bp.stat().st_size)})"
+    assert info["rows blobs"] == f"5 ({store._fmt_bytes(nbytes)} uncompressed)"
+    out = _reader_outputs(capsys)
+    assert out["stats blobs"] == f"   5 {nbytes}"
+    assert out["stats snapshot bytes"] == f"   snapshot bytes  {len('mig v1\n') + len('mig v1\nmig v2\n')}"
+    assert store._store_size() == store.STORE_PATH.stat().st_size + bp.stat().st_size
+
+
+def test_ingest_log_counts_new_blobs_from_the_blob_file(tmp_path, monkeypatch, capsys):
+    """The `stored:` line still reports new blobs, now counted in the blob file."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(store, "PROJECTS_DIR", projects)
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    sid = "sess-blob-log-0001"
+    _write_jsonl(projects / "-proj" / f"{sid}.jsonl",
+                 [_write_create_event(sid, "bl-w", "/tmp/log_demo.py", "x = 1\n")])
+    assert store.cmd_ingest(["ingest"]) == 0
+    assert "+1 file_versions, +1 blobs" in capsys.readouterr().out
+
+
+def test_put_blob_needs_the_writer_and_keeps_a_lone_surrogate(tmp_path, monkeypatch):
+    """A read-only connection cannot put a blob. The writer stores a lone
+    surrogate (only a malformed JSON escape makes one) and reads it back intact;
+    DuckDB used to raise on it."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    con = store.connect()
+    try:
+        sha = store._put_blob(con, "a\ud800b")
+        assert store.blob_texts(con, [sha]) == {sha: "a\ud800b"}
+    finally:
+        con.close()
+    ro = store.connect(read_only=True)
+    try:
+        with pytest.raises(RuntimeError, match="writer connection"):
+            store._put_blob(ro, "text")
+    finally:
+        ro.close()
 
 
 # --- ingest --detach: singleton lock + background fork (Phase 1) ---------------
