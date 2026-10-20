@@ -169,7 +169,8 @@ def _set_schema_version(con):
 
 def connect(read_only: bool = False):
     """Open the store. A writer (the default) also gets the schema, any pending
-    migration, and its blob file (`_blob_path`), which lives as long as `con`.
+    migration, and its blob file (`_blob_path`), which lives as long as `con`
+    (or the DuckDB `blobs` table while a failed move waits, see _move_blobs).
     A reader opens the blob file only when it first reads a blob (`_blob_db`)."""
     import duckdb  # lazy: keeps the TUI/hook free of the duckdb import
     STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -183,21 +184,8 @@ def connect(read_only: bool = False):
         # correctly labelling all pre-phase-8 rows 'transcript').
         con.execute("ALTER TABLE file_versions ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'transcript'")
         if _duck_has_blobs(con):
-            # Schema 2 -> 3. Records the version itself, in the transaction that
-            # drops the table. The drop frees about as much as the table held,
-            # and only a rewrite gives it back, so compact before the run goes on.
-            try:
-                _migrate_blobs(con)
-            finally:
-                con.close()
-            try:
-                old, new = compact_db()
-                _log(f"blobs: compacted {_fmt_bytes(old)} -> {_fmt_bytes(new)}")
-            except Exception as e:   # the move is done; the hourly --compact retries this
-                _log(f"blobs: compaction after the move failed ({e}); the next --compact reclaims it")
-            con = duckdb.connect(str(STORE_PATH))
-        else:
-            _set_schema_version(con)
+            return _move_blobs(con)   # schema 2 -> 3
+        _set_schema_version(con)
         _attach_blob_writer(con)
     return con
 
@@ -972,10 +960,11 @@ def _register_blob_db(con, src):
 
 
 def _blob_db(con):
-    """The blob source for `con`: the writer's SQLite connection (connect()
-    registers it), else, for a reader, the DuckDB `blobs` table while the store
-    is not migrated yet, else the blob file opened read-only. Cached per
-    connection, and closed when `con` is collected or by `_close_blobs`."""
+    """The blob source for `con`: the writer's, which connect() registers (its
+    SQLite connection, or the DuckDB table while a failed move waits), else, for
+    a reader, the DuckDB `blobs` table while the store is not migrated yet, else
+    the blob file opened read-only. Cached per connection, and closed when `con`
+    is collected or by `_close_blobs`."""
     src = _BLOB_DBS.get(con)
     if src is None:
         src = _DUCK_BLOBS if _duck_has_blobs(con) else _open_blob_db(read_only=True)
@@ -992,10 +981,23 @@ def _close_blobs(con):
         db.close()   # the finalizer's later close() is a no-op
 
 
+def _blob_bytes(text):
+    """The bytes a blob stores (before zlib), `cat` prints and its sha covers:
+    UTF-8, with surrogatepass keeping a lone surrogate (only a malformed JSON
+    escape makes one) instead of raising."""
+    return text.encode("utf-8", "surrogatepass")
+
+
+def _blob_sha(text):
+    """sha256 of `_blob_bytes(text)`. For a text without a lone surrogate those
+    are the bytes `_sha` hashes, so no stored sha changes; with one, `_sha`'s
+    "replace" would give "x\\ud800y" the sha of "x?y" and `cat` the wrong file."""
+    return hashlib.sha256(_blob_bytes(text)).hexdigest()
+
+
 def _pack_blob(text):
-    """(size, stored bytes) for a blob's text. surrogatepass keeps a lone
-    surrogate (only a malformed JSON escape makes one) instead of raising."""
-    data = text.encode("utf-8", "surrogatepass")
+    """(size, stored bytes) for a blob's text."""
+    data = _blob_bytes(text)
     return len(data), zlib.compress(data, BLOB_ZLIB_LEVEL)
 
 
@@ -1011,9 +1013,13 @@ def _put_blob(con, text):
     if text is None:
         return None
     db = _BLOB_DBS.get(con)
-    if db is None or db is _DUCK_BLOBS:
+    if db is None:
         raise RuntimeError("blob writes need the writer connection from connect()")
-    sha = _sha(text)
+    sha = _blob_sha(text)
+    if db is _DUCK_BLOBS:   # a schema 2 store whose move failed (_move_blobs): as schema 2 wrote
+        con.execute("INSERT INTO blobs VALUES (?,?,?) ON CONFLICT (sha) DO NOTHING",
+                    [sha, len(_blob_bytes(text)), text])
+        return sha
     # Check first so a repeated content (an unchanged file across versions) is
     # not compressed again; OR IGNORE keeps the insert idempotent regardless.
     if db.execute("SELECT 1 FROM blobs WHERE sha=?", [sha]).fetchone() is None:
@@ -1105,7 +1111,7 @@ def _blob_copy_mismatches(con, db, shas=None):
         for sha, size, content in rows:
             got = db.execute("SELECT size, content FROM blobs WHERE sha=?", [sha]).fetchone()
             if (got is None or got[0] != size
-                    or zlib.decompress(got[1]) != content.encode("utf-8", "surrogatepass")):
+                    or zlib.decompress(got[1]) != _blob_bytes(content)):
                 bad.add(sha)
     return bad
 
@@ -1123,8 +1129,9 @@ def _migrate_blobs(con):
       3. Only then drop the table and record the version, in one DuckDB
          transaction: the table is either there and complete, or gone with every
          row verified in the file.
-    connect() compacts afterwards. Readers keep working at every step: until the
-    drop commits they read the DuckDB table (`_blob_db`)."""
+    `_move_blobs` compacts afterwards, or retries a failure later. Readers keep
+    working at every step: until the drop commits they read the DuckDB table
+    (`_blob_db`)."""
     t0 = time.monotonic()
     total, nbytes = con.execute("SELECT count(*), coalesce(sum(size), 0) FROM blobs").fetchone()
     _log(f"blobs: moving {total:,} rows ({_fmt_bytes(nbytes)}) to {_blob_path()}")
@@ -1147,8 +1154,7 @@ def _migrate_blobs(con):
                 db.commit()
             bad = _blob_copy_mismatches(con, db, bad)
         if bad:
-            raise RuntimeError(f"blobs: {len(bad)} rows do not verify in {_blob_path()}; "
-                               f"the DuckDB table is kept, nothing was dropped")
+            raise RuntimeError(f"{len(bad)} rows do not verify after a second copy")
         db.execute("PRAGMA wal_checkpoint(TRUNCATE)")   # fold the copy into the main file
     finally:
         db.close()
@@ -1165,6 +1171,75 @@ def _migrate_blobs(con):
         raise
     _log(f"blobs: moved {total:,} rows ({copied:,} copied this run), all verified, "
          f"DuckDB table dropped in {time.monotonic() - t0:.1f}s")
+
+
+# Each attempt copies and verifies the whole DuckDB table (about 45 s CPU on the
+# real store), so a move that fails is retried at most this often, not every 30s.
+BLOB_MOVE_RETRY_INTERVAL = 3600.0
+
+
+def _blob_move_stamp():
+    """Marker of the last failed blob move (per store): mtime is when, text is why."""
+    return Path(str(STORE_PATH) + ".blob-move-failed")
+
+
+def _blob_move_due():
+    """Whether this writer connect tries the blob move: no failure is recorded,
+    or the last one is at least BLOB_MOVE_RETRY_INTERVAL old (or in the future)."""
+    try:
+        age = time.time() - _blob_move_stamp().stat().st_mtime
+    except OSError:
+        return True
+    return not 0 <= age < BLOB_MOVE_RETRY_INTERVAL
+
+
+def _move_blobs(con):
+    """Schema 2 -> 3 for the writer `con`; returns the connection to go on with.
+
+    `_migrate_blobs` records the version itself, in the transaction that drops
+    the table. The drop frees about as much as the table held, and only a
+    rewrite gives it back, so compact before the run goes on. A move that fails
+    (a row that does not verify, a SQLite error) keeps the DuckDB table and is
+    tried again only once `_blob_move_due`. Until then the writer works as on
+    schema 2: blobs go to the DuckDB table, which readers prefer while it
+    exists, so transcripts and file-history are still captured. Every such run
+    logs one `error:` line, since the wrapper exits 0 either way."""
+    import duckdb
+    stamp = _blob_move_stamp()
+    why = None
+    if _blob_move_due():
+        try:
+            _migrate_blobs(con)
+        except Exception as e:
+            why = f"{type(e).__name__}: {e}"
+        finally:
+            con.close()
+        if why is None:
+            stamp.unlink(missing_ok=True)
+            try:
+                old, new = compact_db()
+                _log(f"blobs: compacted {_fmt_bytes(old)} -> {_fmt_bytes(new)}")
+            except Exception as e:   # the move is done; the hourly --compact retries this
+                _log(f"blobs: compaction after the move failed ({e}); the next --compact reclaims it")
+        else:
+            try:
+                stamp.write_text(why + "\n")
+            except OSError:
+                pass   # unrecorded: the next run tries again
+        con = duckdb.connect(str(STORE_PATH))
+        if why is None:
+            _attach_blob_writer(con)
+            return con
+    try:
+        why = why or stamp.read_text().strip()
+        wait = max(0.0, BLOB_MOVE_RETRY_INTERVAL - (time.time() - stamp.stat().st_mtime))
+        retry = f"next attempt in {wait / 60:.0f} min, or on the next run once {stamp} is deleted"
+    except OSError:
+        why, retry = why or "cause not recorded", "next attempt on the next run"
+    _log(f"error: blobs not moved to {_blob_path()} ({why}); the DuckDB table is kept and "
+         f"this run writes blobs to it as schema 2 did, so nothing is lost; {retry}")
+    _register_blob_db(con, _DUCK_BLOBS)
+    return con
 
 
 def _post_content(tur, pre):
@@ -3775,7 +3850,10 @@ def cmd_cat(argv):
                   f"a later patch no longer applies cleanly", file=sys.stderr)
             break
         content = patched
-    print(content, end="")
+    # The stored bytes, not print(): a lone surrogate cannot be encoded as text.
+    sys.stdout.flush()
+    sys.stdout.buffer.write(_blob_bytes(content))
+    sys.stdout.buffer.flush()
     return 0
 
 

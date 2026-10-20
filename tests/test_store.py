@@ -4855,17 +4855,67 @@ def test_migration_killed_before_the_drop_recopies_a_bad_row_then_drops(
     assert _reader_outputs(capsys) == want
 
 
-def test_migration_refuses_to_drop_when_a_row_does_not_verify(tmp_path, monkeypatch, capsys):
-    """When a row still differs after the second copy, the move raises, the
-    DuckDB table and version stay, and readers keep working from DuckDB."""
+def test_a_refused_move_keeps_ingest_on_schema2_and_retries_hourly(tmp_path, monkeypatch, capsys):
+    """When a row still differs after the second copy, the move refuses: the
+    DuckDB table and version stay, the failure is stamped, and connect() still
+    returns a writer, so readers and ingest keep working. Until the stamp is
+    BLOB_MOVE_RETRY_INTERVAL old a run does not copy or verify again, logs one
+    error line, and captures as schema 2 did (the new blob goes to the DuckDB
+    table, where cat finds it). The retry after that moves every row, the new
+    one too, and clears the stamp."""
     _build_blob_store(tmp_path, monkeypatch)
     want = _reader_outputs(capsys)
-    _demote_to_schema2()
-    monkeypatch.setattr(store, "_blob_copy_mismatches", lambda con, db, shas=None: {"f" * 64})
-    with pytest.raises(RuntimeError, match="do not verify"):
-        store.connect()
+    rows = _demote_to_schema2()
+    real_verify = store._blob_copy_mismatches
+    verified = []
+
+    def refuse(con, db, shas=None):
+        verified.append(shas)
+        return {"f" * 64}
+
+    monkeypatch.setattr(store, "_blob_copy_mismatches", refuse)
+    store.connect().close()
+    log = capsys.readouterr().out
+    errors = [ln for ln in log.splitlines() if "error: blobs not moved" in ln]
+    assert "blobs: moving 5 rows" in log and len(errors) == 1
+    assert "(RuntimeError: 1 rows do not verify after a second copy)" in errors[0]
+    assert "next attempt in 60 min" in errors[0]
+    stamp = store._blob_move_stamp()
+    assert stamp.read_text() == "RuntimeError: 1 rows do not verify after a second copy\n"
     assert _duck_state() == (True, 5, "2")
     assert _reader_outputs(capsys) == want
+
+    verified.clear()
+    new_path = "/tmp/written_while_refused.py"
+    _write_jsonl(store.PROJECTS_DIR / "-proj" / "sess-blob-0002.jsonl",
+                 [_write_create_event("sess-blob-0002", "bm-new", new_path, "new = 1\n")])
+    assert store.cmd_ingest(["ingest"]) == 0
+    log = capsys.readouterr().out
+    assert verified == [] and "blobs: moving" not in log         # no attempt within the hour
+    assert sum("error: blobs not moved" in ln for ln in log.splitlines()) == 1
+    assert "+1 file_versions, +1 blobs" in log
+    assert _duck_state() == (True, 6, "2")
+    assert store.cmd_cat(["cat", new_path]) == 0
+    assert capsys.readouterr().out == "new = 1\n"
+
+    future = time.time() + 600
+    os.utime(stamp, (future, future))                          # a clock moved back
+    assert store._blob_move_due()
+    old = time.time() - store.BLOB_MOVE_RETRY_INTERVAL - 1
+    os.utime(stamp, (old, old))
+    monkeypatch.setattr(store, "_blob_copy_mismatches", real_verify)
+    store.connect().close()
+    log = capsys.readouterr().out
+    assert "(1 copied this run), all verified" in log and "error:" not in log
+    assert not stamp.exists()
+    assert _duck_state() == (False, None, "3")
+    moved = _blob_file_rows()
+    assert len(moved) == 6 and {sha: moved[sha] for sha in rows} == rows
+    assert store.cmd_cat(["cat", new_path]) == 0
+    assert capsys.readouterr().out == "new = 1\n"
+    got = _reader_outputs(capsys)
+    assert {k: v for k, v in got.items() if not k.startswith("stats")} == {
+        k: v for k, v in want.items() if not k.startswith("stats")}
 
 
 def test_readers_name_a_missing_blob_file_instead_of_raising(tmp_path, monkeypatch, capsys):
@@ -4901,6 +4951,36 @@ def test_readers_name_a_missing_blob_file_instead_of_raising(tmp_path, monkeypat
     got = capsys.readouterr()
     assert got.out == "no stored version for that path/time\n"
     assert "skipped 1 version(s) whose content the blob file does not hold" in got.err
+
+
+def test_cat_skips_a_version_whose_blob_is_missing_and_rolls_the_older_one_forward(
+        tmp_path, monkeypatch, capsys):
+    """Two versions with bytes (a Write, then an Edit of it) and a patch-only
+    edit after them. With the Edit's blob gone from the file, cat takes the
+    Write's bytes, as the old JOIN on `blobs` did, rolls the Edit's patch and
+    the patch-only one forward on top, and says it skipped one version."""
+    sid = "sess-cat-skip-01"
+    pre = "line one\nline two\nline three\n"                  # the Edit's originalFile
+    _build_reconstruction_store(tmp_path, monkeypatch, sid, [
+        _write_create_event(sid, "sk-w", CATDIFF_PATH, pre),
+        _edit_result_event(sid, "sk-e", CATDIFF_PATH),
+        _patch_only_edit_event(sid, "sk-p", CATDIFF_PATH, "2026-06-30T04:00:02.000Z",
+                               [{"oldStart": 4, "oldLines": 1, "newStart": 4, "newLines": 1,
+                                 "lines": ["-line three", "+line THREE"]}])])
+    want = "line one\nline two CHANGED\nline two-b\nline THREE\n"
+    capsys.readouterr()
+    assert store.cmd_cat(["cat", CATDIFF_PATH]) == 0
+    assert capsys.readouterr() == (want, "")
+
+    db = sqlite3.connect(store._blob_path())
+    gone = db.execute("DELETE FROM blobs WHERE sha=?", [store._blob_sha(CATDIFF_EDIT_POST)]).rowcount
+    db.commit()
+    db.close()
+    assert gone == 1
+    assert store.cmd_cat(["cat", CATDIFF_PATH]) == 0
+    got = capsys.readouterr()
+    assert got.out == want
+    assert got.err == "warning: skipped 1 version(s) whose content the blob file does not hold\n"
 
 
 def test_reader_reads_the_blob_file_while_a_writer_is_inserting(tmp_path, monkeypatch, capsys):
@@ -5042,8 +5122,9 @@ def test_db_info_stats_and_store_size_count_the_blob_file(tmp_path, monkeypatch,
     assert info["blob file"] == f"{bp} ({store._fmt_bytes(bp.stat().st_size)})"
     assert info["rows blobs"] == f"5 ({store._fmt_bytes(nbytes)} uncompressed)"
     out = _reader_outputs(capsys)
+    fh_bytes = len("mig v1\n") + len("mig v1\nmig v2\n")
     assert out["stats blobs"] == f"   5 {nbytes}"
-    assert out["stats snapshot bytes"] == f"   snapshot bytes  {len('mig v1\n') + len('mig v1\nmig v2\n')}"
+    assert out["stats snapshot bytes"] == f"   snapshot bytes  {fh_bytes}"
     assert store._store_size() == store.STORE_PATH.stat().st_size + bp.stat().st_size
 
 
@@ -5076,6 +5157,35 @@ def test_put_blob_needs_the_writer_and_keeps_a_lone_surrogate(tmp_path, monkeypa
             store._put_blob(ro, "text")
     finally:
         ro.close()
+
+
+def test_blob_sha_covers_the_stored_bytes_and_cat_prints_a_lone_surrogate(
+        tmp_path, monkeypatch, capsysbinary):
+    """A blob's sha is taken over the bytes the blob file stores. For ordinary
+    text that is the sha it always had (pinned: existing rows and the dedupe
+    depend on it). A Write holding a lone surrogate and a Write of the same
+    text with "?" in its place get two shas, and cat prints each file's own
+    bytes; with the "replace" sha they shared one and cat raised."""
+    assert store._blob_sha("alpha\nbeta\n") == (
+        "e49c81e2d2f84e259d40e2fb8192f3bcd198b355184845d76d8f58807d0d78ee")
+    assert store._blob_sha("café ✓\n") == (
+        "7953dfd42d596ffc230a3ba67f3f1e856f53b477e64300f6eda9e4f94021e32e")
+    for text in ("", "alpha\nbeta\n", "café ✓\n"):
+        assert store._blob_sha(text) == store._sha(text)
+    assert store._blob_sha("x\ud800y\n") == (
+        "614ace69d9d66702b40ddc2fdb7d861eebf12f87c36797a5a75d643c5a7c70c8")
+    assert store._blob_sha("x?y\n") == (
+        "63e9304e35ad3e577a77e74da55fd34d38ebe553a6200b3c6b836e1a56df789e")
+
+    sid = "sess-surrogate-01"
+    _build_reconstruction_store(tmp_path, monkeypatch, sid, [   # json.dumps escapes it as \ud800
+        _write_create_event(sid, "sur-w", "/tmp/sur.txt", "x\ud800y\n"),
+        _write_create_event(sid, "q-w", "/tmp/q.txt", "x?y\n")])
+    capsysbinary.readouterr()
+    assert store.cmd_cat(["cat", "/tmp/sur.txt"]) == 0
+    assert capsysbinary.readouterr() == (b"x\xed\xa0\x80y\n", b"")
+    assert store.cmd_cat(["cat", "/tmp/q.txt"]) == 0
+    assert capsysbinary.readouterr() == (b"x?y\n", b"")
 
 
 # --- ingest --detach: singleton lock + background fork (Phase 1) ---------------
