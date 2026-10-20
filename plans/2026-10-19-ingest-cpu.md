@@ -197,7 +197,8 @@ Evidence:
       command modal +12 to +15%, so within the 20% rule.
     - A plain read-write open that writes anything merges every table back to 122,880-row
       groups (about one full rewrite); the next `--compact` splits them again.
-- [ ] 5. Exit early when nothing changed (optional)
+- [x] 5. Exit early when nothing changed (optional). Skipped (owner, 2026-10-20): idle runs
+  already cost about 0.4 s CPU, not worth a second code path.
   - Before importing duckdb, scan `~/.claude/projects` with `os.scandir` (about 1k files,
     a few ms) and compare the newest transcript mtime with a run stamp. If nothing is newer
     and no flush is due (stamp age plus WAL presence, the rules of `_checkpoint_due`), log
@@ -207,6 +208,22 @@ Evidence:
 
 Expected end state: about 0.5 s CPU per ordinary run and about 1 s per flush, so the ingest
 falls from about 9% of a core to about 2%.
+
+Measured (journal, CPU per timer run):
+
+| Code live | Window | Runs | Average | Median |
+|---|---|---|---|---|
+| Part 1 | 2026-10-19 09:55 to 10:55 | 113 | 2.83 s | 2.02 s |
+| Phase 1 | 2026-10-19 21:48 to 23:29 | 195 | 2.32 s | 1.35 s |
+| Phases 1 to 3 | 2026-10-20 00:51 to 15:07 | 299 | 1.73 s | 0.69 s |
+| Phase 4 | 2026-10-20 15:10 to 15:49 | 75 | 1.20 s | 0.74 s |
+
+Phase 4b, first live flush (2026-10-20 15:52): 1.06 s CPU, 1.08 s wall, 143 MB peak, against
+8.9 s CPU, about 16 s wall and 1.1 GB before part 1. Idle runs: 0.4 to 0.9 s. Still to record:
+the first `--compact` into the 8192-row layout, and a full-day average under phase 4b.
+
+The live store backup taken before the phase 4 migration,
+`/mnt/fast/claude-trail-bench/pre-phase4-live.duckdb` (3.4 GB), is kept for a few days.
 
 ## Verify
 
@@ -251,7 +268,6 @@ CLAUDE_TRAIL_DB=/mnt/fast/claude-trail/trail.duckdb flock -w 60 /mnt/fast/claude
 
 1. Decided 2026-10-19: blobs go to SQLite (phase 4), then smaller row groups (phase 4b).
    Phase 3 also reads `file-history-delta` lines.
-2. Whether phase 5's early exit is worth a second code path, once phases 1 to 3 have
-   brought an idle run down to about 0.5 s.
+2. Decided 2026-10-20: phase 5 skipped.
 3. Keep the 30s cadence. Phases 1 to 3 make a run cheap enough that a slower timer would
    only cost freshness.
