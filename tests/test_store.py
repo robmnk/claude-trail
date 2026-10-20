@@ -5271,3 +5271,181 @@ def test_ingest_detach_returns_cleanly_without_os_fork(tmp_path, monkeypatch):
     monkeypatch.delattr(os, "fork", raising=False)
     assert store.cmd_ingest(["ingest", "--detach"]) == 0
     assert not (tmp_path / "trail-ingest.lock").exists()  # _acquire_ingest_lock never reached
+
+
+# --- Writer row group size (ingest CPU phase 4b) -------------------------------
+#
+# A CHECKPOINT rewrites the whole row group new rows land in. DuckDB keeps the
+# row group size per attached database, not in the file, so every writer open
+# attaches the store with ROW_GROUP_SIZE (`_open_writer`, and compact_db's copy).
+
+
+def _insert_events(con, n, tag):
+    """`n` synthetic events rows of about 300 bytes of text each."""
+    con.execute(
+        "INSERT INTO events (event_id, session_id, ts, type, text) "
+        "SELECT ? || i, 'sess-rg', TIMESTAMPTZ '2026-10-20 00:00:00+00' + to_seconds(i), "
+        "'user', repeat('x', 300) || i FROM range(?) r(i)", [tag, n])
+
+
+def _row_groups(con, table="events"):
+    """`table`'s row groups in order, each as (rows, where its stored segments
+    sit). A CHECKPOINT writes a group it rewrites to new blocks, so an unchanged
+    location set means the flush left that group alone."""
+    groups = {}
+    for rg, path, seg, count, block, offset in con.execute(
+            "SELECT row_group_id, column_path, segment_id, count, block_id, block_offset "
+            f"FROM pragma_storage_info('{table}')").fetchall():
+        g = groups.setdefault(rg, [0, set()])
+        if path == "[0]":
+            g[0] += count
+        g[1].add((path, seg, block, offset))
+    return [(rows, frozenset(at)) for _, (rows, at) in sorted(groups.items())]
+
+
+def _assert_writes_small_groups(con):
+    """ROW_GROUP_SIZE + 1 new events rows end in groups of at most
+    ROW_GROUP_SIZE on this writer, and a bigger group an earlier plain open
+    left (`_demote_to_schema2` opens plainly) is not written again. A plain
+    open would put the new rows in its last group, up to 122,880 rows."""
+    n = store.ROW_GROUP_SIZE
+    con.execute("CHECKPOINT")
+    had = con.execute("SELECT count(*) FROM events").fetchone()[0]
+    before = _row_groups(con)
+    _insert_events(con, n + 1, f"rg{had}-")
+    con.execute("CHECKPOINT")
+    after = _row_groups(con)
+    assert sum(rows for rows, _ in after) == had + n + 1
+    written = [rows for rows, at in after if (rows, at) not in before]
+    assert sum(written) >= n + 1 and max(written) <= n
+
+
+def test_a_flush_after_one_row_rewrites_only_the_small_last_group(tmp_path, monkeypatch):
+    """On a store a plain open filled (one big group, as every store was before
+    this change), the writer puts one new row in a new group and leaves the big
+    one where it is; the same flush through a plain open rewrites the big
+    group. The next one-row flush rewrites only that small last group."""
+    import duckdb
+    n = store.ROW_GROUP_SIZE
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    store.connect().close()                                    # the schema
+    old = duckdb.connect(str(store.STORE_PATH))                # a writer before the change
+    try:
+        _insert_events(old, 3 * n + 100, "old-")
+        old.execute("CHECKPOINT")
+        before = _row_groups(old)
+    finally:
+        old.close()
+    assert [rows for rows, _ in before] == [3 * n + 100]
+    plain = tmp_path / "plain.duckdb"
+    plain.write_bytes(store.STORE_PATH.read_bytes())
+
+    con = store.connect()
+    try:
+        _insert_events(con, 1, "one-")
+        con.execute("CHECKPOINT")
+        after = _row_groups(con)
+    finally:
+        con.close()
+    assert [rows for rows, _ in after] == [3 * n + 100, 1]
+    assert after[0] == before[0]                               # the big group stayed put
+
+    raw = duckdb.connect(str(plain))                           # the same flush, opened plainly
+    try:
+        _insert_events(raw, 1, "one-")
+        raw.execute("CHECKPOINT")
+        rewritten = _row_groups(raw)
+    finally:
+        raw.close()
+    assert [rows for rows, _ in rewritten] == [3 * n + 101]
+    assert rewritten[0][1] != before[0][1]                     # all 3n+101 rows written again
+
+    con = store.connect()                                      # the next flush, a new run
+    try:
+        _insert_events(con, 1, "two-")
+        con.execute("CHECKPOINT")
+        last = _row_groups(con)
+    finally:
+        con.close()
+    assert [rows for rows, _ in last] == [3 * n + 100, 2]
+    assert last[0] == before[0]                                # still not written again
+
+
+def test_every_writer_open_writes_row_groups_of_row_group_size(tmp_path, monkeypatch, capsys):
+    """connect_writer (connect), compact_db's copy, and the writer connect()
+    reopens after a blob move, whether the move lands, is refused, or is not
+    due: each keeps new row groups at ROW_GROUP_SIZE rows. The writer also sees
+    the store as its only catalog and spills where a direct open would."""
+    _build_blob_store(tmp_path, monkeypatch)
+    con = store.connect_writer(attempts=1)
+    try:
+        assert con.execute("SELECT database_name FROM duckdb_databases() "
+                           "WHERE NOT internal").fetchall() == [("trail",)]
+        assert con.execute("SELECT current_setting('temp_directory')").fetchone()[0] == \
+            str(store.STORE_PATH) + ".tmp"
+        _assert_writes_small_groups(con)
+    finally:
+        con.close()
+
+    store.compact_db()
+    con = store.connect(read_only=True)                        # a reader needs nothing new
+    try:
+        sizes = [rows for rows, _ in _row_groups(con)]
+    finally:
+        con.close()
+    assert max(sizes) == store.ROW_GROUP_SIZE and len(sizes) == 2   # not merged into one
+
+    _demote_to_schema2()
+    con = store.connect()                                      # moves, compacts, reopens
+    try:
+        assert not store._duck_has_blobs(con)
+        _assert_writes_small_groups(con)
+    finally:
+        con.close()
+    assert "blobs: compacted" in capsys.readouterr().out
+
+    _demote_to_schema2()
+    monkeypatch.setattr(store, "_blob_copy_mismatches", lambda con, db, shas=None: {"f" * 64})
+    for attempt in ("refused", "not due"):
+        con = store.connect()
+        try:
+            assert store._duck_has_blobs(con)
+            _assert_writes_small_groups(con)
+        finally:
+            con.close()
+        log = capsys.readouterr().out
+        assert ("blobs: moving" in log) == (attempt == "refused")
+        assert "error: blobs not moved" in log
+
+
+def test_no_store_open_bypasses_the_row_group_size():
+    """Every DuckDB open in the store module is read-only, an in-memory driver,
+    or an ATTACH that is read-only or passes ROW_GROUP_SIZE. One plain writer
+    open would let the last group of each table grow back to 122,880 rows,
+    and every flush would rewrite it again."""
+    lines = [ln.strip() for ln in Path(store.__file__).read_text().splitlines()]
+    opens = [ln for ln in lines if "duckdb.connect(" in ln]
+    assert opens and all("duckdb.connect()" in ln or "read_only=True" in ln for ln in opens), opens
+    attaches = [ln for ln in lines if "ATTACH '" in ln]
+    assert len(attaches) == 3, attaches                        # _open_writer, compact_db src + dst
+    assert all("READ_ONLY" in ln or "ROW_GROUP_SIZE" in ln for ln in attaches), attaches
+
+
+def test_connect_writer_skips_a_store_another_process_holds(tmp_path, monkeypatch):
+    """The writer's ATTACH meets another process's lock with the same error as a
+    direct open did, so connect_writer still skips (None) instead of raising."""
+    monkeypatch.setattr(store, "STORE_PATH", tmp_path / "trail.duckdb")
+    store.connect().close()
+    reader = ("import duckdb, sys\n"
+              "con = duckdb.connect(sys.argv[1], read_only=True)\n"
+              "print('held', flush=True)\n"
+              "sys.stdin.read()\n")
+    proc = subprocess.Popen([sys.executable, "-c", reader, str(store.STORE_PATH)],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout.readline() == "held\n"
+        assert store.connect_writer(attempts=1, delay=0) is None
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=30)
+    store.connect_writer(attempts=1).close()                  # free again once it exits

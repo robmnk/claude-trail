@@ -167,14 +167,59 @@ def _set_schema_version(con):
     )
 
 
+# Rows per DuckDB row group for every writer open (DuckDB's default is 122,880).
+# A CHECKPOINT rewrites the whole row group new rows land in, so at the default
+# every 5-minute flush rewrote the last `events` group (97k rows), the last
+# `raw_events` group and the only `api_requests` group: about 378 MB written and
+# 3 s CPU per flush on a copy of the real store (2026-10-20). At 8192 the same
+# flush writes about 87 MB in 0.6 s. Reads after repeated compactions: the
+# Prompts list 4x faster (finer zone maps), the others at most 12% slower
+# (`search`). 2048 flushed a little cheaper but failed that: from the second
+# compaction on, its small segments scatter over many blocks and `turn_actions`
+# read 43% slower. DuckDB 1.5 keeps the size per attached database, not in the
+# file, and has no connect-time setting for it. A writer that opens the store
+# plainly appends into the last group until it holds 122,880 rows, and its
+# first CHECKPOINT that writes anything merges every table's small groups back
+# into 122,880-row ones. So every writer open goes through `_open_writer`, and
+# `compact_db` writes its copy with the same size. A read-only open writes no
+# row group and needs nothing.
+ROW_GROUP_SIZE = 8192
+_WRITER_CATALOG = "trail"   # the store's catalog name on a writer connection
+
+
+def _open_writer():
+    """A read-write DuckDB connection to STORE_PATH whose new row groups hold
+    ROW_GROUP_SIZE rows. DuckDB takes the size only on ATTACH, so this opens an
+    in-memory driver, attaches the store as `_WRITER_CATALOG`, makes it the
+    default and detaches the driver's own catalog: every query,
+    `information_schema` and `PRAGMA database_size` then see the store alone,
+    as on a direct open. A held lock raises the same IOException as a direct
+    open (`is_lock_conflict`)."""
+    import duckdb
+    lit = str(STORE_PATH).replace("'", "''")   # ATTACH takes a string literal
+    con = duckdb.connect()
+    try:
+        # A direct open spills to `<store>.tmp`; the driver's default is `.tmp`
+        # under whatever directory the process runs in.
+        con.execute(f"SET temp_directory = '{lit}.tmp'")
+        con.execute(f"ATTACH '{lit}' AS {_WRITER_CATALOG} (ROW_GROUP_SIZE {ROW_GROUP_SIZE})")
+        con.execute(f"USE {_WRITER_CATALOG}")
+        con.execute("DETACH memory")
+    except BaseException:
+        con.close()
+        raise
+    return con
+
+
 def connect(read_only: bool = False):
     """Open the store. A writer (the default) also gets the schema, any pending
     migration, and its blob file (`_blob_path`), which lives as long as `con`
     (or the DuckDB `blobs` table while a failed move waits, see _move_blobs).
-    A reader opens the blob file only when it first reads a blob (`_blob_db`)."""
+    A reader opens the blob file only when it first reads a blob (`_blob_db`).
+    The writer comes from `_open_writer`, for its row group size."""
     import duckdb  # lazy: keeps the TUI/hook free of the duckdb import
     STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect(str(STORE_PATH), read_only=read_only)
+    con = duckdb.connect(str(STORE_PATH), read_only=True) if read_only else _open_writer()
     if not read_only:
         con.execute(SCHEMA_SQL)
         # Migrate a 0.6.0 (schema 1) DB in place. SCHEMA_SQL's CREATE ... IF NOT
@@ -1204,7 +1249,6 @@ def _move_blobs(con):
     schema 2: blobs go to the DuckDB table, which readers prefer while it
     exists, so transcripts and file-history are still captured. Every such run
     logs one `error:` line, since the wrapper exits 0 either way."""
-    import duckdb
     stamp = _blob_move_stamp()
     why = None
     if _blob_move_due():
@@ -1226,7 +1270,7 @@ def _move_blobs(con):
                 stamp.write_text(why + "\n")
             except OSError:
                 pass   # unrecorded: the next run tries again
-        con = duckdb.connect(str(STORE_PATH))
+        con = _open_writer()
         if why is None:
             _attach_blob_writer(con)
             return con
@@ -1884,6 +1928,10 @@ def compact_db(store_path=None):
     unlocked). Returns (0, 0) if the store does not exist yet. The blob file
     (`_blob_path`) is not touched: SQLite only appends to it, so it has no free
     blocks to give back, and the shas DuckDB keeps survive the rewrite as they are.
+
+    The copy is written in row groups of ROW_GROUP_SIZE, like every other writer
+    open, so a compaction does not merge the store back into 122,880-row groups
+    whose last one each flush would rewrite again.
     """
     import duckdb  # lazy, same as connect()
     path = Path(store_path) if store_path is not None else STORE_PATH
@@ -1906,7 +1954,7 @@ def compact_db(store_path=None):
         mem = duckdb.connect()  # in-memory driver; src/dst are the only real DBs
         try:
             mem.execute(f"ATTACH '{src_lit}' AS src (READ_ONLY)")
-            mem.execute(f"ATTACH '{dst_lit}' AS dst")
+            mem.execute(f"ATTACH '{dst_lit}' AS dst (ROW_GROUP_SIZE {ROW_GROUP_SIZE})")
             mem.execute("COPY FROM DATABASE src TO dst")
             mem.execute("CHECKPOINT dst")   # flush dst so its WAL is folded in before the swap
             mem.execute("DETACH src")
